@@ -135,6 +135,10 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
     Pro…* opens it any time.
   - **Backend:** the Supabase project, its functions and the setup steps are in
     [supabase/README.md](supabase/README.md).
+  - **Admin console:** customers, free Pro, cancellations, prices, the export switch and the Home announcement
+    can all be managed at https://motionforge-admin.pages.dev ([admin/README.md](admin/README.md)).
+  - **Picking up changes:** the app reads prices and settings when it comes to the front, at most every
+    five minutes.
 - **Compositions and precomps**:
   - **Open a precomp:** double-click it (or double-tap on a trackpad) anywhere: its name or bar
     in the timeline, its pixels in the viewer, or its row in the Project panel. You can also use

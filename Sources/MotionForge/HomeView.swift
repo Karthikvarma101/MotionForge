@@ -167,6 +167,8 @@ struct HomeView: View {
             .padding(.top, 28)
             .padding(.bottom, 22)
 
+            AnnouncementSlot(account: model.account)
+
             HStack(alignment: .top, spacing: 34) {
                 actions
                     .frame(width: 220, alignment: .topLeading)
@@ -315,5 +317,41 @@ private struct HomeButtonStyle: ButtonStyle {
                     .fill(primary ? AnyShapeStyle(ForgeGlyph.gradient) : AnyShapeStyle(Color.white.opacity(configuration.isPressed ? 0.16 : 0.08)))
             )
             .opacity(configuration.isPressed && primary ? 0.85 : 1)
+    }
+}
+
+/// The admin console's announcement, when there is one (watches the account model for changes).
+private struct AnnouncementSlot: View {
+    @ObservedObject var account: AccountModel
+    var body: some View {
+        if !account.settings.announcement.isEmpty {
+            AnnouncementBanner(text: account.settings.announcement, style: account.settings.announcementStyle)
+                .padding(.horizontal, 36)
+                .padding(.bottom, 18)
+        }
+    }
+}
+
+/// The message set in the admin console (Settings → Announcement), shown on Home.
+struct AnnouncementBanner: View {
+    let text: String
+    let style: String
+    private var tint: Color {
+        switch style {
+        case "success": return .green
+        case "warning": return Theme.warning
+        default: return Theme.accent
+        }
+    }
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: style == "warning" ? "exclamationmark.triangle.fill" : style == "success" ? "checkmark.seal.fill" : "megaphone.fill")
+                .foregroundStyle(tint)
+            Text(text).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.12)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(tint.opacity(0.35)))
     }
 }

@@ -81,7 +81,8 @@ struct AccountCard: View {
                     .font(.system(size: 16))
                     .foregroundStyle(e.pro ? AnyShapeStyle(ForgeGlyph.gradient) : AnyShapeStyle(Color.secondary))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(e.pro ? planName(e.planID) : "Free plan").font(.system(size: 12, weight: .semibold))
+                    Text(e.pro ? (account.isGrantedPro ? "MotionForge Pro · Complimentary" : planName(e.planID)) : "Free plan")
+                        .font(.system(size: 12, weight: .semibold))
                     Text(planDetail(e)).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
@@ -89,10 +90,10 @@ struct AccountCard: View {
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
             if e.pro {
-                Button("Manage Subscription…") { showPaywall() }.frame(maxWidth: .infinity)
+                if !account.isGrantedPro { Button("Manage Subscription…") { showPaywall() }.frame(maxWidth: .infinity) }
             } else {
                 Button { showPaywall() } label: {
-                    Text("Get MotionForge Pro — from ₹199/month")
+                    Text("Get MotionForge Pro — from \(account.plans.first.map { $0.price + $0.period } ?? "₹199/month")")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.black)
                         .frame(maxWidth: .infinity)
@@ -116,13 +117,16 @@ struct AccountCard: View {
     }
 
     private func planName(_ id: String?) -> String {
-        ProPlan.all.first { $0.id == id }.map { "MotionForge Pro · \($0.title)" } ?? "MotionForge Pro"
+        account.plans.first { $0.id == id }.map { "MotionForge Pro · \($0.title)" } ?? "MotionForge Pro"
     }
 
     private func planDetail(_ e: AccountModel.Entitlement) -> String {
-        guard e.pro else { return "Editing and saving are free. Exporting needs Pro." }
-        guard let end = e.currentEnd else { return "Active" }
+        guard e.pro else {
+            return account.settings.exportRequiresPro ? "Editing and saving are free. Exporting needs Pro." : "Exporting is free for everyone right now."
+        }
+        guard let end = e.currentEnd else { return account.isGrantedPro ? "Given to you — no end date" : "Active" }
         let date = end.formatted(date: .abbreviated, time: .omitted)
+        if account.isGrantedPro { return "Given to you until \(date)" }
         return e.cancelAtPeriodEnd ? "Ends \(date)" : "Renews \(date)"
     }
 }
@@ -187,7 +191,8 @@ struct PaywallSheet: View {
     /// Called when Pro becomes active while the sheet is open (e.g. to carry on to the export).
     var onPro: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
-    @State private var plan = ProPlan.yearly
+    @State private var planID = ProPlan.yearly.id
+    private var plan: ProPlan { account.plans.first { $0.id == planID } ?? account.plans.last ?? ProPlan.yearly }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -236,7 +241,7 @@ struct PaywallSheet: View {
                 feature("Editing, previewing and saving stay free")
             }
             HStack(spacing: 12) {
-                ForEach(ProPlan.all) { p in planCard(p) }
+                ForEach(account.plans) { p in planCard(p) }
             }
             if account.awaitingPayment {
                 HStack(spacing: 8) {
@@ -254,17 +259,19 @@ struct PaywallSheet: View {
 
     private var activePlan: some View {
         let e = account.entitlement
-        let planName = ProPlan.all.first { $0.id == e.planID }.map { "\($0.title) · \($0.price)\($0.period)" } ?? "Pro"
+        let planName = account.isGrantedPro ? "Complimentary — given by MotionForge"
+            : account.plans.first { $0.id == e.planID }.map { "\($0.title) · \($0.price)\($0.period)" } ?? "Pro"
         return VStack(alignment: .leading, spacing: 8) {
             Label("You have MotionForge Pro", systemImage: "checkmark.seal.fill").font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(.green)
             Text(planName).font(.system(size: 12))
             if let end = e.currentEnd {
-                Text(e.cancelAtPeriodEnd ? "Cancelled — Pro stays until \(end.formatted(date: .long, time: .omitted))."
-                                         : "Renews \(end.formatted(date: .long, time: .omitted)).")
+                Text(account.isGrantedPro ? "Pro until \(end.formatted(date: .long, time: .omitted))."
+                     : e.cancelAtPeriodEnd ? "Cancelled — Pro stays until \(end.formatted(date: .long, time: .omitted))."
+                     : "Renews \(end.formatted(date: .long, time: .omitted)).")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            if !e.cancelAtPeriodEnd {
+            if !e.cancelAtPeriodEnd && !account.isGrantedPro {
                 Button("Cancel at the end of this period") { Task { await account.cancelSubscription() } }
                     .controlSize(.small)
                     .disabled(account.busy)
@@ -280,7 +287,7 @@ struct PaywallSheet: View {
     }
 
     private func planCard(_ p: ProPlan) -> some View {
-        let selected = plan == p
+        let selected = plan.id == p.id
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(p.title).font(.system(size: 13, weight: .semibold))
@@ -298,7 +305,7 @@ struct PaywallSheet: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(selected ? 0.08 : 0.04)))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(selected ? Theme.accent : Color.white.opacity(0.08), lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
-        .onTapGesture { plan = p }
+        .onTapGesture { planID = p.id }
     }
 
     private var subscribeButton: some View {

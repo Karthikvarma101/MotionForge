@@ -85,7 +85,7 @@ Deno.serve(async (req) => {
         if (FINAL.includes(r.status) && !(r.current_end && Date.parse(r.current_end) > Date.now())) continue;
         const s = await rzp<RzpSubscription>(cfg, "GET", `/subscriptions/${r.razorpay_subscription_id}`);
         await admin.from("subscriptions").update({
-          status: s.status, current_start: iso(s.current_start), current_end: iso(s.current_end ?? s.ended_at),
+          status: s.status, current_start: iso(s.current_start), current_end: iso(s.ended_at ?? s.current_end),  // ended_at: when access really stops
           updated_at: new Date().toISOString(),
         }).eq("razorpay_subscription_id", s.id);
       }
@@ -104,13 +104,25 @@ Deno.serve(async (req) => {
     console.error(`subscription-status ${user.id}:`, e instanceof Error ? e.message : String(e));
   }
 
-  const best = rows.find(paid) ?? rows[0];
+  // Complimentary Pro from the admin console counts too (a paid subscription is reported first).
+  const nowIso = new Date().toISOString();
+  const { data: grants } = await admin.from("pro_grants").select("until,reason").eq("user_id", user.id).is("revoked_at", null)
+    .or(`until.is.null,until.gt.${nowIso}`).order("until", { ascending: false, nullsFirst: true }).limit(1);
+  const grant = grants?.[0];
+  const best = rows.find(paid);
+  if (!best && grant) {
+    return json({
+      pro: true, plan_id: "grant", status: "granted", current_end: grant.until ?? null, cancel_at_period_end: false,
+      grant_reason: grant.reason ?? null, payments_configured: !!cfg,
+    });
+  }
+  const shown = best ?? rows[0];
   return json({
-    pro: rows.some(paid),
-    plan_id: best?.plan_id ?? null,
-    status: best?.status ?? null,
-    current_end: best?.current_end ?? null,
-    cancel_at_period_end: best?.cancel_at_period_end ?? false,
+    pro: !!best,
+    plan_id: shown?.plan_id ?? null,
+    status: shown?.status ?? null,
+    current_end: shown?.current_end ?? null,
+    cancel_at_period_end: shown?.cancel_at_period_end ?? false,
     payments_configured: !!cfg,
   });
 });

@@ -29,17 +29,39 @@ enum AccountConfig {
     }
 }
 
-/// A MotionForge Pro plan as sold through Razorpay Subscriptions.
-struct ProPlan: Identifiable, Hashable {
+/// A MotionForge Pro plan as sold through Razorpay Subscriptions. Prices come from the server (`plans`, set in
+/// the admin console); these built-in ones are used until it has answered.
+struct ProPlan: Identifiable, Hashable, Codable {
     let id: String      // plans.id in Supabase
     let title: String
-    let price: String
-    let period: String
-    let note: String?
-    static let monthly = ProPlan(id: "pro_monthly", title: "Monthly", price: "₹199", period: "/month", note: nil)
-    static let yearly = ProPlan(id: "pro_yearly", title: "Yearly", price: "₹399", period: "/year",
-                                note: "Save 83% vs monthly")  // 399 vs 12 × 199 = 2,388
-    static let all = [monthly, yearly]
+    let amountPaise: Int
+    let yearly: Bool
+    var note: String?
+
+    var price: String { "₹" + (amountPaise % 100 == 0 ? "\(amountPaise / 100)" : String(format: "%.2f", Double(amountPaise) / 100)) }
+    var period: String { yearly ? "/year" : "/month" }
+
+    static let monthly = ProPlan(id: "pro_monthly", title: "Monthly", amountPaise: 19900, yearly: false)
+    static let yearly = ProPlan(id: "pro_yearly", title: "Yearly", amountPaise: 39900, yearly: true)
+    static let builtIn = withSavings([monthly, yearly])
+
+    /// "Save 83% vs monthly" on yearly plans, against the cheapest monthly one.
+    static func withSavings(_ plans: [ProPlan]) -> [ProPlan] {
+        guard let monthly = plans.filter({ !$0.yearly }).map(\.amountPaise).min(), monthly > 0 else { return plans }
+        return plans.map { p in
+            var p = p
+            let saving = 1 - Double(p.amountPaise) / Double(monthly * 12)
+            if p.yearly && saving >= 0.05 { p.note = "Save \(Int((saving * 100).rounded()))% vs monthly" }
+            return p
+        }
+    }
+}
+
+/// App-wide settings from the admin console (`app_config`).
+struct AppSettings: Codable, Equatable {
+    var exportRequiresPro = true
+    var announcement = ""
+    var announcementStyle = "info"   // info | success | warning
 }
 
 /// The signed-in user (Google, through Supabase Auth) and whether they have MotionForge Pro, which exporting needs.
@@ -69,6 +91,10 @@ final class AccountModel: NSObject, ObservableObject {
 
     @Published private(set) var user: User?
     @Published private(set) var entitlement = Entitlement()
+    /// Plans on sale (server prices), monthly first.
+    @Published private(set) var plans = ProPlan.builtIn
+    @Published private(set) var settings = AppSettings()
+    private var lastServerCheck = Date.distantPast
     @Published private(set) var busy = false
     @Published var message: String?
     /// A Razorpay checkout was opened and hasn't been confirmed yet.
@@ -86,9 +112,10 @@ final class AccountModel: NSObject, ObservableObject {
 
     var isConfigured: Bool { AccountConfig.isConfigured }
     var isSignedIn: Bool { user != nil }
-    /// Exporting is a Pro feature. Offline, the cached state counts until its period ends.
+    /// Exporting is a Pro feature (unless the admin console has switched that off). Offline, the cached state
+    /// counts until its period ends.
     var canExport: Bool {
-        if developerPro { return true }
+        if developerPro || !settings.exportRequiresPro { return true }
         guard entitlement.pro else { return false }
         if let end = entitlement.currentEnd, end < Date(), Date().timeIntervalSince(entitlement.checked) > 3600 { return false }
         return true
@@ -102,8 +129,62 @@ final class AccountModel: NSObject, ObservableObject {
            let e = try? JSONDecoder().decode(Entitlement.self, from: data), session != nil {
             entitlement = e
         }
-        if session != nil { Task { await refreshEntitlement() } }
+        if let data = UserDefaults.standard.data(forKey: "serverPlans"), let p = try? JSONDecoder().decode([ProPlan].self, from: data), !p.isEmpty {
+            plans = p
+        }
+        if let data = UserDefaults.standard.data(forKey: "appSettings"), let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
+            settings = s
+        }
+        Task { await refreshFromServer(force: true) }
+        // Changes made in the admin console reach a running app when it comes back to the front.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { Task { await self?.refreshFromServer() } }
+        }
     }
+
+    /// Prices, app settings and (signed in) Pro status; at most every five minutes unless forced.
+    func refreshFromServer(force: Bool = false) async {
+        guard force || Date().timeIntervalSince(lastServerCheck) > 300 else { return }
+        lastServerCheck = Date()
+        await loadPublicSettings()
+        if isSignedIn { await refreshEntitlement() }
+    }
+
+    private func loadPublicSettings() async {
+        guard let base = AccountConfig.url, isConfigured else { return }
+        func get(_ path: String) async -> [[String: Any]]? {
+            var r = URLRequest(url: URL(string: path, relativeTo: base.appendingPathComponent("rest/v1/"))!)
+            r.setValue(AccountConfig.publishableKey, forHTTPHeaderField: "apikey")
+            guard let (data, resp) = try? await URLSession.shared.data(for: r), (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        }
+        if let rows = await get("plans?select=id,name,amount_paise,period&active=eq.true&order=amount_paise") {
+            let p = ProPlan.withSavings(rows.compactMap { r -> ProPlan? in
+                guard let id = r["id"] as? String, let amount = r["amount_paise"] as? Int, let period = r["period"] as? String else { return nil }
+                return ProPlan(id: id, title: period == "yearly" ? "Yearly" : "Monthly", amountPaise: amount, yearly: period == "yearly")
+            }.sorted { !$0.yearly && $1.yearly })
+            plans = p
+            if let data = try? JSONEncoder().encode(p) { UserDefaults.standard.set(data, forKey: "serverPlans") }
+        }
+        if let rows = await get("app_config?select=key,value") {
+            var s = AppSettings()
+            for r in rows {
+                switch r["key"] as? String {
+                case "export_requires_pro": s.exportRequiresPro = r["value"] as? Bool ?? true
+                case "announcement":
+                    let v = r["value"] as? [String: Any]
+                    s.announcement = v?["text"] as? String ?? ""
+                    s.announcementStyle = v?["style"] as? String ?? "info"
+                default: break
+                }
+            }
+            settings = s
+            if let data = try? JSONEncoder().encode(s) { UserDefaults.standard.set(data, forKey: "appSettings") }
+        }
+    }
+
+    /// Pro given from the admin console rather than bought.
+    var isGrantedPro: Bool { entitlement.status == "granted" }
 
     // MARK: - Google sign-in (Supabase Auth, PKCE, in a system browser sheet)
 

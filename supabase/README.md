@@ -9,9 +9,12 @@ needs Pro; editing, previewing and saving stay free.
 | `functions/subscription-checkout` | Signed-in user + plan → creates the Razorpay plan the first time, then a subscription; returns Razorpay's hosted payment page |
 | `functions/subscription-status` | Re-reads the user's subscriptions from Razorpay and answers whether they're Pro; `{"action":"cancel"}` cancels at the end of the period |
 | `functions/razorpay-subscription-webhook` | Razorpay's server-to-server notices (signature-checked), so renewals and cancellations land even while the app is closed |
+| `migrations/20261028010000_admin_console.sql` | `admins`, `pro_grants` (free Pro), `app_config` (export switch, announcement), `admin_audit`, the sale price on each subscription; the entitlement counts grants |
+| `functions/admin-api` | Everything the [admin console](../admin/README.md) does, for admins only: customers, grants, cancellations, blocking, plans, settings, admins, the activity log |
 
 Live project: **MotionForge** (`hknpofgdsqqsnztriguy`, South Asia/Mumbai) in Karthikvarma101's Org. Steps 1–5 and
-8 below are done for it; Google sign-in was verified end to end on 2026-10-28.
+8 below are done for it; Google sign-in was verified end to end on 2026-10-28. Both migrations ran and all four
+functions (including `admin-api`) are deployed. The admin console is at https://motionforge-admin.pages.dev.
 
 The app (`Sources/MotionForge/AccountModel.swift`) signs in with Google directly: PKCE in a system browser sheet
 against an iOS-type Google client, then Google's ID token is exchanged for a Supabase session

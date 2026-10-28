@@ -64,7 +64,7 @@ Deno.serve(async (req) => {
 
     const admin = createClient(Deno.env.get("SUPABASE_URL")!, serverKey(), { auth: { persistSession: false, autoRefreshToken: false } });
     const fields = {
-      status: s.status, current_start: iso(s.current_start), current_end: iso(s.current_end ?? s.ended_at),
+      status: s.status, current_start: iso(s.current_start), current_end: iso(s.ended_at ?? s.current_end),  // ended_at: when access really stops
       updated_at: new Date().toISOString(),
     };
     const { data: updated } = await admin.from("subscriptions").update(fields).eq("razorpay_subscription_id", id).select("id");

@@ -116,6 +116,7 @@ Deno.serve(async (req) => {
     });
     const { error } = await admin.from("subscriptions").insert({
       user_id: user.id, plan_id: plan.id, razorpay_subscription_id: sub.id, status: sub.status, short_url: sub.short_url,
+      amount_paise: plan.amount_paise,
     });
     if (error) throw new Error(error.message);
     return json({ subscription_id: sub.id, short_url: sub.short_url, status: sub.status });
