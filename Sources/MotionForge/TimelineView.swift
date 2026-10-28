@@ -42,8 +42,7 @@ struct KeyRowFramesKey: PreferenceKey {
 struct TimelineView: View {
     @ObservedObject var model: EditorModel
     @ObservedObject var time: TimeModel
-    @State private var zoom: Double = 1        // 1 = whole composition visible
-    @State private var viewStart: Double = 0
+    @ObservedObject var viewport: TimelineViewport
     @StateObject private var marquee = MarqueeModel()
     @State private var rowFrames: [KeyRowFrame] = []
 
@@ -53,11 +52,14 @@ struct TimelineView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TransportBar(model: model, time: time, zoom: $zoom)
+            CompositionStackBar(model: model)
+            Divider()
+            TransportBar(model: model, time: time, viewport: viewport)
             GeometryReader { geo in
                 let trackWidth = max(50, geo.size.width - Self.nameWidth - 12)
-                let visible = model.comp.duration / zoom
-                let start = min(max(0, viewStart), max(0, model.comp.duration - visible))
+                let _ = syncViewport(trackWidth)
+                let visible = viewport.visible
+                let start = min(max(0, viewport.start), max(0, model.comp.duration - visible))
                 let mapper = TimeMapper(start: start, end: start + visible, width: trackWidth)
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
@@ -70,9 +72,12 @@ struct TimelineView: View {
                     }
                     .frame(height: 26)
                     .background(Theme.panelDark)
-                    if zoom > 1 {
+                    if viewport.zoom > 1 {
                         NavigatorBar(duration: model.comp.duration, start: start, visible: visible, width: trackWidth) { s in
-                            viewStart = s
+                            viewport.start = s
+                            viewport.clamp()
+                        } onFit: {
+                            viewport.fit()
                         }
                         .padding(.leading, Self.nameWidth)
                     }
@@ -103,14 +108,15 @@ struct TimelineView: View {
                     }
                     }
                 }
+                .background(TimelineGestureCatcher(trackOffset: Self.nameWidth, viewport: viewport))
                 .onChange(of: marquee.committed) { _, r in
                     guard let r else { return }
                     selectKeys(in: r, mapper: mapper)
                     marquee.committed = nil
                 }
                 .onChange(of: time.time) { _, t in
-                    // Keep the playhead in view while zoomed.
-                    if zoom > 1, t < mapper.start || t > mapper.end { viewStart = max(0, t - visible * 0.1) }
+                    // Keep the playhead in view while zoomed (playback, stepping, jumping to keys).
+                    viewport.reveal(t)
                 }
             }
         }
@@ -119,6 +125,13 @@ struct TimelineView: View {
 }
 
 extension TimelineView {
+    /// The viewport needs the track width and composition length to clamp and anchor zooms.
+    fileprivate func syncViewport(_ trackWidth: CGFloat) {
+        viewport.trackWidth = trackWidth
+        viewport.duration = model.comp.duration
+        viewport.fps = model.comp.fps
+    }
+
     /// Keys whose row overlaps the rectangle and whose time falls inside its x-range.
     fileprivate func selectKeys(in r: CGRect, mapper: TimeMapper) {
         let t0 = mapper.t(r.minX - Self.nameWidth), t1 = mapper.t(r.maxX - Self.nameWidth)
@@ -153,7 +166,7 @@ private struct MarqueeOverlay: View {
 private struct TransportBar: View {
     @ObservedObject var model: EditorModel
     @ObservedObject var time: TimeModel
-    @Binding var zoom: Double
+    @ObservedObject var viewport: TimelineViewport
 
     var body: some View {
         HStack(spacing: 12) {
@@ -177,9 +190,19 @@ private struct TransportBar: View {
                 .toggleStyle(.button)
                 .help("Graph editor: value curves with ease handles for the selected keys")
             Spacer()
-            Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
-            Slider(value: $zoom, in: 1...32).frame(width: 120).help("Timeline zoom")
-            Image(systemName: "plus.magnifyingglass").foregroundStyle(.secondary)
+            Text(viewport.zoom > 1.001 ? "\(Timecode.string(viewport.visible, fps: model.comp.fps)) shown" : "whole comp")
+                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .trailing)
+            Button { model.zoomTimeline(by: 1 / 1.5) } label: { Image(systemName: "minus.magnifyingglass") }
+                .buttonStyle(.borderless).help("Zoom out (-)")
+            // Logarithmic: equal slider steps are equal zoom ratios, from the whole comp to single frames.
+            Slider(value: Binding(get: { log(viewport.zoom) / log(max(viewport.maxZoom, 1.0001)) },
+                                  set: { s in model.zoomTimeline(by: pow(max(viewport.maxZoom, 1.0001), s) / viewport.zoom) }),
+                   in: 0...1)
+                .frame(width: 120)
+                .help("Timeline zoom — or pinch / ⌥-scroll over the timeline; swipe sideways or ⇧-scroll to move through time; \\ shows the whole composition")
+            Button { model.zoomTimeline(by: 1.5) } label: { Image(systemName: "plus.magnifyingglass") }
+                .buttonStyle(.borderless).help("Zoom in (=)")
         }
         .padding(.horizontal, 10)
         .frame(height: 32)
@@ -267,6 +290,7 @@ private struct NavigatorBar: View {
     let visible: Double
     let width: CGFloat
     let onScroll: (Double) -> Void
+    let onFit: () -> Void
     @State private var dragStart: Double?
 
     var body: some View {
@@ -280,6 +304,8 @@ private struct NavigatorBar: View {
                     if dragStart == nil { dragStart = start }
                     onScroll(max(0, min(duration - visible, (dragStart ?? start) + Double(g.translation.width / k))))
                 }.onEnded { _ in dragStart = nil })
+                .onTapGesture(count: 2) { onFit() }
+                .help("Drag to scroll; double-click to show the whole composition")
         }
         .frame(width: width, height: 12, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -354,7 +380,7 @@ private struct LayerNameCell: View {
             .buttonStyle(.plain)
             Image(systemName: layer.icon).foregroundStyle(layer.kind == .precomp ? Theme.accent : .secondary).frame(width: 16)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) { if layer.kind == .precomp { model.openComposition(layer.sourceCompID) } }
+                .onTapGesture(count: 2) { if layer.kind == .precomp { model.openComposition(layer.sourceCompID, fromLayer: layer) } }
                 .help(layer.kind == .precomp ? "Double-click to open this precomp" : "")
             if renaming {
                 TextField("", text: $name)
@@ -409,6 +435,10 @@ struct LayerContextMenu: View {
     @ObservedObject var model: EditorModel
     let layer: MFLayerInfo
     var body: some View {
+        if layer.kind == .precomp {
+            Button("Open Precomp") { model.openComposition(layer.sourceCompID, fromLayer: layer) }
+            Divider()
+        }
         Button(model.selectedLayers.count > 1 && model.selectedLayers.contains(layer.layerID) ? "Duplicate Layers" : "Duplicate") {
             ensureSelected(); model.duplicateSelection()
         }

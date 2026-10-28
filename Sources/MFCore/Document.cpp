@@ -199,7 +199,10 @@ ObjectId Document::addComposition(const std::string& name, int width, int height
 bool Document::setActiveComposition(ObjectId comp) {
     if (!project_.findComposition(comp) || project_.activeComposition == comp) return false;
     project_.activeComposition = comp;
+    // Navigation, not an edit: views refresh, but a saved document stays saved.
+    const bool wasClean = !dirty();
     touched();
+    if (wasClean) markSaved();
     return true;
 }
 

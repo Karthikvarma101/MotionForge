@@ -83,8 +83,13 @@ final class EditorModel: ObservableObject {
     @Published private(set) var comp: MFCompositionInfo
     @Published private(set) var assets: [MFAssetInfo] = []
     @Published private(set) var compositions: [MFCompositionInfo] = []
-    /// Compositions opened from precomp layers, so "Back" returns to where you came from.
-    @Published private(set) var compHistory: [UInt64] = []
+    /// Timeline tabs: every composition opened this session, in the order they were opened.
+    @Published private(set) var compTabs: [UInt64] = []
+    /// How the current composition was reached, outermost first (it is the last entry).
+    @Published private(set) var compTrail: [UInt64] = []
+    /// Playhead and timeline zoom per composition, restored when you come back to it.
+    private var compMemory: [UInt64: (time: Double, zoom: Double, start: Double)] = [:]
+    let viewport = TimelineViewport()
     /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
     @Published var selection: UInt64? {
         didSet {
@@ -176,6 +181,7 @@ final class EditorModel: ObservableObject {
         comp = engine.composition
         assets = engine.assets()
         compositions = engine.compositions
+        syncCompNavigation()
         let ids = Set(layers.map(\.layerID))
         if !selectedLayers.isSubset(of: ids) { selectedLayers.formIntersection(ids) }
         if let s = selection, !ids.contains(s) { selection = selectedLayers.first }
@@ -277,20 +283,104 @@ final class EditorModel: ObservableObject {
         if id != 0 { selection = id }
     }
 
-    /// Switches the viewer, timeline and inspector to another composition.
-    func openComposition(_ id: UInt64, pushHistory: Bool = true) {
+    // MARK: - Composition navigation
+
+    /// Switches the viewer, timeline and inspector to another composition. With `fromLayer` (a
+    /// precomp layer of the current composition showing it) the breadcrumb goes one level deeper
+    /// and the playhead maps into the precomp's own time.
+    func openComposition(_ id: UInt64, fromLayer layer: MFLayerInfo? = nil) {
         guard id != comp.compID, compositions.contains(where: { $0.compID == id }) else { return }
         closeCoalescedEdit()
-        if pushHistory { compHistory.append(comp.compID) }
+        var mapped: Double?
+        if let layer, layer.kind == .precomp, layer.sourceCompID == id {
+            let t = time.time
+            mapped = layer.timeRemapEnabled ? engine.value(of: .timeRemap, layer: layer.layerID, time: t).x : t - layer.startTime
+        }
+        compMemory[comp.compID] = (time.time, viewport.zoom, viewport.start)
+        if let i = compTrail.firstIndex(of: id) {
+            compTrail.removeSubrange((i + 1)...)        // back up the trail
+        } else if mapped != nil {
+            compTrail.append(id)                         // one level down
+        } else {
+            compTrail = pathToComposition(id)            // from a tab or the project panel
+        }
+        if !compTabs.contains(id) { compTabs.append(id) }
         clearSelection()
         selectedLayers = []
+        time.isPlaying = false
         _ = engine.openComposition(id)
         refresh()
+        let memory = compMemory[id]
+        viewport.duration = comp.duration
+        viewport.fps = comp.fps
+        viewport.zoom = memory?.zoom ?? 1
+        viewport.start = memory?.start ?? 0
+        viewport.clamp()
+        let newTime = min(max(0, mapped ?? memory?.time ?? 0), max(0, comp.duration - 1 / comp.fps))
+        viewport.skipNextReveal = mapped == nil && newTime != time.time
+        time.time = newTime
+        if mapped != nil { viewport.reveal(newTime) }
     }
 
-    func goBackComposition() {
-        guard let id = compHistory.popLast() else { return }
-        openComposition(id, pushHistory: false)
+    /// Opens a precomp of the current composition (the first layer that shows `sourceID`).
+    func openPrecomp(sourceID: UInt64) {
+        openComposition(sourceID, fromLayer: layers.first { $0.kind == .precomp && $0.sourceCompID == sourceID })
+    }
+
+    func goToParentComposition() {
+        guard compTrail.count > 1 else { return }
+        openComposition(compTrail[compTrail.count - 2])
+    }
+
+    func closeCompositionTab(_ id: UInt64) {
+        guard compTabs.count > 1, let i = compTabs.firstIndex(of: id) else { return }
+        compTabs.remove(at: i)
+        if id == comp.compID { openComposition(compTabs[min(i, compTabs.count - 1)]) }
+    }
+
+    /// Distinct compositions shown by precomp layers of the current one, top of the stack first.
+    var precompsInCurrentComposition: [MFCompositionInfo] {
+        var seen = Set<UInt64>()
+        return layers.compactMap { l in
+            guard l.kind == .precomp, seen.insert(l.sourceCompID).inserted else { return nil }
+            return compositions.first { $0.compID == l.sourceCompID }
+        }
+    }
+
+    var parentsOfCurrentComposition: [MFCompositionInfo] {
+        compositions.filter { $0.precompSources.contains(NSNumber(value: comp.compID)) }
+    }
+
+    /// Outermost composition down to `id`, following the first parent at each level.
+    private func pathToComposition(_ id: UInt64) -> [UInt64] {
+        var path = [id]
+        var current = id
+        while path.count < 64,
+              let parent = compositions.first(where: { $0.precompSources.contains(NSNumber(value: current)) && !path.contains($0.compID) }) {
+            path.insert(parent.compID, at: 0)
+            current = parent.compID
+        }
+        return path
+    }
+
+    /// Keeps tabs and trail valid after undo, open, new project or deleted compositions.
+    private func syncCompNavigation() {
+        let ids = Set(compositions.map(\.compID))
+        compTabs.removeAll { !ids.contains($0) }
+        compTrail.removeAll { !ids.contains($0) }
+        let current = comp.compID
+        if !compTabs.contains(current) { compTabs.append(current) }
+        if compTrail.last != current { compTrail = pathToComposition(current) }
+        viewport.duration = comp.duration
+        viewport.fps = comp.fps
+    }
+
+    /// A different document: start again from its active composition.
+    private func resetCompNavigation() {
+        compTabs = [comp.compID]
+        compTrail = pathToComposition(comp.compID)
+        compMemory = [:]
+        viewport.fit()
     }
 
     func addPrecompLayer(source: UInt64) {
@@ -303,6 +393,10 @@ final class EditorModel: ObservableObject {
         var id: UInt64 = 0
         edit { id = $0.addComposition(name: "", width: comp.width, height: comp.height, fps: comp.fps, duration: comp.duration) }
         if id != 0 { openComposition(id) }
+    }
+
+    func zoomTimeline(by factor: Double) {
+        viewport.zoom(by: factor, anchorX: viewport.x(of: time.time))
     }
 
     func addImageLayer(asset: UInt64) {
@@ -601,6 +695,7 @@ final class EditorModel: ObservableObject {
         zoom = nil
         pan = .zero
         refresh()
+        resetCompNavigation()
         RecoveryStore.clear()
     }
 
@@ -620,6 +715,7 @@ final class EditorModel: ObservableObject {
             zoom = nil
             pan = .zero
             refresh()
+            resetCompNavigation()
             RecoveryStore.clear()
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
             let missing = assets.filter(\.missing).map(\.name)
@@ -757,6 +853,10 @@ final class EditorModel: ObservableObject {
     private func handleKey(_ event: NSEvent) -> Bool {
         if let responder = event.window?.firstResponder, responder is NSText || responder is NSTextView { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control])
+        if mods == [.command] && event.modifierFlags.contains(.shift) && event.keyCode == 126 {  // ⌘⇧↑
+            goToParentComposition()
+            return true
+        }
         if mods == [.command] && !event.modifierFlags.contains(.shift) {
             switch event.keyCode {
             case 8: copySelection(); return true    // ⌘C
@@ -785,6 +885,9 @@ final class EditorModel: ObservableObject {
         case 36, 76:                                                             // return / enter
             if tool == .pen && penDraft.count >= 2 { commitPen(closed: false); return true }
             return false
+        case 24: zoomTimeline(by: 1.5); return true                               // = zoom timeline in
+        case 27: zoomTimeline(by: 1 / 1.5); return true                           // - zoom out
+        case 42: viewport.fit(); return true                                      // \ whole composition
         case 35: tool = .pen; return true                                         // P
         case 9: tool = .select; return true                                       // V
         default: return false

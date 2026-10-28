@@ -7,5 +7,5 @@ cd "${0:A:h}/.."
 OUT="${1:-build/ui-demo}"
 [[ -d build/MotionForge.app ]] || scripts/bundle.sh release
 rm -rf "$OUT"; mkdir -p "$OUT"
-MOTIONFORGE_UIDEMO="${OUT:A}" build/MotionForge.app/Contents/MacOS/MotionForge
+MOTIONFORGE_RECOVERY_DIR="${OUT:A}/recovery" MOTIONFORGE_UIDEMO="${OUT:A}" build/MotionForge.app/Contents/MacOS/MotionForge
 echo "Screenshots and ui-demo.json in $OUT"

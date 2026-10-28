@@ -226,6 +226,8 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) MFValue background;
 @property(nonatomic, readonly, copy) NSString* folder;  // "" = top level
 @property(nonatomic, readonly) NSInteger layerCount;
+// Compositions shown by this one's precomp layers (each once, in stack order).
+@property(nonatomic, readonly) NSArray<NSNumber*>* precompSources;
 @end
 
 @interface MFAssetInfo : NSObject

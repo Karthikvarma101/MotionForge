@@ -40,6 +40,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated { if let model = self.model { UIDemo.run(model: model, outputDirectory: dir) } }
             }
         }
+        // Open a project at launch (scripts, or launching the binary directly).
+        if let path = ProcessInfo.processInfo.environment["MOTIONFORGE_OPEN"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                MainActor.assumeIsolated {
+                    guard let model = self.model else { return }
+                    model.open(url: URL(fileURLWithPath: path))
+                    // Composition navigation and timeline-gesture check (scripts/ui-demo-nav.sh).
+                    if let dir = ProcessInfo.processInfo.environment["MOTIONFORGE_UIDEMO_NAV"] {
+                        UIDemo.runNavigation(model: model, outputDirectory: dir)
+                    }
+                }
+            }
+        }
     }
 
     @MainActor private func snapshotAndQuit(_ path: String) {
@@ -89,7 +102,7 @@ struct ContentView: View {
                         }
                     }
                     .frame(minHeight: 260, idealHeight: 560)
-                    TimelineView(model: model, time: model.time)
+                    TimelineView(model: model, time: model.time, viewport: model.viewport)
                         .frame(minHeight: 170, idealHeight: 300)
                 }
                 .frame(minWidth: 560)

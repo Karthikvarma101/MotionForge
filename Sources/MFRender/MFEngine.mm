@@ -421,6 +421,10 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         _background = toMF(c.background);
         _folder = @(c.folder.c_str());
         _layerCount = NSInteger(c.layers.size());
+        NSMutableArray* sources = [NSMutableArray array];
+        for (const Layer& l : c.layers)
+            if (l.kind == LayerKind::Precomp && l.source != 0 && ![sources containsObject:@(l.source)]) [sources addObject:@(l.source)];
+        _precompSources = sources;
     }
     return self;
 }

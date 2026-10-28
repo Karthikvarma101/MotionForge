@@ -120,8 +120,8 @@ struct ProjectPanel: View {
         VStack(spacing: 0) {
             List {
                 Section("Composition") {
-                    if let back = model.compHistory.last, let parent = model.compositions.first(where: { $0.compID == back }) {
-                        Button { model.goBackComposition() } label: {
+                    if model.compTrail.count > 1, let parent = model.compositions.first(where: { $0.compID == model.compTrail[model.compTrail.count - 2] }) {
+                        Button { model.goToParentComposition() } label: {
                             Label("Back to \(parent.name)", systemImage: "chevron.left").font(.system(size: 11))
                         }
                         .buttonStyle(.plain)

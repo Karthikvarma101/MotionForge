@@ -57,6 +57,7 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `make bench` | Run the renderer benchmark, write `benchmarks/results-<date>.md` |
 | `make sample` | Render the position / scale / opacity demo into `Examples/demo/`, the effects sheet into `Examples/effects/` and the text / path sheet into `Examples/phase4/` |
 | `scripts/ui-demo.sh` | Launch the real app, drive it (click, drag, edit, undo, play, save), screenshot each step into `build/ui-demo/` |
+| `scripts/ui-demo-nav.sh project.mfproj` | Open a nested project and go master › scene › rig through tabs and breadcrumb; zoom with ⌥-scroll and scroll with sideways swipes (scroll events sent inside the app). Screenshots go to `build/ui-demo-nav/` |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
 
@@ -72,7 +73,24 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   on, any change writes a keyframe at the playhead. ◀ ◆ ▶ jumps between, adds or removes keys.
 - **Timeline**: drag a bar to slide it, its ends to trim; twirl a layer open to see property rows;
   drag keyframes to retime them (frame-snapped), right-click for Linear / Easy Ease / Ease In /
-  Ease Out / Hold. Drag in the ruler to scrub. Zoom with the slider; the navigator bar scrolls.
+  Ease Out / Hold. Drag in the ruler to scrub.
+- **Timeline zoom and scroll**:
+  - **Zoom:** pinch on the trackpad, or ⌥- / ⌘-scroll with a mouse or trackpad. The zoom centres
+    on the pointer, from the whole composition down to single frames (about 40 px per frame).
+  - **Scroll through time:** swipe sideways with two fingers, or ⇧-scroll with a mouse wheel.
+  - **Vertical scrolling** still moves the layer list.
+  - **Keys:** = and − zoom around the playhead; \\ shows the whole composition. The slider is
+    logarithmic.
+  - **Navigator bar:** drag it to scroll; double-click it to fit the whole composition.
+- **Compositions and precomps**:
+  - **Open a precomp:** double-click its icon in the timeline, choose *Open Precomp* from its
+    context menu, or use *Open* in the inspector. The playhead moves to the matching time inside
+    it, including through time remapping.
+  - **Tabs:** every composition you open gets a tab above the timeline. Switching back to one
+    restores its playhead, zoom and scroll position.
+  - **Breadcrumb:** the trail under the tabs shows how you got there (master › scene › rig).
+    Click any level to go back up, or press ⌘⇧↑ for the parent. Its menus list the precomps
+    inside the current composition and the compositions that use it.
 - **Playback**: Space, Home/End, Page Up/Down (or ⌘←/⌘→) for frame steps. The status bar
   shows presented fps, dropped frames, CPU eval/encode time, GPU time, frame-cache use and GPU memory.
 - **Preview quality**: Auto / Full / Half / Quarter. The viewer footer always states the actual
@@ -300,6 +318,7 @@ MotionForge/
 │   │   ├── EditorModel.swift          UI state, edits, files, autosave, memory pressure, shortcuts
 │   │   ├── ViewerView.swift           MTKView viewer, playback clock, direct manipulation
 │   │   ├── TimelineView.swift         ruler, layer bars, property rows, keyframes
+│   │   ├── TimelineNavigation.swift   composition tabs + breadcrumb, timeline zoom/scroll gestures
 │   │   ├── GraphEditorView.swift      value curves with ease / speed handles
 │   │   ├── NodeGraphView.swift        node workspace (layer stack as Source → Masks → Effects → Composite)
 │   │   ├── InspectorView.swift        layer / transform / shape / text / animator / mask / effect properties

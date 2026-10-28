@@ -1560,6 +1560,24 @@ TEST(precomp_group_opacity_and_time) {
     CHECK(evaluateFrame(d.project(), c, 2.0).hash != h0);
 }
 
+TEST(switching_compositions_is_not_an_edit) {
+    Document d(makeDefaultProject(800, 400, 30, 5));
+    const ObjectId main = d.project().activeComposition;
+    const ObjectId other = d.addComposition("Other", 400, 200, 30, 5);
+    d.markSaved();
+    const uint64_t rev = d.revision();
+    const size_t undo = d.undoDepth();
+    CHECK(d.setActiveComposition(other));
+    CHECK(d.revision() > rev);       // views refresh
+    CHECK(!d.dirty());               // but the saved document stays saved
+    CHECK(d.undoDepth() == undo);    // and there is nothing to undo
+    CHECK(!d.setActiveComposition(other));
+    d.addLayer(other, LayerKind::Shape);
+    CHECK(d.dirty());
+    CHECK(d.setActiveComposition(main));
+    CHECK(d.dirty());                // unsaved edits stay unsaved
+}
+
 TEST(baked_tracks_evaluate_edit_and_save) {
     Document d(makeDefaultProject(800, 400, 30, 5));
     const ObjectId comp = d.project().activeComposition;

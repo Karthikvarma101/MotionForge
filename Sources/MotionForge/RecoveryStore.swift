@@ -14,7 +14,11 @@ enum RecoveryStore {
     }
 
     static var directory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        // Scripted runs use their own folder so they never touch a running editor's autosave.
+        if let dir = ProcessInfo.processInfo.environment["MOTIONFORGE_RECOVERY_DIR"] {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MotionForge/Recovery", isDirectory: true)
     }
 

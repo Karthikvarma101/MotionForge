@@ -58,7 +58,8 @@ public:
     bool setCompositionSettings(ObjectId comp, int width, int height, double fps, double duration, Value background,
                                 const std::string& name);
     ObjectId addComposition(const std::string& name, int width, int height, double fps, double duration);
-    // Which composition the editor shows. Not an undoable edit (like scrolling), but saved.
+    // Which composition the editor shows. Like scrolling, not an undoable edit and it doesn't make
+    // a saved document dirty; it is written with the next save.
     bool setActiveComposition(ObjectId comp);
     // A layer showing `source` in `comp`; refused when it would make a composition contain itself.
     ObjectId addPrecompLayer(ObjectId comp, ObjectId source);

@@ -342,7 +342,7 @@ private struct PrecompSection: View {
                     Image(systemName: "square.stack.3d.up").foregroundStyle(Theme.accent)
                     Text(source?.name ?? "Missing composition").lineLimit(1)
                     Spacer()
-                    Button("Open") { model.openComposition(layer.sourceCompID) }
+                    Button("Open") { model.openComposition(layer.sourceCompID, fromLayer: layer) }
                         .disabled(source == nil)
                         .help("Edit the source composition (double-click the layer in the timeline does the same)")
                 }

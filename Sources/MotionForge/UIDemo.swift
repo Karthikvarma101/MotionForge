@@ -301,6 +301,111 @@ enum UIDemo {
         }
     }
 
+    /// Composition tabs / breadcrumb and timeline zoom + scroll on a real nested project
+    /// (`scripts/ui-demo-nav.sh`). Precomps are opened through the same call as double-clicking one;
+    /// scroll events go through the app's own event dispatch, so the cursor never moves.
+    static func runNavigation(model: EditorModel, outputDirectory: String) {
+        Task { @MainActor in
+            let out = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            var log: [[String: Any]] = []
+            guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) else {
+                print("ui-demo-nav: no window"); exit(4)
+            }
+            window.makeKeyAndOrderFront(nil)
+            let vp = model.viewport
+            @MainActor func names(_ ids: [UInt64]) -> [String] { ids.map { id in model.compositions.first { $0.compID == id }?.name ?? "?" } }
+            @MainActor func record(_ name: String, _ extra: [String: Any] = [:]) async {
+                try? await Task.sleep(for: .seconds(0.8))
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                p.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", out.appendingPathComponent("\(name).png").path]
+                try? p.run()
+                p.waitUntilExit()
+                var e: [String: Any] = ["step": name, "comp": model.comp.name, "tabs": names(model.compTabs),
+                                        "trail": names(model.compTrail), "time": model.time.time,
+                                        "zoom": vp.zoom, "start": vp.start, "visible": vp.visible]
+                e.merge(extra) { a, _ in a }
+                log.append(e)
+                print("ui-demo-nav \(name): \(e)")
+            }
+
+            model.time.time = 50  // inside the Mountain Pose scene
+            await record("nav-01-master")
+
+            // Down one level: the scene precomp under the playhead.
+            let t = model.time.time
+            if let scene = model.layers.first(where: { $0.kind == .precomp && $0.inPoint <= t && t < $0.outPoint && $0.name.hasPrefix("YB") }) {
+                model.openComposition(scene.sourceCompID, fromLayer: scene)
+                await record("nav-02-scene", ["expectedTime": t - scene.startTime])
+            }
+            // And again: the teacher's rig inside the scene.
+            if let rig = model.layers.first(where: { $0.kind == .precomp && $0.name.contains("TEACHER") }) {
+                model.openComposition(rig.sourceCompID, fromLayer: rig)
+                await record("nav-03-rig")
+            }
+
+            // Timeline gestures over the track area: ⌥-scroll zooms around the pointer, a
+            // horizontal trackpad swipe scrolls through time, plain vertical scrolling is left alone.
+            if let gestures = findGestureView(in: window.contentView) {
+                let p = CGPoint(x: gestures.trackOffset + 200, y: gestures.bounds.midY)
+                let anchor = vp.start + Double(200 / vp.trackWidth) * vp.visible
+                for _ in 0..<12 { scroll(gestures, at: p, dx: 0, dy: 20, flags: .option) }
+                let anchorAfter = vp.start + Double(200 / vp.trackWidth) * vp.visible
+                await record("nav-04-option-scroll-zoom", ["timeUnderPointerBefore": anchor, "timeUnderPointerAfter": anchorAfter])
+                let before = vp.start
+                for _ in 0..<10 { scroll(gestures, at: p, dx: -40, dy: 0) }
+                await record("nav-05-swipe-scroll", ["startBefore": before])
+                let zoomBefore = vp.zoom, startBefore = vp.start
+                for _ in 0..<5 { scroll(gestures, at: p, dx: 0, dy: -30) }
+                await record("nav-06-vertical-left-to-list", ["zoomUnchanged": vp.zoom == zoomBefore, "startUnchanged": vp.start == startBefore])
+            } else {
+                print("ui-demo-nav: no timeline gesture view")
+            }
+
+            // Breadcrumb: jump straight back to the master; its playhead and zoom come back.
+            if let root = model.compTrail.first {
+                model.openComposition(root)
+                await record("nav-07-breadcrumb-to-master")
+            }
+            // Tabs: switch to the rig's tab, then close the scene's tab.
+            if model.compTabs.count >= 3 {
+                model.openComposition(model.compTabs[2])
+                await record("nav-08-tab-switch")
+                model.closeCompositionTab(model.compTabs[1])
+                await record("nav-09-tab-closed")
+            }
+
+            if let data = try? JSONSerialization.data(withJSONObject: log, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: out.appendingPathComponent("ui-demo-nav.json"))
+            }
+            model.applicationWillTerminate()
+            exit(0)
+        }
+    }
+
+    private static func findGestureView(in view: NSView?) -> TimelineGestureView? {
+        guard let view else { return nil }
+        if let v = view as? TimelineGestureView { return v }
+        for sub in view.subviews { if let v = findGestureView(in: sub) { return v } }
+        return nil
+    }
+
+    /// A continuous (trackpad-style, pixel) scroll event at `p` in `view`, dispatched in-app.
+    private static func scroll(_ view: NSView, at p: CGPoint, dx: Int32, dy: Int32, flags: NSEvent.ModifierFlags = []) {
+        guard let window = view.window,
+              let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+        cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        let screen = window.convertPoint(toScreen: view.convert(p, to: nil))
+        cg.location = CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.height ?? 0) - screen.y)
+        var f: CGEventFlags = []
+        if flags.contains(.option) { f.insert(.maskAlternate) }
+        if flags.contains(.command) { f.insert(.maskCommand) }
+        if flags.contains(.shift) { f.insert(.maskShift) }
+        cg.flags = f
+        if let e = NSEvent(cgEvent: cg) { NSApp.sendEvent(e) }
+    }
+
     private static func findViewer(in view: NSView?) -> ViewerMTKView? {
         guard let view else { return nil }
         if let v = view as? ViewerMTKView { return v }
