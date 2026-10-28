@@ -458,6 +458,31 @@ kernel void fx_ramp(texture2d<float, access::read> src [[texture(0)]],
     dst.write(mix(ramp, o, p.d.y), gid);
 }
 
+// Export: running average of motion-blur subframes. a.x = weight, a.y = 1 for the first one.
+kernel void fx_accum(texture2d<float, access::read> src [[texture(0)]],
+                     texture2d<float, access::read_write> acc [[texture(1)]],
+                     constant FxParams& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= acc.get_width() || gid.y >= acc.get_height()) return;
+    const float4 s = src.read(gid) * p.a.x;
+    acc.write(p.a.y > 0.5f ? s : acc.read(gid) + s, gid);
+}
+
+// Export: premultiplied frame -> 8-bit BGRA. b.x = 0: over the background colour a.rgb (opaque
+// video); b.x = 1: straight alpha (ProRes 4444).
+kernel void to_bgra8(texture2d<float, access::read> src [[texture(0)]],
+                     texture2d<float, access::write> dst [[texture(1)]],
+                     constant FxParams& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (outside(gid, dst)) return;
+    float4 c = src.read(gid);
+    if (p.b.x > 0.5f) {
+        c.rgb = c.a > 0.0f ? c.rgb / c.a : float3(0.0f);
+    } else {
+        c.rgb += p.a.rgb * (1.0f - c.a);
+        c.a = 1.0f;
+    }
+    dst.write(saturate(c), gid);
+}
+
 // Frame-cache copy: RGBA16F -> RGBA8 (premultiplied). Half the memory, same 8-bit display output.
 kernel void to_rgba8(texture2d<float, access::read> src [[texture(0)]],
                      texture2d<float, access::write> dst [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {

@@ -501,6 +501,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (BOOL)dirty { return _doc.dirty(); }
 
 - (ObjectId)compID { return _doc.project().activeComposition; }
+- (mf::Project)mf_projectSnapshot { return _doc.project(); }  // cheap: baked tracks are shared
 - (const Composition*)comp { return _doc.project().activeComp(); }
 
 // ---- project ----

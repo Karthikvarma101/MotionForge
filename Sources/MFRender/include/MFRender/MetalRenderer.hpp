@@ -96,6 +96,10 @@ public:
 
     // Synchronous render + readback of premultiplied RGBA floats (tests, CLI, export).
     bool renderToRGBA(const FrameDesc& f, std::vector<float>& rgba, double* gpuMs, std::string& error);
+    // Video export: the average of `subframes` (motion-blur samples, or just one frame) as 8-bit
+    // BGRA rows, composited over `background` (opaque) or with straight alpha. Synchronous.
+    bool renderToBGRA8(const std::vector<FrameDesc>& subframes, const Value& background, bool straightAlpha,
+                       uint8_t* dst, size_t dstRowBytes, std::string& error);
 
     // ---- frame cache --------------------------------------------------------------------
     bool cacheContains(uint64_t hash) const;
@@ -171,7 +175,9 @@ private:
     id<MTLRenderPipelineState> glyphPSO_ = nil, maskApplyPSO_ = nil;
     std::unique_ptr<GlyphSheetCache> glyphs_;
     id<MTLComputePipelineState> fxShadow_ = nil, fxOver_ = nil, fxBright_ = nil, fxGlow_ = nil, fxColor_ = nil,
-                                fxMatte_ = nil, fxRamp_ = nil, toRGBA8_ = nil;
+                                fxMatte_ = nil, fxRamp_ = nil, toRGBA8_ = nil, fxAccum_ = nil, toBGRA8_ = nil;
+    id<MTLTexture> exportTexture_ = nil;  // BGRA8 export frame, reused while the size stays
+    id<MTLBuffer> exportBuffer_ = nil;
     id<MTLFunction> presentVS_ = nil, presentFS_ = nil;
     std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> presentPSOs_;  // by drawable pixel format
     id<MTLSamplerState> linearMip_ = nil, linear_ = nil, nearest_ = nil;

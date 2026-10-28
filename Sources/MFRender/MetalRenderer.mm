@@ -371,11 +371,13 @@ bool MetalRenderer::init(id<MTLDevice> device, std::string& error) {
     fxColor_ = makeKernel(@"fx_color");
     fxMatte_ = makeKernel(@"fx_matte");
     fxRamp_ = makeKernel(@"fx_ramp");
+    fxAccum_ = makeKernel(@"fx_accum");
+    toBGRA8_ = makeKernel(@"to_bgra8");
     toRGBA8_ = makeKernel(@"to_rgba8");
     presentVS_ = [lib newFunctionWithName:@"present_vertex"];
     presentFS_ = [lib newFunctionWithName:@"present_fragment"];
     if (!shapePSO_ || !imagePSO_ || !shapeMaskPSO_ || !imageMaskPSO_ || !glyphPSO_ || !maskApplyPSO_ || !shapePathPSO_ ||
-        !shapePathMaskPSO_ || !imagePathMaskPSO_ || !fxShadow_ || !fxOver_ || !fxBright_ || !fxGlow_ || !fxColor_ || !fxMatte_ || !fxRamp_ ||
+        !shapePathMaskPSO_ || !imagePathMaskPSO_ || !fxShadow_ || !fxOver_ || !fxBright_ || !fxGlow_ || !fxColor_ || !fxMatte_ || !fxRamp_ || !fxAccum_ || !toBGRA8_ ||
         !toRGBA8_ || !presentVS_ || !presentFS_) {
         if (error.empty()) error = "Missing shader functions";
         return false;
@@ -1280,6 +1282,78 @@ bool MetalRenderer::renderToRGBA(const FrameDesc& f, std::vector<float>& rgba, d
     rgba.resize(count);
     const auto* half = static_cast<const _Float16*>(rb.contents);
     for (size_t i = 0; i < count; ++i) rgba[i] = float(half[i]);
+    return true;
+}
+
+bool MetalRenderer::renderToBGRA8(const std::vector<FrameDesc>& subframes, const Value& background, bool straightAlpha,
+                                  uint8_t* dst, size_t dstRowBytes, std::string& error) {
+    if (subframes.empty()) {
+        error = "Nothing to render";
+        return false;
+    }
+    const int w = subframes[0].width, h = subframes[0].height;
+    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+    bool complete = true;
+    std::vector<id<MTLTexture>> used;
+    id<MTLTexture> image = nil;
+    if (subframes.size() == 1) {
+        image = acquire(w, h, PoolKind::Target);
+        used.push_back(image);
+        encodeComposite(subframes[0], cb, image, &complete);
+    } else {
+        image = acquire(w, h, PoolKind::Scratch);
+        used.push_back(image);
+        for (size_t k = 0; k < subframes.size(); ++k) {
+            id<MTLTexture> t = acquire(w, h, PoolKind::Target);
+            used.push_back(t);
+            bool c = true;
+            encodeComposite(subframes[k], cb, t, &c);
+            complete = complete && c;
+            FxParams p;
+            p.a[0] = 1.f / float(subframes.size());
+            p.a[1] = k == 0 ? 1.f : 0.f;
+            runKernel(cb, fxAccum_, {t, image}, &p, sizeof p);
+        }
+    }
+    if (!exportTexture_ || int(exportTexture_.width) != w || int(exportTexture_.height) != h) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                      width:NSUInteger(w)
+                                                                                     height:NSUInteger(h)
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        exportTexture_ = [device_ newTextureWithDescriptor:td];
+        exportBuffer_ = [device_ newBufferWithLength:size_t(w) * size_t(h) * 4 options:MTLResourceStorageModeShared];
+    }
+    FxParams q;
+    for (int i = 0; i < 3; ++i) q.a[i] = float(background[size_t(i)]);
+    q.b[0] = straightAlpha ? 1.f : 0.f;
+    runKernel(cb, toBGRA8_, {image, exportTexture_}, &q, sizeof q);
+    const size_t rowBytes = size_t(w) * 4;
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:exportTexture_
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(NSUInteger(w), NSUInteger(h), 1)
+                        toBuffer:exportBuffer_
+               destinationOffset:0
+          destinationBytesPerRow:rowBytes
+        destinationBytesPerImage:rowBytes * size_t(h)];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    for (id<MTLTexture> t : used) recycle(t);
+    if (cb.status == MTLCommandBufferStatusError) {
+        error = std::string("GPU error: ") + (cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        return false;
+    }
+    if (!complete) {
+        error = "Frame references media that is not loaded";
+        return false;
+    }
+    const auto* src = static_cast<const uint8_t*>(exportBuffer_.contents);
+    for (int y = 0; y < h; ++y) std::memcpy(dst + size_t(y) * dstRowBytes, src + size_t(y) * rowBytes, rowBytes);
     return true;
 }
 

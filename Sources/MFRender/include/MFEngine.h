@@ -275,6 +275,48 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) NSInteger offscreenLayers;
 @end
 
+typedef NS_ENUM(NSInteger, MFExportFormat) {
+    MFExportFormatH264 NS_SWIFT_NAME(h264) = 0,
+    MFExportFormatHEVC NS_SWIFT_NAME(hevc),
+    MFExportFormatProRes422 NS_SWIFT_NAME(proRes422),
+    MFExportFormatProRes4444 NS_SWIFT_NAME(proRes4444),
+    MFExportFormatPNGSequence NS_SWIFT_NAME(pngSequence)
+};
+
+// What to export and how. Defaults: H.264 at the composition's size, the whole composition, with
+// the composition's motion blur, automatic bitrate, no soundtrack.
+@interface MFExportSettings : NSObject
+@property(nonatomic) MFExportFormat format;
+@property(nonatomic) double scale;                     // 1 = composition size, 0.5 = half
+@property(nonatomic) double startTime;                 // seconds
+@property(nonatomic) double endTime;                   // seconds; <= startTime means to the end
+@property(nonatomic) BOOL motionBlur;
+@property(nonatomic) NSInteger bitsPerSecond;          // H.264 / HEVC; 0 = automatic
+@property(nonatomic, copy, nullable) NSString* audioPath;  // encoded as AAC, trimmed to the video
+@end
+
+@interface MFExportProgress : NSObject
+@property(nonatomic, readonly) NSInteger framesDone;
+@property(nonatomic, readonly) NSInteger framesTotal;
+@property(nonatomic, readonly) double elapsed;          // seconds since the export started
+@property(nonatomic, readonly) double framesPerSecond;  // render + encode speed so far
+@end
+
+@class MFEngine;
+
+// Renders the active composition to a movie (or PNG sequence folder) on a background queue. It
+// works from a snapshot of the project taken at init, so editing can carry on meanwhile. Uses its
+// own renderer and the hardware encoders; callbacks arrive on the main queue.
+@interface MFVideoExporter : NSObject
+- (nullable instancetype)initWithEngine:(MFEngine*)engine settings:(MFExportSettings*)settings
+                             outputPath:(NSString*)path error:(NSError**)error;
+- (instancetype)init NS_UNAVAILABLE;
+@property(nonatomic, readonly, copy) NSString* outputPath;
+- (void)startWithProgress:(void (^)(MFExportProgress* progress))progress
+               completion:(void (^)(NSError* _Nullable error))completion;
+- (void)cancel;  // the partial file is removed; completion reports a cancellation error
+@end
+
 @interface MFEngine : NSObject
 
 - (nullable instancetype)initWithDevice:(nullable id<MTLDevice>)device error:(NSError**)error NS_DESIGNATED_INITIALIZER;

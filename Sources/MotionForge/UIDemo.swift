@@ -1,5 +1,6 @@
 import AppKit
 import MFRender
+import SwiftUI
 
 /// Scripted end-to-end check of the real editor UI, used by `scripts/ui-demo.sh`.
 ///
@@ -319,7 +320,8 @@ enum UIDemo {
                 try? await Task.sleep(for: .seconds(0.8))
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-                p.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", out.appendingPathComponent("\(name).png").path]
+                let file = out.appendingPathComponent("\(name).png").path
+                p.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", file]
                 try? p.run()
                 p.waitUntilExit()
                 var e: [String: Any] = ["step": name, "comp": model.comp.name, "tabs": names(model.compTabs),
@@ -375,6 +377,38 @@ enum UIDemo {
                 model.closeCompositionTab(model.compTabs[1])
                 await record("nav-09-tab-closed")
             }
+
+            // Export: the sheet, then a short background export through the same call the sheet's
+            // Export button makes after the save panel (which needs a person to answer).
+            // A window with a sheet attached can't be captured by id, so the sheet's view is shown in
+            // a window of its own for the screenshot.
+            let sheetWindow = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 520, height: 560),
+                                       styleMask: [.titled], backing: .buffered, defer: false)
+            sheetWindow.contentView = NSHostingView(rootView: ExportSheet(model: model).preferredColorScheme(.dark))
+            sheetWindow.setContentSize(sheetWindow.contentView!.fittingSize)
+            sheetWindow.orderFront(nil)
+            try? await Task.sleep(for: .seconds(0.8))
+            let cap = Process()
+            cap.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            cap.arguments = ["-x", "-o", "-l", "\(sheetWindow.windowNumber)", out.appendingPathComponent("nav-10-export-sheet.png").path]
+            try? cap.run()
+            cap.waitUntilExit()
+            sheetWindow.orderOut(nil)
+            let settings = MFExportSettings()
+            settings.format = .h264
+            settings.scale = 0.5
+            settings.startTime = 4
+            settings.endTime = 10
+            settings.bitsPerSecond = 10_000_000
+            let movie = out.appendingPathComponent("export-test.mp4")
+            model.startExport(settings, to: movie)
+            try? await Task.sleep(for: .seconds(0.6))
+            await record("nav-11-exporting", ["exportDone": model.exportStatus?.done ?? -1, "exportTotal": model.exportStatus?.total ?? -1])
+            for _ in 0..<120 where model.exporter != nil { try? await Task.sleep(for: .seconds(0.25)) }
+            let size = (try? FileManager.default.attributesOfItem(atPath: movie.path)[.size] as? Int) ?? 0
+            await record("nav-12-exported", ["exportFinished": model.exportStatus?.finished ?? false,
+                                             "exportError": model.exportStatus?.error ?? "", "exportBytes": size,
+                                             "exportSeconds": model.exportStatus?.elapsed ?? 0])
 
             if let data = try? JSONSerialization.data(withJSONObject: log, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: out.appendingPathComponent("ui-demo-nav.json"))

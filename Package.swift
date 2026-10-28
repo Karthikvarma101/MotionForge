@@ -30,6 +30,7 @@ let package = Package(
                 .linkedFramework("CoreGraphics"), .linkedFramework("ImageIO"), .linkedFramework("MetalPerformanceShaders"),
                 .linkedFramework("CoreText"),
                 .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("AVFoundation"), .linkedFramework("CoreMedia"), .linkedFramework("CoreVideo"),
             ]
         ),
         .executableTarget(

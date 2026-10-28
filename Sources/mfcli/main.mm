@@ -14,6 +14,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -36,6 +37,8 @@ int usage() {
                  "  mfcli render <project.mfproj> <out.png> [--time S] [--scale F] [--transparent] [--no-motion-blur]\n"
                  "  mfcli frames <project.mfproj> <out-dir> [--from S] [--to S] [--scale F] [--no-motion-blur]\n"
                  "  mfcli time   <project.mfproj> [--from S] [--to S] [--step S] [--scale F]   (CPU evaluate + GPU render per frame)\n"
+                 "  mfcli export <project.mfproj> <out.mp4|.mov|dir> [--format h264|hevc|prores|prores4444|png] [--from S] [--to S]\n"
+                 "               [--scale F] [--mbps N] [--audio file] [--no-motion-blur]\n"
                  "  mfcli demo   <out-dir>\n"
                  "  mfcli effects-demo <out-dir>\n"
                  "  mfcli phase4-demo <out-dir>\n");
@@ -223,6 +226,51 @@ int cmdTime(int argc, const char* argv[]) {
     if (!blurGpu.empty())
         std::printf("  GPU with motion blur   median %.2f ms   p95 %.2f ms   (%zu subframes)\n", stat(blurGpu, 0.5), stat(blurGpu, 0.95), offs.size());
     return 0;
+}
+
+const char* argString(int argc, const char* argv[], const char* name, const char* fallback) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], name) == 0) return argv[i + 1];
+    return fallback;
+}
+
+// The app's exporter (MFVideoExporter), headless.
+int cmdExport(int argc, const char* argv[]) {
+    MFEngine* e = openProject(argv[2]);
+    if (!e) return 1;
+    MFExportSettings* s = [MFExportSettings new];
+    const std::string fmt = argString(argc, argv, "--format", "h264");
+    s.format = fmt == "hevc" ? MFExportFormatHEVC : fmt == "prores" ? MFExportFormatProRes422
+             : fmt == "prores4444" ? MFExportFormatProRes4444 : fmt == "png" ? MFExportFormatPNGSequence : MFExportFormatH264;
+    s.startTime = argDouble(argc, argv, "--from", 0);
+    s.endTime = argDouble(argc, argv, "--to", 0);
+    s.scale = argDouble(argc, argv, "--scale", 1);
+    s.bitsPerSecond = NSInteger(argDouble(argc, argv, "--mbps", 0) * 1e6);
+    s.motionBlur = !argFlag(argc, argv, "--no-motion-blur");
+    if (const char* a = argString(argc, argv, "--audio", nullptr)) s.audioPath = @(a);
+    NSError* error = nil;
+    MFVideoExporter* x = [[MFVideoExporter alloc] initWithEngine:e settings:s outputPath:@(argv[3]) error:&error];
+    if (!x) {
+        std::fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
+        return 1;
+    }
+    __block bool finished = false;
+    __block int status = 0;
+    __block MFExportProgress* last = nil;
+    [x startWithProgress:^(MFExportProgress* p) {
+        last = p;
+        std::fprintf(stderr, "\r%ld / %ld frames  %.1f fps   ", long(p.framesDone), long(p.framesTotal), p.framesPerSecond);
+    } completion:^(NSError* err) {
+        if (err) {
+            std::fprintf(stderr, "\nexport failed: %s\n", err.localizedDescription.UTF8String);
+            status = 1;
+        } else {
+            std::printf("\nwrote %s: %ld frames in %.2f s (%.1f fps)\n", argv[3], long(last.framesDone), last.elapsed, last.framesPerSecond);
+        }
+        finished = true;
+    }];
+    while (!finished) [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    return status;
 }
 
 int cmdFrames(int argc, const char* argv[]) {
@@ -543,6 +591,7 @@ int main(int argc, const char* argv[]) {
         if (cmd == "info") return cmdInfo(argv[2]);
         if (cmd == "render" && argc >= 4) return cmdRender(argc, argv);
         if (cmd == "time") return cmdTime(argc, argv);
+        if (cmd == "export" && argc >= 4) return cmdExport(argc, argv);
         if (cmd == "frames" && argc >= 4) return cmdFrames(argc, argv);
         if (cmd == "demo") return cmdDemo(argv[2]);
         if (cmd == "effects-demo") return cmdEffectsDemo(argv[2]);

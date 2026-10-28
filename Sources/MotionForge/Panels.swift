@@ -344,6 +344,7 @@ struct StatusBar: View {
                 if s.pendingMedia > 0 { metric("Media", "\(s.pendingMedia) loading", warn: true) }
             }
             Spacer()
+            ExportStatusPill(model: model)
             if let s { Text("\(s.deviceName) · Metal\(s.programmableBlending ? " · tile blending" : "")").foregroundStyle(.secondary) }
         }
         .font(.system(size: 10, design: .monospaced))

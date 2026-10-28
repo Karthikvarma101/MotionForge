@@ -57,6 +57,7 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `make bench` | Run the renderer benchmark, write `benchmarks/results-<date>.md` |
 | `make sample` | Render the position / scale / opacity demo into `Examples/demo/`, the effects sheet into `Examples/effects/` and the text / path sheet into `Examples/phase4/` |
 | `scripts/ui-demo.sh` | Launch the real app, drive it (click, drag, edit, undo, play, save), screenshot each step into `build/ui-demo/` |
+| `mfcli export project.mfproj out.mp4 [--format h264\|hevc\|prores\|prores4444\|png] [--from S --to S] [--mbps N] [--audio file]` | The app's exporter without the app |
 | `scripts/ui-demo-nav.sh project.mfproj` | Open a nested project and go master › scene › rig through tabs and breadcrumb; zoom with ⌥-scroll and scroll with sideways swipes (scroll events sent inside the app). Screenshots go to `build/ui-demo-nav/` |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
@@ -82,6 +83,17 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Keys:** = and − zoom around the playhead; \\ shows the whole composition. The slider is
     logarithmic.
   - **Navigator bar:** drag it to scroll; double-click it to fit the whole composition.
+- **Export**: the toolbar's *Export* button or *File → Export Video…* (⌘M).
+  - **Formats:** H.264 or HEVC (.mp4), ProRes 422, ProRes 4444 with alpha (.mov), or a PNG
+    sequence.
+  - **Settings:** full, half or quarter size; the whole composition or a custom range; bitrate
+    presets (Reels 10 Mb/s, YouTube 35 Mb/s, or custom); motion blur; and an optional soundtrack
+    file. MotionForge has no audio layers yet, so add the mix there.
+  - **Background:** the export renders from a snapshot of the project, so you can keep editing.
+    Progress, fps and time left show in the status bar, with *Cancel* while it runs and *Reveal*
+    when it's done.
+  - **Destination:** the save panel starts in `/Volumes/Extreme SSD/YOGA/eXPORTED` when that drive
+    is mounted, otherwise in ~/Movies.
 - **Compositions and precomps**:
   - **Open a precomp:** double-click its icon in the timeline, choose *Open Precomp* from its
     context menu, or use *Open* in the inspector. The playhead moves to the matching time inside
@@ -312,6 +324,7 @@ MotionForge/
 │   │   ├── MetalRenderer.mm           pipelines, path flattening, offscreen effect/matte layers (MPS blur), pools, frame cache, media
 │   │   ├── TextEngine.mm              CoreText layout cache + GPU glyph sheets
 │   │   ├── MFEngine.mm                Objective-C API that Swift uses
+│   │   ├── MFExport.mm                background video export: AVAssetWriter, hardware encoders, soundtrack
 │   │   └── include/MFEngine.h         the Swift-visible bridge (module map exposes only this)
 │   ├── MotionForge/           Swift — SwiftUI/AppKit editor
 │   │   ├── MotionForgeApp.swift       app, window layout, toolbar, menus
@@ -319,6 +332,7 @@ MotionForge/
 │   │   ├── ViewerView.swift           MTKView viewer, playback clock, direct manipulation
 │   │   ├── TimelineView.swift         ruler, layer bars, property rows, keyframes
 │   │   ├── TimelineNavigation.swift   composition tabs + breadcrumb, timeline zoom/scroll gestures
+│   │   ├── ExportView.swift           export sheet, background export state, status-bar progress
 │   │   ├── GraphEditorView.swift      value curves with ease / speed handles
 │   │   ├── NodeGraphView.swift        node workspace (layer stack as Source → Masks → Effects → Composite)
 │   │   ├── InspectorView.swift        layer / transform / shape / text / animator / mask / effect properties

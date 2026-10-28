@@ -75,7 +75,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        MainActor.assumeIsolated { (model?.confirmDiscardChanges() ?? true) ? .terminateNow : .terminateCancel }
+        MainActor.assumeIsolated {
+            if let model, model.exporter != nil {
+                let alert = NSAlert()
+                alert.messageText = "An export is still running."
+                alert.informativeText = "Quitting stops it and deletes the unfinished file."
+                alert.addButton(withTitle: "Keep Exporting")
+                alert.addButton(withTitle: "Quit")
+                if alert.runModal() == .alertFirstButtonReturn { return .terminateCancel }
+                model.cancelExport()
+            }
+            return (model?.confirmDiscardChanges() ?? true) ? .terminateNow : .terminateCancel
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -114,6 +125,7 @@ struct ContentView: View {
         .navigationTitle(model.displayName + (model.engine.dirty ? " — Edited" : ""))
         .toolbar { EditorToolbar(model: model) }
         .sheet(isPresented: $model.showCompSettings) { CompSettingsSheet(model: model) }
+        .sheet(isPresented: $model.showExportSheet) { ExportSheet(model: model) }
         .alert("MotionForge", isPresented: Binding(get: { model.alertMessage != nil }, set: { if !$0 { model.alertMessage = nil } })) {
             Button("OK") { model.alertMessage = nil }
         } message: {
@@ -171,6 +183,9 @@ struct EditorToolbar: ToolbarContent {
                 .help(model.engine.canRedo ? "Redo \(model.engine.redoLabel)" : "Nothing to redo")
             Button { model.showCompSettings = true } label: { Label("Composition", systemImage: "aspectratio") }
                 .help("Composition settings (size, aspect ratio, frame rate)")
+            Button { model.showExportSheet = true } label: { Label("Export", systemImage: "square.and.arrow.up") }
+                .disabled(model.exporter != nil)
+                .help(model.exporter != nil ? "An export is running (see the status bar)" : "Export the composition as a video or image sequence (⌘M)")
         }
     }
 }
@@ -188,6 +203,7 @@ struct AppCommands: Commands {
             Button("Save As…") { model.saveAs() }.keyboardShortcut("s", modifiers: [.command, .shift])
             Divider()
             Button("Import Media…") { model.presentImportPanel() }.keyboardShortcut("i")
+            Button("Export Video…") { model.showExportSheet = true }.keyboardShortcut("m").disabled(model.exporter != nil)
             Button("Export Frame as PNG…") { model.exportFramePanel() }.keyboardShortcut("e", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .undoRedo) {

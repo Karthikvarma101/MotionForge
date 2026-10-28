@@ -90,6 +90,10 @@ final class EditorModel: ObservableObject {
     /// Playhead and timeline zoom per composition, restored when you come back to it.
     private var compMemory: [UInt64: (time: Double, zoom: Double, start: Double)] = [:]
     let viewport = TimelineViewport()
+    /// Video export (see ExportView.swift).
+    @Published var showExportSheet = false
+    @Published var exportStatus: ExportStatus?
+    var exporter: MFVideoExporter?
     /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
     @Published var selection: UInt64? {
         didSet {
