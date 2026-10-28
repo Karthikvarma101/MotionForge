@@ -63,6 +63,7 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `scripts/ui-demo-audio.sh project.mfproj` | Select the audible audio layer (waveform, inspector), play and compare the picture with the audio clock, show the account card, run a 60 s export in the export window. Screenshots (plus offscreen `-view.png` renders, which Stage Manager can't shrink) go to `build/ui-demo-audio/`. While it runs the app ignores the keyboard |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
+| `make dmg` | Build the app, then pack it into `build/MotionForge.dmg`, the drag-to-Applications disk image that releases ship (`scripts/make-dmg.sh`; the window layout comes from dmgbuild, fetched with `uvx`, so it needs [uv](https://docs.astral.sh/uv/)) |
 
 ## Using it
 
@@ -371,6 +372,7 @@ MotionForge/
 ├── scripts/bundle.sh          release build → signed build/MotionForge.app
 ├── scripts/ui-demo.sh         scripted end-to-end GUI check with screenshots
 ├── scripts/make-icon.*        app icon from the brand artwork (transparent cut-out on Apple's grid)
+├── scripts/make-dmg.sh        build/MotionForge.app → build/MotionForge.dmg (+ dmg-settings.py, make-dmg-background.swift)
 ├── Resources/                 AppIcon.icns; Brand/ = source icon, 1024 px master, wordmark
 ├── Sources/
 │   ├── MFCore/                C++20, no platform dependencies

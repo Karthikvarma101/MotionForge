@@ -1,5 +1,5 @@
 # MotionForge — convenience targets (everything is plain SwiftPM underneath).
-.PHONY: all build app run test bench sample clean
+.PHONY: all build app dmg run test bench sample clean
 
 all: app
 
@@ -8,6 +8,10 @@ build:
 
 app:
 	scripts/bundle.sh release
+
+# Drag-to-Applications disk image for releases -> build/MotionForge.dmg
+dmg: app
+	scripts/make-dmg.sh
 
 run: app
 	open build/MotionForge.app
