@@ -213,8 +213,21 @@ extension MFPropRef: @retroactive Equatable {
     }
 }
 
+extension MFPropRef: @retroactive Hashable {
+    public func hash(into h: inout Hasher) {
+        h.combine(owner.rawValue)
+        h.combine(ownerID)
+        h.combine(index)
+    }
+}
+
 extension MFPropRef {
     static func layer(_ p: MFProp) -> MFPropRef { MFPropRefMake(p) }
+    /// Position-like properties have motion paths (layer position / anchor point, mask position).
+    var isSpatial: Bool {
+        (owner == .layer && (index == MFProp.position.rawValue || index == MFProp.anchorPoint.rawValue))
+            || (owner == .mask && index == 0)
+    }
     var id: String { "\(owner.rawValue)-\(ownerID)-\(index)" }
 }
 

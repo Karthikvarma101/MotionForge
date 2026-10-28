@@ -12,11 +12,13 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <numeric>
 #include <string>
 #include <vector>
 
 #include "MFEngine.h"
 #include "MFRender/MetalRenderer.hpp"
+#include "mf/Clipboard.hpp"
 #include "mf/Document.hpp"
 #include "mf/Evaluator.hpp"
 #include "mf/Json.hpp"
@@ -944,7 +946,7 @@ TEST(project_file_v2_effects_masks_mattes) {
     d.setPropertyValue(comp, a, PropRef::mask(m, MaskParam::Feather), 0, {12, 0, 0, 0});
     d.setLayerMatte(comp, a, b, MatteMode::LumaInverted);
     const std::string text = serializeProject(d.project(), "");
-    CHECK(text.find("\"version\": 2") != std::string::npos);
+    CHECK(text.find("\"version\": 3") != std::string::npos);
     Project back;
     std::string err;
     CHECK(deserializeProject(text, "", back, err));
@@ -958,6 +960,257 @@ TEST(project_file_v2_effects_masks_mattes) {
     CHECK(deserializeProject(v1, "", old, err));
     CHECK(old.compositions.size() == 1 && old.compositions[0].layers.size() == 1 &&
           old.compositions[0].layers[0].effects.empty());
+}
+
+// =============================================================================================
+// Phase 2: motion paths, multi-selection operations, clipboard
+// =============================================================================================
+
+// Layer with position keys at t = 0, 1, 2 through (100,500) (500,100) (900,500).
+static Document pathDoc(ObjectId* layerOut) {
+    Document d(makeDefaultProject(1000, 600, 30, 3));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Shape);
+    d.setPropertyAnimated(comp, l, PropId::Position, true, 0);
+    d.setPropertyValue(comp, l, PropId::Position, 0, {100, 500, 0, 0});
+    d.setPropertyValue(comp, l, PropId::Position, 1, {500, 100, 0, 0});
+    d.setPropertyValue(comp, l, PropId::Position, 2, {900, 500, 0, 0});
+    *layerOut = l;
+    return d;
+}
+
+static Vec2 posAt(const Document& d, ObjectId l, double t) {
+    const Value v = evaluateProperty(d.project().activeComp()->findLayer(l)->prop(PropId::Position), PropId::Position, t);
+    return {v[0], v[1]};
+}
+
+static double turnDegrees(Vec2 a, Vec2 b, Vec2 c) {  // angle between a->b and b->c
+    const double a1 = std::atan2(b.y - a.y, b.x - a.x), a2 = std::atan2(c.y - b.y, c.x - b.x);
+    double d = std::abs(a2 - a1) * 180 / M_PI;
+    return d > 180 ? 360 - d : d;
+}
+
+TEST(spatial_auto_bezier_is_smooth_and_hits_keys) {
+    ObjectId l;
+    Document d = pathDoc(&l);
+    const Property& p = d.project().activeComp()->findLayer(l)->prop(PropId::Position);
+    CHECK(p.keyframes.size() == 3 && p.keyframes[1].spatial == Spatial::Auto);  // new position keys are smooth
+    const Vec2 mid = posAt(d, l, 1);
+    CHECK_NEAR(mid.x, 500, 1e-9);
+    CHECK_NEAR(mid.y, 100, 1e-9);
+    // No corner at the middle key…
+    CHECK(turnDegrees(posAt(d, l, 0.99), mid, posAt(d, l, 1.01)) < 3);
+    // …and the path bows outward instead of following the straight chord.
+    const Vec2 q = posAt(d, l, 0.5);
+    const double chordDist = std::abs((500 - 100) * (500 - q.y) - (100 - 500) * (100 - q.x)) / std::hypot(400, 400);
+    CHECK(chordDist > 10);
+
+    // Linear spatial keys give straight segments with a corner.
+    const ObjectId comp = d.project().activeComposition;
+    for (int i = 0; i < 3; ++i) d.setKeyframeSpatial(comp, l, PropRef::layer(PropId::Position), i, Spatial::Linear, {}, {});
+    CHECK(turnDegrees(posAt(d, l, 0.99), posAt(d, l, 1), posAt(d, l, 1.01)) > 80);
+    const Vec2 lin = posAt(d, l, 0.5);
+    CHECK_NEAR(lin.x, 300, 1e-9);
+    CHECK_NEAR(lin.y, 300, 1e-9);
+}
+
+TEST(spatial_linear_timing_moves_at_constant_speed) {
+    ObjectId l;
+    Document d = pathDoc(&l);
+    // Equal time steps cover equal distances along the curve (arc-length parameterisation).
+    std::vector<double> steps;
+    Vec2 prev = posAt(d, l, 0);
+    for (int i = 1; i <= 30; ++i) {
+        const Vec2 cur = posAt(d, l, i / 30.0);
+        steps.push_back(std::hypot(cur.x - prev.x, cur.y - prev.y));
+        prev = cur;
+    }
+    const double mean = std::accumulate(steps.begin(), steps.end(), 0.0) / steps.size();
+    for (double s : steps) CHECK_NEAR(s, mean, mean * 0.02);
+}
+
+TEST(spatial_explicit_bezier_handles) {
+    Property p;
+    Keyframe a, b;
+    a.time = 0;
+    a.value = {0, 0, 0, 0};
+    a.spatial = Spatial::Bezier;
+    a.tangentOut = {0, 100, 0, 0};
+    b.time = 1;
+    b.value = {100, 0, 0, 0};
+    b.spatial = Spatial::Bezier;
+    b.tangentIn = {0, 100, 0, 0};
+    p.keyframes = {a, b};
+    const Value v = evaluateProperty(p, PropId::Position, 0.5);
+    CHECK_NEAR(v[0], 50, 0.5);  // symmetric arch: halfway in time is the apex
+    CHECK_NEAR(v[1], 75, 0.5);
+    const auto path = sampleMotionPath(p, 16);
+    CHECK(path.size() == 17);
+    CHECK_NEAR(path[8][1], 75, 1e-9);
+
+    // Files written before version 3 have no "spatial" key: their paths stay straight.
+    Json kj;
+    std::string err;
+    CHECK(Json::parse(R"({"t":0,"v":[1,2],"in":"linear","out":"linear"})", kj, err));
+    CHECK(keyframeFromJson(kj, {}).spatial == Spatial::Linear);
+    const Keyframe back = keyframeFromJson(keyframeToJson(a, propDef(PropId::Position)), {});
+    CHECK(back == a);
+}
+
+TEST(spatial_handle_edit_invalidates_only_between_keys) {
+    ObjectId l;
+    Document d = pathDoc(&l);
+    const ObjectId comp = d.project().activeComposition;
+    auto hashAt = [&](double t) { return evaluateFrame(d.project(), *d.project().activeComp(), t).hash; };
+    const uint64_t atKey = hashAt(1), between = hashAt(0.5), later = hashAt(1.5);
+    d.setKeyframeSpatial(comp, l, PropRef::layer(PropId::Position), 0, Spatial::Bezier, {0, 0, 0, 0}, {0, -200, 0, 0});
+    CHECK(hashAt(1) == atKey);       // keys stay where they are
+    CHECK(hashAt(0.5) != between);   // the curve between key 0 and 1 changed
+    CHECK(hashAt(1.5) == later);     // the next segment didn't
+    d.undo();
+    CHECK(hashAt(0.5) == between);
+}
+
+TEST(multi_keyframe_move_delete_ease) {
+    ObjectId l;
+    Document d = pathDoc(&l);
+    const ObjectId comp = d.project().activeComposition;
+    d.setPropertyAnimated(comp, l, PropId::Opacity, true, 0);
+    d.setPropertyValue(comp, l, PropId::Opacity, 2, {0, 0, 0, 0});
+    const PropRef pos = PropRef::layer(PropId::Position), op = PropRef::layer(PropId::Opacity);
+    const size_t depth = d.undoDepth();
+    // Move position keys 1 and 2 and opacity key 0 by +0.5 s in one step.
+    const auto moved = d.moveKeyframes(comp, {{l, pos, 1}, {l, pos, 2}, {l, op, 0}}, 0.5);
+    CHECK(d.undoDepth() == depth + 1);
+    const Layer& L = *d.project().activeComp()->findLayer(l);
+    CHECK_NEAR(L.prop(PropId::Position).keyframes[1].time, 1.5, 1e-9);
+    CHECK_NEAR(L.prop(PropId::Position).keyframes[2].time, 2.5, 1e-9);
+    CHECK_NEAR(L.prop(PropId::Opacity).keyframes[0].time, 0.5, 1e-9);
+    CHECK(moved.size() == 3 && moved[0].index == 1 && moved[1].index == 2 && moved[2].index == 0);
+    // Landing on an unselected key replaces it.
+    const auto onto = d.moveKeyframes(comp, {{l, pos, 1}}, -1.5);  // 1.5 -> 0.0, onto key 0
+    const Layer& L2 = *d.project().activeComp()->findLayer(l);
+    CHECK(L2.prop(PropId::Position).keyframes.size() == 2);
+    CHECK(onto[0].index == 0);
+    CHECK_NEAR(L2.prop(PropId::Position).keyframes[0].value[0], 500, 1e-9);
+    // Ease several keys, then delete several.
+    CHECK(d.setKeyframesInterpolation(comp, {{l, pos, 0}, {l, op, 0}}, Interp::Bezier, Interp::Bezier));
+    CHECK(d.project().activeComp()->findLayer(l)->prop(PropId::Opacity).keyframes[0].outInterp == Interp::Bezier);
+    CHECK(d.removeKeyframes(comp, {{l, pos, 0}, {l, pos, 1}, {l, pos, 0}}));
+    CHECK(d.project().activeComp()->findLayer(l)->prop(PropId::Position).keyframes.empty());
+    d.undo();
+    CHECK(d.project().activeComp()->findLayer(l)->prop(PropId::Position).keyframes.size() == 2);
+    // A key's value can be edited away from the playhead (motion-path drag).
+    CHECK(d.setKeyframeValue(comp, l, pos, 1, {10, 20, 0, 0}));
+    CHECK_NEAR(d.project().activeComp()->findLayer(l)->prop(PropId::Position).keyframes[1].value[1], 20, 0);
+}
+
+TEST(multi_layer_delete_and_duplicate) {
+    Document d(makeDefaultProject(640, 360, 30, 2));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId a = d.addLayer(comp, LayerKind::Null);
+    const ObjectId b = d.addLayer(comp, LayerKind::Shape);
+    const ObjectId c = d.addLayer(comp, LayerKind::Shape);
+    d.setLayerParent(comp, b, a);
+    d.setLayerMatte(comp, c, b, MatteMode::Alpha);
+    const size_t depth = d.undoDepth();
+    const auto dup = d.duplicateLayers(comp, {a, b});
+    CHECK(dup.size() == 2 && d.undoDepth() == depth + 1);
+    const Composition& C = *d.project().activeComp();
+    CHECK(C.layers.size() == 5);
+    // Copies come back top-first (b above a), and b's copy is parented to a's copy, not to a.
+    CHECK(C.findLayer(dup[0])->parent == dup[1]);
+    CHECK(C.findLayer(dup[1])->name != C.findLayer(a)->name);
+    CHECK(C.indexOf(dup[0]) < C.indexOf(dup[1]));
+    CHECK(d.removeLayers(comp, {a, b}));
+    const Composition& C2 = *d.project().activeComp();
+    CHECK(C2.layers.size() == 3);
+    CHECK(!C2.findLayer(c)->hasMatte());  // matte source deleted -> link cleared
+    d.undo();
+    CHECK(d.project().activeComp()->layers.size() == 5);
+}
+
+TEST(clipboard_layers_between_projects) {
+    const std::string dir = tempDir("clip");
+    const std::string png = (fs::path(dir) / "quad.png").string();
+    writeQuadrantPNG(png);
+    Document src(makeDefaultProject(640, 360, 30, 2));
+    const ObjectId sc = src.project().activeComposition;
+    const ObjectId asset = src.addImageAsset(png, "quad.png", 4, 4);
+    const ObjectId ctrl = src.addLayer(sc, LayerKind::Null);
+    const ObjectId img = src.addLayer(sc, LayerKind::Image, ShapeType::Rectangle, asset);
+    const ObjectId outsider = src.addLayer(sc, LayerKind::Null);
+    const ObjectId star = src.addLayer(sc, LayerKind::Shape, ShapeType::Star);
+    src.setLayerParent(sc, img, ctrl);
+    src.setLayerParent(sc, star, outsider);
+    src.setLayerMatte(sc, star, img, MatteMode::Luma);
+    src.addEffect(sc, star, EffectType::Glow);
+    src.addMask(sc, star, MaskShape::Ellipse);
+    const std::string text = copyLayers(src.project(), sc, {star, img, ctrl});
+    CHECK(clipboardKind(text) == ClipboardKind::Layers);
+
+    Document dst(makeDefaultProject(1920, 1080, 25, 4));
+    const ObjectId dc = dst.project().activeComposition;
+    std::string err;
+    const auto pasted = pasteLayers(dst, dc, text, 0, err);
+    CHECK(pasted.size() == 3);
+    const Composition& D = *dst.project().activeComp();
+    CHECK(D.layers.size() == 3 && D.layers[0].id == pasted[0]);  // stacking order kept: star on top
+    const Layer& pStar = *D.findLayer(pasted[0]);
+    const Layer& pImg = *D.findLayer(pasted[1]);
+    const Layer& pCtrl = *D.findLayer(pasted[2]);
+    CHECK(pImg.parent == pCtrl.id);                     // link inside the copied set survives
+    CHECK(pStar.parent == 0);                           // link to a layer that wasn't copied is dropped
+    CHECK(pStar.matteLayer == pImg.id && pStar.matteMode == MatteMode::Luma);
+    CHECK(dst.project().assets.size() == 1 && dst.project().assets[0].path == png);  // media came along
+    CHECK(pImg.asset == dst.project().assets[0].id);
+    CHECK(pStar.effects.size() == 1 && pStar.masks.size() == 1);
+    // Pasting again into the same comp reuses the media and keeps ids and names unique.
+    const auto again = pasteLayers(dst, dc, text, 0, err);
+    CHECK(again.size() == 3 && dst.project().assets.size() == 1);
+    CHECK(dst.project().activeComp()->findLayer(again[0])->name != pStar.name);
+    std::vector<ObjectId> all;
+    for (const Layer& l : dst.project().activeComp()->layers) {
+        all.push_back(l.id);
+        for (const Mask& m : l.masks) all.push_back(m.id);
+        for (const Effect& e : l.effects) all.push_back(e.id);
+    }
+    std::sort(all.begin(), all.end());
+    CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());  // every id unique
+    CHECK(pasteLayers(dst, dc, "{\"format\":\"something\"}", 0, err).empty());
+}
+
+TEST(clipboard_keyframes_relative_and_mapped) {
+    ObjectId a;
+    Document d = pathDoc(&a);
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId glow = d.addEffect(comp, a, EffectType::Glow);
+    d.setPropertyAnimated(comp, a, PropRef::effect(glow, 1), true, 1);
+    d.setPropertyValue(comp, a, PropRef::effect(glow, 1), 2, {90, 0, 0, 0});
+    const ObjectId b = d.addLayer(comp, LayerKind::Shape);
+    // Copy position keys at t=1,2 and the glow radius keys at t=1,2.
+    const std::string text = copyKeyframes(d.project(), comp,
+                                           {{a, PropRef::layer(PropId::Position), 1}, {a, PropRef::layer(PropId::Position), 2},
+                                            {a, PropRef::effect(glow, 1), 0}, {a, PropRef::effect(glow, 1), 1}});
+    CHECK(clipboardKind(text) == ClipboardKind::Keyframes);
+    std::string err;
+    // B has no Glow: position keys paste, the glow track is reported as skipped.
+    CHECK(pasteKeyframes(d, comp, {b}, 3.0, text, err) == 2);
+    CHECK(err.find("glow") != std::string::npos);
+    const Property& bp = d.project().activeComp()->findLayer(b)->prop(PropId::Position);
+    CHECK(bp.keyframes.size() == 2);
+    CHECK_NEAR(bp.keyframes[0].time, 3.0, 1e-9);  // earliest copied key lands on the playhead
+    CHECK_NEAR(bp.keyframes[1].time, 4.0, 1e-9);  // spacing kept
+    CHECK_NEAR(bp.keyframes[0].value[0], 500, 1e-9);
+    // Once B has a Glow, its radius track pastes too.
+    const ObjectId bGlow = d.addEffect(comp, b, EffectType::Glow);
+    err.clear();
+    CHECK(pasteKeyframes(d, comp, {b}, 0.0, text, err) == 4);
+    CHECK(err.empty());
+    CHECK(d.project().activeComp()->findLayer(b)->findEffect(bGlow)->params[1].keyframes.size() == 2);
+    // The paste was one undo step.
+    d.undo();
+    CHECK(d.project().activeComp()->findLayer(b)->findEffect(bGlow)->params[1].keyframes.empty());
 }
 
 // The exact path the app uses: Objective-C bridge -> document -> renderer -> PNG.

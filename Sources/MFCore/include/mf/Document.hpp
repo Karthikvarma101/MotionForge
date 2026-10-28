@@ -9,11 +9,22 @@
 
 #include <cstdint>
 #include <deque>
+#include <optional>
+#include <utility>
+#include <vector>
 #include <string>
 
 #include "mf/Model.hpp"
 
 namespace mf {
+
+// One keyframe anywhere in a composition.
+struct KeyAddress {
+    ObjectId layer = 0;
+    PropRef prop;
+    int index = 0;
+    bool operator==(const KeyAddress&) const = default;
+};
 
 class Document {
 public:
@@ -49,6 +60,13 @@ public:
     ObjectId addLayer(ObjectId comp, LayerKind kind, ShapeType shape = ShapeType::Rectangle, ObjectId asset = 0);
     bool removeLayer(ObjectId comp, ObjectId layer);
     ObjectId duplicateLayer(ObjectId comp, ObjectId layer);
+    bool removeLayers(ObjectId comp, const std::vector<ObjectId>& layers);              // one undo step
+    std::vector<ObjectId> duplicateLayers(ObjectId comp, const std::vector<ObjectId>& layers);
+    // Inserts copies of `layers` (e.g. from the clipboard) above stack index `atIndex`, with fresh
+    // ids. Parent / matte links between the inserted layers are kept, links to anything else are
+    // cleared. Media in `assets` is matched to this project's media by path or added.
+    std::vector<ObjectId> insertLayers(ObjectId comp, std::vector<Layer> layers, const std::vector<Asset>& assets,
+                                       int atIndex);
     bool moveLayer(ObjectId comp, ObjectId layer, int newIndex);  // 0 = top
     bool setLayerName(ObjectId comp, ObjectId layer, const std::string& name);
     bool setLayerVisible(ObjectId comp, ObjectId layer, bool visible);
@@ -84,6 +102,21 @@ public:
     // Moves a key to a new time (replacing a key already there). Returns its new index or -1.
     int moveKeyframe(ObjectId comp, ObjectId layer, PropRef prop, int index, double newTime);
     bool setKeyframeInterpolation(ObjectId comp, ObjectId layer, PropRef prop, int index, Interp in, Interp out);
+    bool setKeyframeValue(ObjectId comp, ObjectId layer, PropRef prop, int index, Value v);
+    // Spatial properties: Linear / Auto ignore the tangents; Bezier stores them (offsets).
+    bool setKeyframeSpatial(ObjectId comp, ObjectId layer, PropRef prop, int index, Spatial mode, Value tangentIn,
+                            Value tangentOut);
+
+    // Several keyframes at once (any layers/properties), as one undo step. Moving shifts every
+    // selected key by `dt`; a selected key landing on an unselected one replaces it. Returns the
+    // keys' new addresses, in the order given.
+    std::vector<KeyAddress> moveKeyframes(ObjectId comp, const std::vector<KeyAddress>& keys, double dt);
+    bool removeKeyframes(ObjectId comp, const std::vector<KeyAddress>& keys);
+    bool setKeyframesInterpolation(ObjectId comp, const std::vector<KeyAddress>& keys, std::optional<Interp> in,
+                                   std::optional<Interp> out);
+    // Pastes keyframe tracks onto a layer (one undo step). Keys replace keys at the same time;
+    // a property that wasn't animated becomes animated. Returns the number of keys written.
+    int insertKeyframes(ObjectId comp, ObjectId layer, const std::vector<std::pair<PropRef, std::vector<Keyframe>>>& tracks);
 
     // Layer-property shorthands.
     bool setPropertyValue(ObjectId c, ObjectId l, PropId p, double t, Value v) { return setPropertyValue(c, l, PropRef::layer(p), t, v); }

@@ -6,7 +6,10 @@ SwiftUI/AppKit editor.
 - **Phase 1** (vertical slice): composition viewer, shape and image layers, transform controls,
   an editable timeline with keyframes, undo/redo, project files, autosave/crash recovery, a
   performance monitor, automated tests and a renderer benchmark.
-- **Phase 3** (this update): GPU effects (Gaussian Blur, Drop Shadow, Glow, Brightness &
+- **Phase 2** (completed after Phase 3): spatial bezier motion paths with on-screen handles and
+  constant speed along curves, multi-selection of layers and keyframes (⌘/⇧-click, marquee),
+  multi-key retiming/easing/deletion, and copy/paste of layers and keyframes, between projects too.
+- **Phase 3**: GPU effects (Gaussian Blur, Drop Shadow, Glow, Brightness &
   Contrast, Hue/Saturation, Fill) with animatable parameters, layer masks (rectangle / ellipse;
   add, subtract, intersect, difference; feather, expansion, opacity, invert), track mattes
   (alpha / luma, normal / inverted), an effects browser, an 8-bit cost-aware frame cache,
@@ -62,6 +65,25 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   resolution when the composite takes longer than 85% of the frame budget, and the footer says so
   ("Auto lowered preview: GPU 65.4 ms > 33.3 ms frame budget"); it also stays at half for 15 s
   after a memory-pressure warning. Exports always render at full resolution.
+- **Selection**: ⌘-click toggles a layer, ⇧-click adds (⇧-click in the timeline selects a range),
+  ⌘A selects all layers. Dragging any selected layer in the viewer moves all of them, each in its own
+  parent's space; arrow keys nudge them all; delete/duplicate apply to all. Sliding a selected
+  layer's bar in the timeline slides every selected layer. The inspector edits the primary
+  (last-clicked) layer and says how many are selected.
+- **Keyframes**: ⌘/⇧-click to build a selection, or drag a rubber band across property rows
+  (⌘/⇧ to add). Dragging one selected key retimes them all by the same frame-snapped offset;
+  right-click applies easing, motion-path mode, copy or delete to the whole selection.
+- **Copy / paste** (⌘C, ⌘X, ⌘V): with keyframes selected, ⌘C copies them; the earliest lands on
+  the playhead when pasted onto the selected layer(s), spacing intact. Tracks map by property,
+  effect type and mask slot, so you can paste between layers, and anything without a match is
+  reported. Otherwise ⌘C copies layers (with their effects, masks, keyframes and media); they
+  paste above the topmost selected layer, keeping parent and matte links among themselves. It uses
+  the system pasteboard, so it works between projects.
+- **Motion paths**: new position keyframes are smooth (auto bezier), and linear timing moves
+  at constant speed along the curve. The selected layer's path is drawn dotted in the viewer:
+  drag a key square to move that keyframe, drag a handle dot to shape the curve (handles stay
+  opposite each other; hold ⌥ to break them). Right-click a position keyframe for *Smooth* or
+  *Corner*.
 - **Effects**: *Effects* tab in the left panel (searchable; double-click or Apply), the *Effect*
   menu, or *Add Effect* in the inspector. Each effect has a bypass checkbox, ▲▼ to reorder and
   stopwatches on every parameter. Effects run after masks, in stack order; spatial parameters are
@@ -98,7 +120,12 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | Effects in the real app | UI demo: blur applied to the card from the catalogue, ellipse mask on the star, an orange layer track-matted by the ring (the ring auto-hidden), three offscreen layers in the frame; 4 s of playback of the effect-laden scene presented 30/30 fps with 0 dropped frames, and afterwards 126 frames of the current state were in the cache (rendered ahead by prefetch) |
 | Adaptive preview resolution | UI demo stress step: 4K comp with 24 animated full-frame layers blurred 120 px, at 100% zoom: composite measured 65.4 ms vs the 33.3 ms budget, Auto dropped to half resolution, playback then held 30 fps with 1 dropped frame during the switch |
 
-Test run: **38 tests, 319 checks, 0 failures** on the M5 (stable across 5 consecutive runs).
+| Motion paths | auto keys pass exactly through every key with no corner (< 3° turn) and bow off the chord; linear keys give straight segments and a corner; equal time steps cover equal distances along the curve (±2%); explicit handles give the analytic arch (50, 75); editing a handle invalidates only the frames of that segment; pre-v3 keys load as straight paths |
+| Multi-key / multi-layer ops | moving 3 keys over 2 properties is one undo step with correct new indices; a key landing on another replaces it; easing and deletion apply to all; duplicating a parent + child re-links the copies; deleting a matte source clears the link |
+| Clipboard | layers pasted into a *different* project keep their stacking order, parent and matte links inside the set, effects and masks, and bring their media (reused, not duplicated, on a second paste); all ids unique; keyframes paste relative to the playhead, map effect tracks by type, report what had no match, one undo step |
+| Phase 2 in the real app | UI demo: ⌘-click added Card to Star in the viewer and a drag moved both by exactly (−120, +60) as one undo step; copy + paste of the two layers added two selected copies; dragging a motion-path handle turned the key into a Bezier key with opposite handles; Card's position keys at 0/1/2 s pasted onto Star at 3/4/5 s. The demo uses a private pasteboard, so it never touches yours |
+
+Test run: **46 tests, 416 checks, 0 failures** on the M5.
 
 ## Benchmark
 
@@ -210,6 +237,16 @@ MotionForge/
   comps, ~1.9 ms for 100 effect layers). Prefetch rendering happens on the GPU without blocking,
   but its evaluation is on the main thread too. Moving evaluation to a worker is Phase 6 work.
 - Masks are parametric rectangles/ellipses; bezier masks arrive with the pen tool (Phase 4).
+- Not exercised by the automated UI demo (they compile and their document operations are
+  unit-tested, but nothing drove them through the UI): the timeline marquee, dragging several keys
+  in the timeline, and range-select with ⇧ in the layer list.
+- Viewer clicks hit-test layer *bounds*, so a full-frame layer with a track matte catches clicks
+  everywhere even though it only shows through its matte (hide it, or select from the timeline).
+- Dragging keys onto other keys replaces them, even if the drag continues past them.
+- Only the layer position has an on-screen path editor; anchor-point and mask-position keys are
+  smooth too, but are edited numerically.
+- Checking each animated position for a curve made timeline evaluation ~6% slower (5,000 animated
+  layers: 1.39 → 1.48 ms of CPU).
   No motion blur, transitions or particles yet.
 - Drop Shadow and Glow work on the layer's own pixels in layer space, like most motion tools; Glow
   uses the layer's own colours (no tint option yet).
@@ -225,7 +262,7 @@ MotionForge/
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Native app, Metal renderer, viewer, image + shape layers, transforms, basic timeline, project files | **Done** (plus keyframes, easing, undo, parenting, blend modes, autosave pulled forward) |
-| 2 | Keyframes, playback, interpolation, undo/redo, saving | Mostly done; remaining: spatial bezier paths, copy/paste of keys, multi-selection |
+| 2 | Keyframes, playback, interpolation, undo/redo, saving | **Done** (plus spatial bezier paths, multi-selection, copy/paste) |
 | 3 | Metal effects (blur, glow, shadow, colour), masks, track mattes, memory manager, background caching | **Done** (6 effects, parametric masks, 4 matte modes, cost-aware 8-bit cache, prefetch, adaptive resolution) |
 | 4 | Text animation, shape tools (pen/bezier paths), graph editor, presets, node compositing | Planned |
 | 5 | Video import (AVFoundation/VideoToolbox), audio, proxies, hardware export, render queue | Planned |

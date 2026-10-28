@@ -165,7 +165,11 @@ struct AppCommands: Commands {
             Button("New Null") { model.addNull() }.keyboardShortcut("y", modifiers: [.command, .option, .shift])
             Divider()
             Button("Duplicate") { model.duplicateSelection() }.keyboardShortcut("d").disabled(model.selection == nil)
-            Button("Delete") { model.deleteSelection() }.disabled(model.selection == nil && model.selectedKeyframe == nil)
+            Button("Delete") { model.deleteSelection() }.disabled(model.selection == nil && model.selectedKeyframes.isEmpty)
+            Divider()
+            Button("Copy (⌘C)") { model.copySelection() }.disabled(model.selection == nil && model.selectedKeyframes.isEmpty)
+            Button("Paste (⌘V)") { model.paste() }
+            Button("Select All Layers (⌘A)") { model.selectAll() }
             Divider()
             Button("Bring Forward") { model.moveSelection(by: -1) }.keyboardShortcut("]").disabled(model.selection == nil)
             Button("Send Backward") { model.moveSelection(by: 1) }.keyboardShortcut("[").disabled(model.selection == nil)

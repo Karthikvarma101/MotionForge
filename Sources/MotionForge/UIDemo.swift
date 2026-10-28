@@ -19,6 +19,7 @@ enum UIDemo {
                 print("ui-demo: no window"); exit(4)
             }
             window.makeKeyAndOrderFront(nil)
+            model.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.motionforge.uidemo"))  // never the user's clipboard
             NSApp.activate()
             try? await Task.sleep(for: .seconds(1.0))
 
@@ -120,6 +121,72 @@ enum UIDemo {
                             "ringHiddenByMatte": !(model.layers.first { $0.layerID == ring.layerID }?.visible ?? true)])
             }
 
+            // Phase 2: multi-selection, copy/paste, motion paths.
+            if let star = model.layers.first(where: { $0.name == "Star" }), let card = model.layers.first(where: { $0.name == "Card" }) {
+                // The full-frame matted layer from step 10 is on top and would catch every click.
+                let orange = model.layers.first { $0.name.hasPrefix("Orange") }?.layerID
+                if let orange { model.edit { _ = $0.setLayer(orange, visible: false) } }
+                let t = model.time.time
+                let g = viewer.coordinator!.geometry
+                let sp = model.engine.value(of: .position, layer: star.layerID, time: t)
+                let cp = model.engine.value(of: .position, layer: card.layerID, time: t)
+                click(viewer, at: g.toView(CGPoint(x: sp.x, y: sp.y)))                          // select star
+                click(viewer, at: g.toView(CGPoint(x: cp.x + 200, y: cp.y)), flags: .command)   // ⌘-click adds card
+                let selectedBoth = model.selectedLayers == [star.layerID, card.layerID]
+                drag(viewer, from: g.toView(CGPoint(x: sp.x, y: sp.y)), to: g.toView(CGPoint(x: sp.x - 120, y: sp.y + 60)))
+                let sp2 = model.engine.value(of: .position, layer: star.layerID, time: t)
+                let cp2 = model.engine.value(of: .position, layer: card.layerID, time: t)
+                log.append(["step": "multi-select-drag", "bothSelected": selectedBoth,
+                            "starMoved": [sp2.x - sp.x, sp2.y - sp.y], "cardMoved": [cp2.x - cp.x, cp2.y - cp.y],
+                            "undo": model.engine.undoLabel])
+                await record("13-multi-select-drag")
+                model.undo()
+
+                // Copy both layers and paste them back (private pasteboard).
+                let before = model.layers.count
+                model.copySelection()
+                model.paste()
+                log.append(["step": "copy-paste-layers", "layersBefore": before, "layersAfter": model.layers.count,
+                            "pastedSelected": model.selectedLayers.count, "names": model.layers.prefix(2).map(\.name)])
+                await record("14-copy-paste-layers")
+                model.undo()
+
+                // Motion path: a third Card position key makes a smooth (auto-bezier) curve.
+                model.time.time = 2
+                model.edit { _ = $0.setPropertyValue(MFValue(x: 1500, y: 650, z: 0, w: 0), prop: .position, layer: card.layerID, time: 2) }
+                model.time.time = 1
+                model.selectLayer(card.layerID, mode: .replace)
+                await record("15-motion-path-auto")
+                // Drag the middle key's out-handle: it becomes a bezier key with mirrored handles.
+                if let mp = model.engine.motionPath(layer: card.layerID, time: 1), mp.keys.count == 3 {
+                    let k = mp.keys[1]
+                    let g2 = viewer.coordinator!.geometry
+                    let from = g2.toView(k.outHandle)
+                    drag(viewer, from: from, to: CGPoint(x: from.x + 60, y: from.y + 90))
+                    let info = model.engine.layer(withID: card.layerID)!.keyframes(for: .layer(.position))[1]
+                    let cross = info.tangentIn.x * info.tangentOut.y - info.tangentIn.y * info.tangentOut.x
+                    let dot = info.tangentIn.x * info.tangentOut.x + info.tangentIn.y * info.tangentOut.y
+                    log.append(["step": "motion-path-handle", "spatial": info.spatial.rawValue, "handlesOpposite": abs(cross) < 1e-6 && dot < 0,
+                                "tangentOut": [info.tangentOut.x, info.tangentOut.y], "undo": model.engine.undoLabel])
+                    await record("16-motion-path-handle-dragged")
+                }
+
+                // Copy Card's position keys and paste them onto Star at 3 s.
+                let keys = model.engine.layer(withID: card.layerID)!.keyframes(for: .layer(.position))
+                model.selectedKeyframes = Set(keys.map { KeyframeRef(layer: card.layerID, ref: .layer(.position), index: $0.index) })
+                model.copySelection()
+                model.selectLayer(star.layerID, mode: .replace)
+                model.time.time = 3
+                model.paste()
+                let starKeys = model.engine.layer(withID: star.layerID)!.keyframes(for: .layer(.position)).map(\.time)
+                log.append(["step": "copy-paste-keyframes", "copied": keys.map(\.time), "starPositionKeyTimes": starKeys])
+                print("ui-demo phase2: \(log.suffix(4))")
+                model.expandedLayers.insert(star.layerID)
+                model.time.time = 3.5
+                await record("17-pasted-keyframes")
+                if let orange { model.edit { _ = $0.setLayer(orange, visible: true) } }
+            }
+
             // 8. Real-time playback for 4 s: measured presented fps and dropped frames.
             model.time.time = 0
             model.time.isPlaying = true
@@ -194,16 +261,16 @@ enum UIDemo {
         return nil
     }
 
-    private static func event(_ type: NSEvent.EventType, _ view: NSView, _ p: CGPoint) -> NSEvent {
+    private static func event(_ type: NSEvent.EventType, _ view: NSView, _ p: CGPoint, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
         let w = view.convert(p, to: nil)
-        return NSEvent.mouseEvent(with: type, location: w, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        return NSEvent.mouseEvent(with: type, location: w, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
                                   windowNumber: view.window!.windowNumber, context: nil, eventNumber: 0,
                                   clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
     }
 
-    private static func click(_ view: NSView, at p: CGPoint) {
-        view.window?.sendEvent(event(.leftMouseDown, view, p))
-        view.window?.sendEvent(event(.leftMouseUp, view, p))
+    private static func click(_ view: NSView, at p: CGPoint, flags: NSEvent.ModifierFlags = []) {
+        view.window?.sendEvent(event(.leftMouseDown, view, p, flags))
+        view.window?.sendEvent(event(.leftMouseUp, view, p, flags))
     }
 
     private static func drag(_ view: NSView, from a: CGPoint, to b: CGPoint) {

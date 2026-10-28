@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "MFRender/MetalRenderer.hpp"
+#include "mf/Clipboard.hpp"
 #include "mf/Document.hpp"
 #include "mf/Evaluator.hpp"
 #include "mf/ProjectIO.hpp"
@@ -83,10 +84,59 @@ NSInteger MFPropDimensions(MFProp prop) { return propDef(static_cast<PropId>(pro
         _value = toMF(k.value);
         _inInterp = static_cast<MFInterp>(k.inInterp);
         _outInterp = static_cast<MFInterp>(k.outInterp);
+        _spatial = static_cast<MFSpatial>(k.spatial);
+        _tangentIn = toMF(k.tangentIn);
+        _tangentOut = toMF(k.tangentOut);
     }
     return self;
 }
 @end
+
+@implementation MFKeyAddress
+- (instancetype)initWithLayer:(uint64_t)layerID ref:(MFPropRef)ref index:(NSInteger)index {
+    if ((self = [super init])) {
+        _layerID = layerID;
+        _ref = ref;
+        _index = index;
+    }
+    return self;
+}
+@end
+
+@interface MFMotionPathKey ()
+@property(nonatomic, readwrite) NSInteger index;
+@property(nonatomic, readwrite) double time;
+@property(nonatomic, readwrite) CGPoint point, inHandle, outHandle;
+@property(nonatomic, readwrite) MFSpatial spatial;
+@end
+@implementation MFMotionPathKey
+@end
+
+@interface MFMotionPath ()
+@property(nonatomic, readwrite) MFPropRef ref;
+@property(nonatomic, readwrite) NSArray<NSValue*>* points;
+@property(nonatomic, readwrite) NSArray<MFMotionPathKey*>* keys;
+@end
+@implementation MFMotionPath
+@end
+
+namespace {
+std::vector<KeyAddress> toKeys(NSArray<MFKeyAddress*>* keys) {
+    std::vector<KeyAddress> out;
+    for (MFKeyAddress* k in keys) out.push_back(KeyAddress{k.layerID, toRef(k.ref), int(k.index)});
+    return out;
+}
+std::vector<ObjectId> toIds(NSArray<NSNumber*>* ids) {
+    std::vector<ObjectId> out;
+    for (NSNumber* n in ids) out.push_back(n.unsignedLongLongValue);
+    return out;
+}
+NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
+    NSMutableArray* out = [NSMutableArray arrayWithCapacity:ids.size()];
+    for (ObjectId i : ids) [out addObject:@(i)];
+    return out;
+}
+}  // namespace
 
 @interface MFParamInfo ()
 - (instancetype)initWithRef:(PropRef)ref def:(const PropDef&)def property:(const Property&)p;
@@ -484,6 +534,10 @@ NSInteger MFPropDimensions(MFProp prop) { return propDef(static_cast<PropId>(pro
 - (uint64_t)addNullLayer { return _doc.addLayer([self compID], LayerKind::Null); }
 - (BOOL)removeLayer:(uint64_t)layerID { return _doc.removeLayer([self compID], layerID); }
 - (uint64_t)duplicateLayer:(uint64_t)layerID { return _doc.duplicateLayer([self compID], layerID); }
+- (BOOL)removeLayers:(NSArray<NSNumber*>*)layerIDs { return _doc.removeLayers([self compID], toIds(layerIDs)); }
+- (NSArray<NSNumber*>*)duplicateLayers:(NSArray<NSNumber*>*)layerIDs {
+    return fromIds(_doc.duplicateLayers([self compID], toIds(layerIDs)));
+}
 - (BOOL)moveLayer:(uint64_t)layerID toIndex:(NSInteger)index { return _doc.moveLayer([self compID], layerID, int(index)); }
 - (BOOL)setLayer:(uint64_t)layerID name:(NSString*)name { return _doc.setLayerName([self compID], layerID, name.UTF8String); }
 - (BOOL)setLayer:(uint64_t)layerID visible:(BOOL)visible { return _doc.setLayerVisible([self compID], layerID, visible); }
@@ -554,6 +608,95 @@ NSInteger MFPropDimensions(MFProp prop) { return propDef(static_cast<PropId>(pro
                                      in:(MFInterp)inInterp out:(MFInterp)outInterp {
     return _doc.setKeyframeInterpolation([self compID], layerID, toRef(ref), int(index), static_cast<Interp>(inInterp),
                                          static_cast<Interp>(outInterp));
+}
+
+- (BOOL)setKeyframeValueAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID value:(MFValue)value {
+    return _doc.setKeyframeValue([self compID], layerID, toRef(ref), int(index), toValue(value));
+}
+- (BOOL)setKeyframeSpatialAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID
+                             mode:(MFSpatial)mode tangentIn:(MFValue)tangentIn tangentOut:(MFValue)tangentOut {
+    return _doc.setKeyframeSpatial([self compID], layerID, toRef(ref), int(index), static_cast<Spatial>(mode),
+                                   toValue(tangentIn), toValue(tangentOut));
+}
+
+- (NSArray<MFKeyAddress*>*)moveKeyframes:(NSArray<MFKeyAddress*>*)keys by:(double)dt {
+    const auto moved = _doc.moveKeyframes([self compID], toKeys(keys), dt);
+    NSMutableArray* out = [NSMutableArray arrayWithCapacity:moved.size()];
+    for (const KeyAddress& k : moved) [out addObject:[[MFKeyAddress alloc] initWithLayer:k.layer ref:fromRef(k.prop) index:k.index]];
+    return out;
+}
+- (BOOL)removeKeyframes:(NSArray<MFKeyAddress*>*)keys { return _doc.removeKeyframes([self compID], toKeys(keys)); }
+- (BOOL)setInterpolationForKeyframes:(NSArray<MFKeyAddress*>*)keys
+                                  in:(MFInterp)inInterp
+                                 out:(MFInterp)outInterp
+                               setIn:(BOOL)setIn
+                              setOut:(BOOL)setOut {
+    return _doc.setKeyframesInterpolation([self compID], toKeys(keys),
+                                          setIn ? std::optional<Interp>(static_cast<Interp>(inInterp)) : std::nullopt,
+                                          setOut ? std::optional<Interp>(static_cast<Interp>(outInterp)) : std::nullopt);
+}
+
+- (MFMotionPath*)motionPathForLayer:(uint64_t)layerID time:(double)time {
+    const Composition* c = [self comp];
+    const Layer* l = c ? c->findLayer(layerID) : nullptr;
+    if (!l || !l->prop(PropId::Position).animated()) return nil;
+    const Property& p = l->prop(PropId::Position);
+    // Positions live in the parent's space; draw them with the parent's transform at `time`.
+    Affine parent;
+    if (const Layer* pl = l->parent ? c->findLayer(l->parent) : nullptr) parent = layerWorldTransform(*c, *pl, time);
+    auto toComp = [&](double x, double y) {
+        const Vec2 v = parent.apply({x, y});
+        return CGPointMake(v.x, v.y);
+    };
+    NSMutableArray* pts = [NSMutableArray array];
+    for (const auto& q : sampleMotionPath(p, 24)) [pts addObject:[NSValue valueWithPoint:toComp(q[0], q[1])]];
+    NSMutableArray* keys = [NSMutableArray array];
+    for (size_t i = 0; i < p.keyframes.size(); ++i) {
+        const Keyframe& k = p.keyframes[i];
+        Value in, out;
+        spatialHandles(p.keyframes, i, in, out);
+        MFMotionPathKey* mk = [MFMotionPathKey new];
+        mk.index = NSInteger(i);
+        mk.time = k.time;
+        mk.point = toComp(k.value[0], k.value[1]);
+        mk.inHandle = toComp(k.value[0] + in[0], k.value[1] + in[1]);
+        mk.outHandle = toComp(k.value[0] + out[0], k.value[1] + out[1]);
+        mk.spatial = static_cast<MFSpatial>(k.spatial);
+        [keys addObject:mk];
+    }
+    MFMotionPath* path = [MFMotionPath new];
+    path.ref = MFPropRefMake(MFPropPosition);
+    path.points = pts;
+    path.keys = keys;
+    return path;
+}
+
+- (NSString*)clipboardForLayers:(NSArray<NSNumber*>*)layerIDs {
+    return @(copyLayers(_doc.project(), [self compID], toIds(layerIDs)).c_str());
+}
+- (NSString*)clipboardForKeyframes:(NSArray<MFKeyAddress*>*)keys {
+    return @(copyKeyframes(_doc.project(), [self compID], toKeys(keys)).c_str());
+}
+- (NSInteger)clipboardKind:(NSString*)text {
+    return static_cast<NSInteger>(mf::clipboardKind(text.UTF8String));
+}
+- (NSArray<NSNumber*>*)pasteLayers:(NSString*)text atIndex:(NSInteger)index error:(NSError**)error {
+    std::string err;
+    const auto ids = mf::pasteLayers(_doc, [self compID], text.UTF8String, int(index), err);
+    if (ids.empty()) {
+        if (error) *error = makeError(7, err.empty() ? "Nothing to paste" : err);
+        return nil;
+    }
+    for (const Asset& a : _doc.project().assets)  // newly pasted media starts loading
+        if (!a.missing && !_renderer->hasImage(a.id, a.generation) && !_renderer->imagePending(a.id, a.generation))
+            [self requestMedia:a];
+    return fromIds(ids);
+}
+- (NSInteger)pasteKeyframes:(NSString*)text layers:(NSArray<NSNumber*>*)layerIDs time:(double)time message:(NSString**)message {
+    std::string err;
+    const int n = mf::pasteKeyframes(_doc, [self compID], toIds(layerIDs), time, text.UTF8String, err);
+    if (message) *message = err.empty() ? nil : @(err.c_str());
+    return n;
 }
 
 // ---- effects, masks, mattes ----

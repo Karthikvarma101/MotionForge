@@ -12,6 +12,46 @@ namespace fs = std::filesystem;
 namespace mf {
 
 namespace {
+Json valueToJson(const Value& v, int dims);
+Value valueFromJson(const Json& j, const Value& fallback);
+}  // namespace
+
+Json keyframeToJson(const Keyframe& k, const PropDef& def) {
+    Json kj = Json::object();
+    kj.set("t", Json(k.time));
+    kj.set("v", valueToJson(k.value, def.dims));
+    kj.set("in", Json(interpKey(k.inInterp)));
+    kj.set("out", Json(interpKey(k.outInterp)));
+    kj.set("easeIn", Json(k.easeIn));
+    kj.set("easeOut", Json(k.easeOut));
+    if (def.spatial) {
+        kj.set("spatial", Json(spatialKey(k.spatial)));
+        if (k.spatial == Spatial::Bezier) {
+            kj.set("ti", valueToJson(k.tangentIn, 2));
+            kj.set("to", valueToJson(k.tangentOut, 2));
+        }
+    }
+    return kj;
+}
+
+Keyframe keyframeFromJson(const Json& kj, const Value& fallback) {
+    Keyframe k;
+    k.time = kj.get("t").number();
+    k.value = valueFromJson(kj.get("v"), fallback);
+    k.inInterp = interpFromKey(kj.get("in").string()).value_or(Interp::Linear);
+    k.outInterp = interpFromKey(kj.get("out").string()).value_or(Interp::Linear);
+    k.easeIn = kj.get("easeIn").number(1.0 / 3.0);
+    k.easeOut = kj.get("easeOut").number(1.0 / 3.0);
+    // Files before version 3 had straight motion paths: a missing "spatial" means Linear.
+    k.spatial = spatialFromKey(kj.get("spatial").string()).value_or(Spatial::Linear);
+    if (k.spatial == Spatial::Bezier) {
+        k.tangentIn = valueFromJson(kj.get("ti"), Value{});
+        k.tangentOut = valueFromJson(kj.get("to"), Value{});
+    }
+    return k;
+}
+
+namespace {
 
 Json valueToJson(const Value& v, int dims) {
     Json a = Json::array();
@@ -31,21 +71,11 @@ Value valueFromJson(const Json& j, const Value& fallback) {
 }
 
 Json propertyToJson(const Property& p, const PropDef& def) {
-    const int dims = def.dims;
     Json o = Json::object();
-    o.set("value", valueToJson(p.value, dims));
+    o.set("value", valueToJson(p.value, def.dims));
     if (!p.keyframes.empty()) {
         Json keys = Json::array();
-        for (const Keyframe& k : p.keyframes) {
-            Json kj = Json::object();
-            kj.set("t", Json(k.time));
-            kj.set("v", valueToJson(k.value, dims));
-            kj.set("in", Json(interpKey(k.inInterp)));
-            kj.set("out", Json(interpKey(k.outInterp)));
-            kj.set("easeIn", Json(k.easeIn));
-            kj.set("easeOut", Json(k.easeOut));
-            keys.push(std::move(kj));
-        }
+        for (const Keyframe& k : p.keyframes) keys.push(keyframeToJson(k, def));
         o.set("keyframes", std::move(keys));
     }
     return o;
@@ -54,16 +84,7 @@ Json propertyToJson(const Property& p, const PropDef& def) {
 void propertyFromJson(const Json& j, Property& p) {
     p.value = valueFromJson(j.get("value"), p.value);
     p.keyframes.clear();
-    for (const Json& kj : j.get("keyframes").items()) {
-        Keyframe k;
-        k.time = kj.get("t").number();
-        k.value = valueFromJson(kj.get("v"), p.value);
-        k.inInterp = interpFromKey(kj.get("in").string()).value_or(Interp::Linear);
-        k.outInterp = interpFromKey(kj.get("out").string()).value_or(Interp::Linear);
-        k.easeIn = kj.get("easeIn").number(1.0 / 3.0);
-        k.easeOut = kj.get("easeOut").number(1.0 / 3.0);
-        p.keyframes.push_back(k);
-    }
+    for (const Json& kj : j.get("keyframes").items()) p.keyframes.push_back(keyframeFromJson(kj, p.value));
     std::stable_sort(p.keyframes.begin(), p.keyframes.end(),
                      [](const Keyframe& a, const Keyframe& b) { return a.time < b.time; });
 }
@@ -82,6 +103,129 @@ bool exists(const std::string& p) {
 }
 
 }  // namespace
+
+Json layerToJson(const Layer& l) {
+    Json lj = Json::object();
+    lj.set("id", Json(l.id));
+    lj.set("name", Json(l.name));
+    lj.set("kind", Json(layerKindKey(l.kind)));
+    if (l.kind == LayerKind::Shape) lj.set("shape", Json(shapeTypeKey(l.shape)));
+    lj.set("blend", Json(blendModeKey(l.blend)));
+    lj.set("visible", Json(l.visible));
+    lj.set("fillEnabled", Json(l.fillEnabled));
+    lj.set("strokeEnabled", Json(l.strokeEnabled));
+    lj.set("in", Json(l.inPoint));
+    lj.set("out", Json(l.outPoint));
+    lj.set("parent", Json(l.parent));
+    lj.set("asset", Json(l.asset));
+    Json props = Json::object();
+    for (int i = 0; i < kPropCount; ++i) {
+        const auto id = static_cast<PropId>(i);
+        props.set(propDef(id).key, propertyToJson(l.props[i], propDef(id)));
+    }
+    lj.set("properties", std::move(props));
+    if (!l.masks.empty()) {
+        Json masks = Json::array();
+        for (const Mask& m : l.masks) {
+            Json mj = Json::object();
+            mj.set("id", Json(m.id));
+            mj.set("name", Json(m.name));
+            mj.set("shape", Json(maskShapeKey(m.shape)));
+            mj.set("mode", Json(maskModeKey(m.mode)));
+            mj.set("inverted", Json(m.inverted));
+            mj.set("enabled", Json(m.enabled));
+            Json mp = Json::object();
+            for (int k = 0; k < kMaskParamCount; ++k) {
+                const PropDef& def = maskParamDef(static_cast<MaskParam>(k));
+                mp.set(def.key, propertyToJson(m.params[size_t(k)], def));
+            }
+            mj.set("properties", std::move(mp));
+            masks.push(std::move(mj));
+        }
+        lj.set("masks", std::move(masks));
+    }
+    if (!l.effects.empty()) {
+        Json effects = Json::array();
+        for (const Effect& e : l.effects) {
+            const EffectDef& def = effectDef(e.type);
+            Json ej = Json::object();
+            ej.set("id", Json(e.id));
+            ej.set("type", Json(def.key));
+            ej.set("enabled", Json(e.enabled));
+            Json ep = Json::object();
+            for (size_t k = 0; k < def.params.size() && k < e.params.size(); ++k)
+                ep.set(def.params[k].key, propertyToJson(e.params[k], def.params[k]));
+            ej.set("params", std::move(ep));
+            effects.push(std::move(ej));
+        }
+        lj.set("effects", std::move(effects));
+    }
+    if (l.hasMatte()) {
+        Json mt = Json::object();
+        mt.set("layer", Json(l.matteLayer));
+        mt.set("mode", Json(matteModeKey(l.matteMode)));
+        lj.set("trackMatte", std::move(mt));
+    }
+    return lj;
+}
+
+Layer layerFromJson(const Json& lj, const Composition& c, ObjectId* maxId) {
+    const LayerKind kind = layerKindFromKey(lj.get("kind").string()).value_or(LayerKind::Shape);
+    Layer l = makeLayer(kind, c, static_cast<ObjectId>(lj.get("id").number()));
+    l.name = lj.get("name").string();
+    l.shape = shapeTypeFromKey(lj.get("shape").string()).value_or(ShapeType::Rectangle);
+    l.blend = blendModeFromKey(lj.get("blend").string()).value_or(BlendMode::Normal);
+    l.visible = lj.get("visible").boolean(true);
+    l.fillEnabled = lj.get("fillEnabled").boolean(true);
+    l.strokeEnabled = lj.get("strokeEnabled").boolean(false);
+    l.inPoint = lj.get("in").number(0);
+    l.outPoint = lj.get("out").number(c.duration);
+    l.parent = static_cast<ObjectId>(lj.get("parent").number(0));
+    l.asset = static_cast<ObjectId>(lj.get("asset").number(0));
+    const Json& props = lj.get("properties");
+    for (int i = 0; i < kPropCount; ++i) {
+        const auto id = static_cast<PropId>(i);
+        const Json& pj = props.get(propDef(id).key);
+        if (!pj.isNull()) propertyFromJson(pj, l.props[i]);
+    }
+    for (const Json& mj : lj.get("masks").items()) {
+        Mask m;
+        m.id = static_cast<ObjectId>(mj.get("id").number());
+        m.name = mj.get("name").string();
+        m.shape = maskShapeFromKey(mj.get("shape").string()).value_or(MaskShape::Rectangle);
+        m.mode = maskModeFromKey(mj.get("mode").string()).value_or(MaskMode::Add);
+        m.inverted = mj.get("inverted").boolean(false);
+        m.enabled = mj.get("enabled").boolean(true);
+        for (int k = 0; k < kMaskParamCount; ++k) {
+            const PropDef& def = maskParamDef(static_cast<MaskParam>(k));
+            m.params[size_t(k)].value = def.defaultValue;
+            const Json& pj = mj.get("properties").get(def.key);
+            if (!pj.isNull()) propertyFromJson(pj, m.params[size_t(k)]);
+        }
+        if (maxId) *maxId = std::max(*maxId, m.id);
+        l.masks.push_back(std::move(m));
+    }
+    for (const Json& ej : lj.get("effects").items()) {
+        const auto type = effectTypeFromKey(ej.get("type").string());
+        if (!type) continue;  // effect from a newer build: skipped rather than failing the load
+        Effect e = makeEffect(*type, static_cast<ObjectId>(ej.get("id").number()));
+        e.enabled = ej.get("enabled").boolean(true);
+        const EffectDef& def = effectDef(*type);
+        for (size_t k = 0; k < def.params.size(); ++k) {
+            const Json& pj = ej.get("params").get(def.params[k].key);
+            if (!pj.isNull()) propertyFromJson(pj, e.params[k]);
+        }
+        if (maxId) *maxId = std::max(*maxId, e.id);
+        l.effects.push_back(std::move(e));
+    }
+    const Json& mt = lj.get("trackMatte");
+    if (mt.isObject()) {
+        l.matteLayer = static_cast<ObjectId>(mt.get("layer").number(0));
+        l.matteMode = matteModeFromKey(mt.get("mode").string()).value_or(MatteMode::None);
+    }
+    if (maxId) *maxId = std::max(*maxId, l.id);
+    return l;
+}
 
 std::string serializeProject(const Project& project, const std::string& projectDir) {
     Json root = Json::object();
@@ -117,67 +261,7 @@ std::string serializeProject(const Project& project, const std::string& projectD
         cj.set("background", valueToJson(c.background, 4));
         Json layers = Json::array();
         for (const Layer& l : c.layers) {
-            Json lj = Json::object();
-            lj.set("id", Json(l.id));
-            lj.set("name", Json(l.name));
-            lj.set("kind", Json(layerKindKey(l.kind)));
-            if (l.kind == LayerKind::Shape) lj.set("shape", Json(shapeTypeKey(l.shape)));
-            lj.set("blend", Json(blendModeKey(l.blend)));
-            lj.set("visible", Json(l.visible));
-            lj.set("fillEnabled", Json(l.fillEnabled));
-            lj.set("strokeEnabled", Json(l.strokeEnabled));
-            lj.set("in", Json(l.inPoint));
-            lj.set("out", Json(l.outPoint));
-            lj.set("parent", Json(l.parent));
-            lj.set("asset", Json(l.asset));
-            Json props = Json::object();
-            for (int i = 0; i < kPropCount; ++i) {
-                const auto id = static_cast<PropId>(i);
-                props.set(propDef(id).key, propertyToJson(l.props[i], propDef(id)));
-            }
-            lj.set("properties", std::move(props));
-            if (!l.masks.empty()) {
-                Json masks = Json::array();
-                for (const Mask& m : l.masks) {
-                    Json mj = Json::object();
-                    mj.set("id", Json(m.id));
-                    mj.set("name", Json(m.name));
-                    mj.set("shape", Json(maskShapeKey(m.shape)));
-                    mj.set("mode", Json(maskModeKey(m.mode)));
-                    mj.set("inverted", Json(m.inverted));
-                    mj.set("enabled", Json(m.enabled));
-                    Json mp = Json::object();
-                    for (int k = 0; k < kMaskParamCount; ++k) {
-                        const PropDef& def = maskParamDef(static_cast<MaskParam>(k));
-                        mp.set(def.key, propertyToJson(m.params[size_t(k)], def));
-                    }
-                    mj.set("properties", std::move(mp));
-                    masks.push(std::move(mj));
-                }
-                lj.set("masks", std::move(masks));
-            }
-            if (!l.effects.empty()) {
-                Json effects = Json::array();
-                for (const Effect& e : l.effects) {
-                    const EffectDef& def = effectDef(e.type);
-                    Json ej = Json::object();
-                    ej.set("id", Json(e.id));
-                    ej.set("type", Json(def.key));
-                    ej.set("enabled", Json(e.enabled));
-                    Json ep = Json::object();
-                    for (size_t k = 0; k < def.params.size() && k < e.params.size(); ++k)
-                        ep.set(def.params[k].key, propertyToJson(e.params[k], def.params[k]));
-                    ej.set("params", std::move(ep));
-                    effects.push(std::move(ej));
-                }
-                lj.set("effects", std::move(effects));
-            }
-            if (l.hasMatte()) {
-                Json mt = Json::object();
-                mt.set("layer", Json(l.matteLayer));
-                mt.set("mode", Json(matteModeKey(l.matteMode)));
-                lj.set("trackMatte", std::move(mt));
-            }
+            Json lj = layerToJson(l);
             layers.push(std::move(lj));
         }
         cj.set("layers", std::move(layers));
@@ -243,59 +327,7 @@ bool deserializeProject(const std::string& text, const std::string& projectDir, 
         c.background = valueFromJson(cj.get("background"), c.background);
         maxId = std::max(maxId, c.id);
         for (const Json& lj : cj.get("layers").items()) {
-            const LayerKind kind = layerKindFromKey(lj.get("kind").string()).value_or(LayerKind::Shape);
-            Layer l = makeLayer(kind, c, static_cast<ObjectId>(lj.get("id").number()));
-            l.name = lj.get("name").string();
-            l.shape = shapeTypeFromKey(lj.get("shape").string()).value_or(ShapeType::Rectangle);
-            l.blend = blendModeFromKey(lj.get("blend").string()).value_or(BlendMode::Normal);
-            l.visible = lj.get("visible").boolean(true);
-            l.fillEnabled = lj.get("fillEnabled").boolean(true);
-            l.strokeEnabled = lj.get("strokeEnabled").boolean(false);
-            l.inPoint = lj.get("in").number(0);
-            l.outPoint = lj.get("out").number(c.duration);
-            l.parent = static_cast<ObjectId>(lj.get("parent").number(0));
-            l.asset = static_cast<ObjectId>(lj.get("asset").number(0));
-            const Json& props = lj.get("properties");
-            for (int i = 0; i < kPropCount; ++i) {
-                const auto id = static_cast<PropId>(i);
-                const Json& pj = props.get(propDef(id).key);
-                if (!pj.isNull()) propertyFromJson(pj, l.props[i]);
-            }
-            for (const Json& mj : lj.get("masks").items()) {
-                Mask m;
-                m.id = static_cast<ObjectId>(mj.get("id").number());
-                m.name = mj.get("name").string();
-                m.shape = maskShapeFromKey(mj.get("shape").string()).value_or(MaskShape::Rectangle);
-                m.mode = maskModeFromKey(mj.get("mode").string()).value_or(MaskMode::Add);
-                m.inverted = mj.get("inverted").boolean(false);
-                m.enabled = mj.get("enabled").boolean(true);
-                for (int k = 0; k < kMaskParamCount; ++k) {
-                    const PropDef& def = maskParamDef(static_cast<MaskParam>(k));
-                    m.params[size_t(k)].value = def.defaultValue;
-                    const Json& pj = mj.get("properties").get(def.key);
-                    if (!pj.isNull()) propertyFromJson(pj, m.params[size_t(k)]);
-                }
-                maxId = std::max(maxId, m.id);
-                l.masks.push_back(std::move(m));
-            }
-            for (const Json& ej : lj.get("effects").items()) {
-                const auto type = effectTypeFromKey(ej.get("type").string());
-                if (!type) continue;  // effect from a newer build: skipped rather than failing the load
-                Effect e = makeEffect(*type, static_cast<ObjectId>(ej.get("id").number()));
-                e.enabled = ej.get("enabled").boolean(true);
-                const EffectDef& def = effectDef(*type);
-                for (size_t k = 0; k < def.params.size(); ++k) {
-                    const Json& pj = ej.get("params").get(def.params[k].key);
-                    if (!pj.isNull()) propertyFromJson(pj, e.params[k]);
-                }
-                maxId = std::max(maxId, e.id);
-                l.effects.push_back(std::move(e));
-            }
-            const Json& mt = lj.get("trackMatte");
-            if (mt.isObject()) {
-                l.matteLayer = static_cast<ObjectId>(mt.get("layer").number(0));
-                l.matteMode = matteModeFromKey(mt.get("mode").string()).value_or(MatteMode::None);
-            }
+            Layer l = layerFromJson(lj, c, &maxId);
             maxId = std::max(maxId, l.id);
             c.layers.push_back(std::move(l));
         }

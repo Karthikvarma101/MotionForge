@@ -1,7 +1,9 @@
 #include "mf/Document.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <unordered_map>
 
 #include "mf/Evaluator.hpp"
 
@@ -26,6 +28,15 @@ int putKey(Property& p, const Keyframe& k) {
     auto it = std::upper_bound(p.keyframes.begin(), p.keyframes.end(), k.time,
                                [](double t, const Keyframe& x) { return t < x.time; });
     return static_cast<int>(p.keyframes.insert(it, k) - p.keyframes.begin());
+}
+
+// A new keyframe: spatial properties default to smooth (Auto) motion paths, like most motion tools.
+Keyframe newKey(const PropDef& def, double time, const Value& v) {
+    Keyframe k;
+    k.time = time;
+    k.value = v;
+    if (def.spatial) k.spatial = Spatial::Auto;
+    return k;
 }
 
 std::string uniqueName(const Composition& c, const std::string& base) {
@@ -308,10 +319,7 @@ bool Document::setPropertyValue(ObjectId comp, ObjectId layer, PropRef prop, dou
     edit(std::string("Change ") + def.label);
     Property& p = *resolveProperty(*layerFor(comp, layer), prop);
     if (p.animated()) {
-        Keyframe k;
-        k.time = time;
-        k.value = v;
-        putKey(p, k);
+        putKey(p, newKey(def, time, v));
     } else {
         p.value = v;
     }
@@ -326,10 +334,7 @@ bool Document::setPropertyAnimated(ObjectId comp, ObjectId layer, PropRef prop, 
     edit(animated ? "Enable Keyframes" : "Remove Keyframes");
     Property& p = *resolveProperty(*layerFor(comp, layer), prop);
     if (animated) {
-        Keyframe k;
-        k.time = time;
-        k.value = current;
-        p.keyframes = {k};
+        p.keyframes = {newKey(*propertyDef(*layerFor(comp, layer), prop), time, current)};
     } else {
         p.keyframes.clear();
         p.value = current;
@@ -342,10 +347,8 @@ bool Document::addKeyframe(ObjectId comp, ObjectId layer, PropRef prop, double t
     const Property* p0 = l0 ? resolveProperty(*l0, prop) : nullptr;
     if (!p0 || findKeyAt(*p0, time) >= 0) return false;
     const Value current = evaluateProperty(*p0, *propertyDef(*l0, prop), time);
+    const Keyframe k = newKey(*propertyDef(*l0, prop), time, current);
     edit("Add Keyframe");
-    Keyframe k;
-    k.time = time;
-    k.value = current;
     putKey(*resolveProperty(*layerFor(comp, layer), prop), k);
     return true;
 }
@@ -513,6 +516,261 @@ bool Document::setLayerMatte(ObjectId comp, ObjectId layer, ObjectId matteLayer,
     l->matteMode = mode;
     if (matteLayer && matteLayer != previous) cc.findLayer(matteLayer)->visible = false;
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keyframe editing beyond the playhead, and multi-selection
+
+bool Document::setKeyframeValue(ObjectId comp, ObjectId layer, PropRef prop, int index, Value v) {
+    Layer* l0 = layerFor(comp, layer);
+    const Property* p0 = l0 ? resolveProperty(*l0, prop) : nullptr;
+    if (!p0 || index < 0 || index >= int(p0->keyframes.size())) return false;
+    const PropDef& def = *propertyDef(*l0, prop);
+    for (int i = def.dims; i < 4; ++i) v[size_t(i)] = 0;
+    for (int i = 0; i < def.dims; ++i) v[size_t(i)] = std::clamp(v[size_t(i)], def.minValue, def.maxValue);
+    if (p0->keyframes[size_t(index)].value == v) return false;
+    edit(std::string("Change ") + def.label);
+    resolveProperty(*layerFor(comp, layer), prop)->keyframes[size_t(index)].value = v;
+    return true;
+}
+
+bool Document::setKeyframeSpatial(ObjectId comp, ObjectId layer, PropRef prop, int index, Spatial mode, Value tin,
+                                  Value tout) {
+    Layer* l0 = layerFor(comp, layer);
+    const Property* p0 = l0 ? resolveProperty(*l0, prop) : nullptr;
+    if (!p0 || !propertyDef(*l0, prop)->spatial || index < 0 || index >= int(p0->keyframes.size())) return false;
+    if (mode != Spatial::Bezier) tin = tout = Value{};
+    const Keyframe& k0 = p0->keyframes[size_t(index)];
+    if (k0.spatial == mode && k0.tangentIn == tin && k0.tangentOut == tout) return false;
+    edit("Motion Path");
+    Keyframe& k = resolveProperty(*layerFor(comp, layer), prop)->keyframes[size_t(index)];
+    k.spatial = mode;
+    k.tangentIn = tin;
+    k.tangentOut = tout;
+    return true;
+}
+
+namespace {
+bool sameTrack(const KeyAddress& a, const KeyAddress& b) { return a.layer == b.layer && a.prop == b.prop; }
+}  // namespace
+
+std::vector<KeyAddress> Document::moveKeyframes(ObjectId comp, const std::vector<KeyAddress>& keys, double dt) {
+    std::vector<KeyAddress> result = keys;
+    if (keys.empty() || std::abs(dt) < kTimeEps) return result;
+    for (const KeyAddress& k : keys) {  // validate everything before touching the document
+        Layer* l = layerFor(comp, k.layer);
+        const Property* p = l ? resolveProperty(*l, k.prop) : nullptr;
+        if (!p || k.index < 0 || k.index >= int(p->keyframes.size())) return keys;
+    }
+    edit(keys.size() == 1 ? "Move Keyframe" : "Move Keyframes");
+    std::vector<bool> done(keys.size(), false);
+    for (size_t a = 0; a < keys.size(); ++a) {
+        if (done[a]) continue;
+        // All selected keys of this property.
+        std::vector<size_t> group;
+        for (size_t b = a; b < keys.size(); ++b)
+            if (!done[b] && sameTrack(keys[a], keys[b])) group.push_back(b);
+        Property& p = *resolveProperty(*layerFor(comp, keys[a].layer), keys[a].prop);
+        struct Tagged {
+            Keyframe k;
+            int tag;  // index into `group`, or -1 for unselected keys
+        };
+        std::vector<Tagged> moved, rest;
+        std::vector<bool> selected(p.keyframes.size(), false);
+        for (size_t gi = 0; gi < group.size(); ++gi) {
+            const int idx = keys[group[gi]].index;
+            if (selected[size_t(idx)]) continue;  // the same key listed twice
+            selected[size_t(idx)] = true;
+            Keyframe k = p.keyframes[size_t(idx)];
+            k.time += dt;
+            moved.push_back({k, int(gi)});
+        }
+        for (size_t i = 0; i < p.keyframes.size(); ++i) {
+            if (selected[i]) continue;
+            const bool covered = std::any_of(moved.begin(), moved.end(), [&](const Tagged& m) {
+                return std::abs(m.k.time - p.keyframes[i].time) < kTimeEps;
+            });
+            if (!covered) rest.push_back({p.keyframes[i], -1});
+        }
+        std::vector<Tagged> merged = rest;
+        merged.insert(merged.end(), moved.begin(), moved.end());
+        std::stable_sort(merged.begin(), merged.end(), [](const Tagged& x, const Tagged& y) { return x.k.time < y.k.time; });
+        p.keyframes.clear();
+        for (size_t i = 0; i < merged.size(); ++i) {
+            p.keyframes.push_back(merged[i].k);
+            if (merged[i].tag >= 0) {
+                // Every listing of this key (duplicates included) gets its new index.
+                const int oldIdx = keys[group[size_t(merged[i].tag)]].index;
+                for (size_t gi : group)
+                    if (keys[gi].index == oldIdx) result[gi].index = int(i);
+            }
+        }
+        for (size_t gi : group) done[gi] = true;
+    }
+    return result;
+}
+
+bool Document::removeKeyframes(ObjectId comp, const std::vector<KeyAddress>& keys) {
+    std::vector<KeyAddress> valid;
+    for (const KeyAddress& k : keys) {
+        Layer* l = layerFor(comp, k.layer);
+        const Property* p = l ? resolveProperty(*l, k.prop) : nullptr;
+        if (p && k.index >= 0 && k.index < int(p->keyframes.size()) &&
+            std::find(valid.begin(), valid.end(), k) == valid.end())
+            valid.push_back(k);
+    }
+    if (valid.empty()) return false;
+    edit(valid.size() == 1 ? "Delete Keyframe" : "Delete Keyframes");
+    // Highest index first so earlier erasures don't shift later ones.
+    std::sort(valid.begin(), valid.end(), [](const KeyAddress& a, const KeyAddress& b) { return a.index > b.index; });
+    for (const KeyAddress& k : valid) {
+        Property& p = *resolveProperty(*layerFor(comp, k.layer), k.prop);
+        if (p.keyframes.size() == 1) p.value = p.keyframes.front().value;  // keeps its last value
+        p.keyframes.erase(p.keyframes.begin() + k.index);
+    }
+    return true;
+}
+
+bool Document::setKeyframesInterpolation(ObjectId comp, const std::vector<KeyAddress>& keys, std::optional<Interp> in,
+                                         std::optional<Interp> out) {
+    bool any = false;
+    for (const KeyAddress& k : keys) {
+        Layer* l = layerFor(comp, k.layer);
+        const Property* p = l ? resolveProperty(*l, k.prop) : nullptr;
+        if (!p || k.index < 0 || k.index >= int(p->keyframes.size())) continue;
+        const Keyframe& kf = p->keyframes[size_t(k.index)];
+        if ((in && kf.inInterp != *in) || (out && kf.outInterp != *out)) any = true;
+    }
+    if (!any) return false;
+    edit("Keyframe Interpolation");
+    for (const KeyAddress& k : keys) {
+        Layer* l = layerFor(comp, k.layer);
+        Property* p = l ? resolveProperty(*l, k.prop) : nullptr;
+        if (!p || k.index < 0 || k.index >= int(p->keyframes.size())) continue;
+        Keyframe& kf = p->keyframes[size_t(k.index)];
+        if (in) kf.inInterp = *in;
+        if (out) kf.outInterp = *out;
+    }
+    return true;
+}
+
+int Document::insertKeyframes(ObjectId comp, ObjectId layer,
+                              const std::vector<std::pair<PropRef, std::vector<Keyframe>>>& tracks) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0) return 0;
+    bool any = false;
+    for (const auto& [ref, keys] : tracks) any = any || (resolveProperty(*l0, ref) && !keys.empty());
+    if (!any) return 0;
+    edit("Paste Keyframes");
+    Layer& l = *layerFor(comp, layer);
+    int written = 0;
+    for (const auto& [ref, keys] : tracks) {
+        Property* p = resolveProperty(l, ref);
+        if (!p) continue;
+        const PropDef& def = *propertyDef(l, ref);
+        for (Keyframe k : keys) {
+            for (int i = def.dims; i < 4; ++i) k.value[size_t(i)] = 0;
+            for (int i = 0; i < def.dims; ++i) k.value[size_t(i)] = std::clamp(k.value[size_t(i)], def.minValue, def.maxValue);
+            if (!def.spatial) {
+                k.spatial = Spatial::Linear;
+                k.tangentIn = k.tangentOut = Value{};
+            }
+            if (int i = findKeyAt(*p, k.time); i >= 0) p->keyframes.erase(p->keyframes.begin() + i);
+            auto it = std::upper_bound(p->keyframes.begin(), p->keyframes.end(), k.time,
+                                       [](double t, const Keyframe& x) { return t < x.time; });
+            p->keyframes.insert(it, k);
+            ++written;
+        }
+    }
+    return written;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Several layers at once
+
+bool Document::removeLayers(ObjectId comp, const std::vector<ObjectId>& ids) {
+    Composition* c0 = project_.findComposition(comp);
+    if (!c0) return false;
+    std::vector<ObjectId> valid;
+    for (ObjectId id : ids)
+        if (c0->findLayer(id) && std::find(valid.begin(), valid.end(), id) == valid.end()) valid.push_back(id);
+    if (valid.empty()) return false;
+    edit(valid.size() == 1 ? "Delete Layer" : "Delete Layers");
+    Composition& c = *project_.findComposition(comp);
+    auto gone = [&](ObjectId id) { return std::find(valid.begin(), valid.end(), id) != valid.end(); };
+    c.layers.erase(std::remove_if(c.layers.begin(), c.layers.end(), [&](const Layer& l) { return gone(l.id); }),
+                   c.layers.end());
+    for (Layer& l : c.layers) {
+        if (gone(l.parent)) l.parent = 0;
+        if (gone(l.matteLayer)) {
+            l.matteLayer = 0;
+            l.matteMode = MatteMode::None;
+        }
+    }
+    return true;
+}
+
+std::vector<ObjectId> Document::duplicateLayers(ObjectId comp, const std::vector<ObjectId>& ids) {
+    std::vector<Layer> copies;
+    int top = INT32_MAX;
+    if (const Composition* c = project_.findComposition(comp))
+        for (const Layer& l : c->layers)  // keep stacking order
+            if (std::find(ids.begin(), ids.end(), l.id) != ids.end()) {
+                copies.push_back(l);
+                top = std::min(top, c->indexOf(l.id));
+            }
+    if (copies.empty()) return {};
+    return insertLayers(comp, std::move(copies), {}, top);
+}
+
+std::vector<ObjectId> Document::insertLayers(ObjectId comp, std::vector<Layer> layers, const std::vector<Asset>& assets,
+                                             int atIndex) {
+    if (!project_.findComposition(comp) || layers.empty()) return {};
+    Project& p = edit(layers.size() == 1 ? "Paste Layer" : "Paste Layers");
+    Composition& c = *p.findComposition(comp);
+    // Media: reuse this project's asset for the same file, otherwise add it.
+    std::unordered_map<ObjectId, ObjectId> assetMap;
+    for (const Asset& a : assets) {
+        ObjectId id = 0;
+        for (const Asset& mine : p.assets)
+            if (mine.path == a.path) id = mine.id;
+        if (!id && !a.path.empty()) {
+            Asset copy = a;
+            copy.id = id = p.allocateId();
+            p.assets.push_back(copy);
+        }
+        assetMap[a.id] = id;
+    }
+    std::unordered_map<ObjectId, ObjectId> idMap;
+    for (Layer& l : layers) {
+        const ObjectId fresh = p.allocateId();
+        idMap[l.id] = fresh;
+        l.id = fresh;
+        for (Mask& m : l.masks) m.id = p.allocateId();
+        for (Effect& e : l.effects) e.id = p.allocateId();
+        if (l.kind == LayerKind::Image) {
+            auto it = assetMap.find(l.asset);
+            if (it != assetMap.end()) l.asset = it->second;
+            else if (!p.findAsset(l.asset)) l.asset = 0;
+        }
+        l.name = uniqueName(c, l.name);
+    }
+    std::vector<ObjectId> out;
+    for (Layer& l : layers) {
+        auto pi = idMap.find(l.parent);
+        l.parent = pi != idMap.end() ? pi->second : 0;
+        auto mi = idMap.find(l.matteLayer);
+        if (mi != idMap.end()) {
+            l.matteLayer = mi->second;
+        } else {
+            l.matteLayer = 0;
+            l.matteMode = MatteMode::None;
+        }
+        out.push_back(l.id);
+    }
+    atIndex = std::clamp(atIndex, 0, int(c.layers.size()));
+    c.layers.insert(c.layers.begin() + atIndex, layers.begin(), layers.end());
+    return out;
 }
 
 }  // namespace mf

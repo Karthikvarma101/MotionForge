@@ -111,6 +111,14 @@ struct SelectionOverlay: View {
             ctx.stroke(Path(frame), with: .color(.white.opacity(0.12)), lineWidth: 1)
 
             guard let sel = model.selection else { return }
+            // Every selected layer gets an outline; the primary one also gets corner handles.
+            for id in model.selectedLayers where id != sel {
+                let q = model.engine.quad(forLayer: id, time: time.time)
+                var outline = Path()
+                outline.addLines([q.topLeft, q.topRight, q.bottomRight, q.bottomLeft].map(geometry.toView))
+                outline.closeSubpath()
+                ctx.stroke(outline, with: .color(Theme.accent.opacity(0.75)), lineWidth: 1)
+            }
             let q = model.engine.quad(forLayer: sel, time: time.time)
             let pts = [q.topLeft, q.topRight, q.bottomRight, q.bottomLeft].map(geometry.toView)
             var path = Path()
@@ -121,6 +129,32 @@ struct SelectionOverlay: View {
                 let r = CGRect(x: p.x - 3.5, y: p.y - 3.5, width: 7, height: 7)
                 ctx.fill(Path(r), with: .color(.white))
                 ctx.stroke(Path(r), with: .color(Theme.accent), lineWidth: 1)
+            }
+            // Motion paths: dotted path, a square per keyframe; bezier handles on the primary layer.
+            for id in model.selectedLayers {
+                guard let mp = model.engine.motionPath(layer: id, time: time.time) else { continue }
+                var line = Path()
+                line.addLines(mp.points.map { geometry.toView($0.pointValue) })
+                ctx.stroke(line, with: .color(.white.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                for k in mp.keys {
+                    let c = geometry.toView(k.point)
+                    if id == sel {
+                        for h in [k.inHandle, k.outHandle] {
+                            let hv = geometry.toView(h)
+                            guard hypot(hv.x - c.x, hv.y - c.y) > 1 else { continue }
+                            var stem = Path()
+                            stem.move(to: c)
+                            stem.addLine(to: hv)
+                            ctx.stroke(stem, with: .color(Theme.keyframe.opacity(0.9)), lineWidth: 1)
+                            let dot = CGRect(x: hv.x - 3.5, y: hv.y - 3.5, width: 7, height: 7)
+                            ctx.fill(Path(ellipseIn: dot), with: .color(Theme.keyframe))
+                        }
+                    }
+                    let atPlayhead = abs(k.time - time.time) < 0.5 / model.comp.fps
+                    let r = CGRect(x: c.x - 4, y: c.y - 4, width: 8, height: 8)
+                    ctx.fill(Path(r), with: .color(atPlayhead ? Theme.keyframe : Color(white: 0.15)))
+                    ctx.stroke(Path(r), with: .color(Theme.keyframe), lineWidth: 1)
+                }
             }
             // Masks of the selected layer, dashed.
             for m in model.selectedLayer?.masks ?? [] where m.enabled {
@@ -273,9 +307,12 @@ struct MetalViewer: NSViewRepresentable {
         private var dropped = 0
         private var lastPerfPublish: CFTimeInterval = 0
         // interaction
-        private var dragLayer: UInt64 = 0
-        private var dragStartComp = CGPoint.zero
-        private var dragStartPos = MFValue()
+        private enum Drag {
+            case layers(start: CGPoint, positions: [UInt64: MFValue])
+            case pathKey(layer: UInt64, index: Int, start: CGPoint, value: MFValue)
+            case pathHandle(layer: UInt64, index: Int, isOut: Bool, start: CGPoint, tangentIn: MFValue, tangentOut: MFValue)
+        }
+        private var drag: Drag?
         private var panStartView: CGPoint?
         private var panStart = CGSize.zero
         // adaptive preview resolution (Auto quality, playback only)
@@ -422,46 +459,105 @@ struct MetalViewer: NSViewRepresentable {
             model.closeCoalescedEdit()
             let t = model.time.time
             let cp = geometry.toComp(p)
+            let flags = event.modifierFlags
+            // 1. Motion-path handles and key points of the primary layer take precedence.
+            if let sel = model.selection, let mp = model.engine.motionPath(layer: sel, time: t), beginPathDrag(mp, sel, p, cp, t) {
+                return
+            }
+            // 2. Layers: ⌘ toggles, ⇧ adds, a plain click on an unselected layer selects only it.
             let hit = model.engine.hitTest(at: cp, time: t)
-            model.selectedKeyframe = nil
-            if hit != 0 && !event.modifierFlags.contains(.option) {
-                model.selection = hit
-                dragLayer = hit
-                dragStartComp = cp
-                dragStartPos = model.engine.value(of: .position, layer: hit, time: t)
-                model.engine.beginUndoGroup("Move Layer")
+            if hit != 0 && !flags.contains(.option) {
+                if flags.contains(.command) {
+                    model.selectLayer(hit, mode: .toggle)
+                    if !model.selectedLayers.contains(hit) { return }
+                } else if flags.contains(.shift) {
+                    if !model.selectedLayers.contains(hit) { model.selectLayer(hit, mode: .toggle) } else { model.selection = hit }
+                } else if !model.selectedLayers.contains(hit) {
+                    model.selectLayer(hit, mode: .replace)
+                    model.selectedKeyframes = []
+                } else {
+                    model.selection = hit
+                }
+                var starts: [UInt64: MFValue] = [:]
+                for id in model.selectedLayers { starts[id] = model.engine.value(of: .position, layer: id, time: t) }
+                drag = .layers(start: cp, positions: starts)
+                model.engine.beginUndoGroup(starts.count > 1 ? "Move Layers" : "Move Layer")
             } else {
-                if hit == 0 { model.selection = nil }
+                if hit == 0 && !flags.contains(.command) && !flags.contains(.shift) { model.clearSelection() }
                 panStartView = p
                 panStart = model.pan
             }
         }
 
+        /// Starts dragging a bezier handle or a key point if `p` is within reach of one.
+        private func beginPathDrag(_ mp: MFMotionPath, _ layer: UInt64, _ p: CGPoint, _ cp: CGPoint, _ t: Double) -> Bool {
+            let reach = 6.0
+            func near(_ q: CGPoint) -> Bool { let v = geometry.toView(q); return hypot(v.x - p.x, v.y - p.y) <= reach }
+            let position = MFPropRef.layer(.position)
+            for k in mp.keys {  // handles first: they sit on top of the path
+                for (h, isOut) in [(k.outHandle, true), (k.inHandle, false)] where near(h) && !near(k.point) {
+                    let tin = model.engine.parentSpaceVector(CGPoint(x: k.inHandle.x - k.point.x, y: k.inHandle.y - k.point.y), layer: layer, time: t)
+                    let tout = model.engine.parentSpaceVector(CGPoint(x: k.outHandle.x - k.point.x, y: k.outHandle.y - k.point.y), layer: layer, time: t)
+                    drag = .pathHandle(layer: layer, index: k.index, isOut: isOut, start: cp,
+                                       tangentIn: MFValue(x: tin.x, y: tin.y, z: 0, w: 0), tangentOut: MFValue(x: tout.x, y: tout.y, z: 0, w: 0))
+                    model.engine.beginUndoGroup("Motion Path")
+                    return true
+                }
+            }
+            for k in mp.keys where near(k.point) {
+                guard let info = model.selectedLayer?.keyframes(for: position).first(where: { $0.index == k.index }) else { continue }
+                drag = .pathKey(layer: layer, index: k.index, start: cp, value: info.value)
+                model.selectKeyframe(KeyframeRef(layer: layer, ref: position, index: k.index), mode: .replace)
+                model.engine.beginUndoGroup("Move Keyframe Position")
+                return true
+            }
+            return false
+        }
+
         func mouseDragged(_ p: CGPoint, event: NSEvent) {
-            if dragLayer != 0 {
-                let cp = geometry.toComp(p)
-                var d = CGPoint(x: cp.x - dragStartComp.x, y: cp.y - dragStartComp.y)
+            let t = model.time.time
+            let cp = geometry.toComp(p)
+            switch drag {
+            case .layers(let start, let positions):
+                var d = CGPoint(x: cp.x - start.x, y: cp.y - start.y)
                 if event.modifierFlags.contains(.shift) {  // constrain to the dominant axis
                     if abs(d.x) > abs(d.y) { d.y = 0 } else { d.x = 0 }
                 }
-                let t = model.time.time
-                let v = model.engine.parentSpaceVector(d, layer: dragLayer, time: t)
-                var pos = dragStartPos
-                pos.x += v.x
-                pos.y += v.y
-                model.edit { _ = $0.setPropertyValue(pos, prop: .position, layer: dragLayer, time: t) }
-            } else if let start = panStartView {
-                if model.zoom == nil { model.zoom = geometry.scale }
-                model.pan = CGSize(width: panStart.width + p.x - start.x, height: panStart.height + p.y - start.y)
+                model.edit { e in
+                    for (id, start) in positions {  // each in its own parent's space
+                        let v = e.parentSpaceVector(d, layer: id, time: t)
+                        _ = e.setPropertyValue(MFValue(x: start.x + v.x, y: start.y + v.y, z: 0, w: 0), prop: .position, layer: id, time: t)
+                    }
+                }
+            case .pathKey(let layer, let index, let start, let value):
+                let v = model.engine.parentSpaceVector(CGPoint(x: cp.x - start.x, y: cp.y - start.y), layer: layer, time: t)
+                model.edit { _ = $0.setKeyframeValue(at: index, ref: .layer(.position), layer: layer,
+                                                      value: MFValue(x: value.x + v.x, y: value.y + v.y, z: 0, w: 0)) }
+            case .pathHandle(let layer, let index, let isOut, let start, let tin, let tout):
+                let v = model.engine.parentSpaceVector(CGPoint(x: cp.x - start.x, y: cp.y - start.y), layer: layer, time: t)
+                let moved = isOut ? MFValue(x: tout.x + v.x, y: tout.y + v.y, z: 0, w: 0) : MFValue(x: tin.x + v.x, y: tin.y + v.y, z: 0, w: 0)
+                var other = isOut ? tin : tout
+                // Handles stay opposite each other (smooth curve) unless ⌥ splits them.
+                if !event.modifierFlags.contains(.option) {
+                    let len = hypot(other.x, other.y), m = hypot(moved.x, moved.y)
+                    if m > 1e-6 { other = MFValue(x: -moved.x / m * len, y: -moved.y / m * len, z: 0, w: 0) }
+                }
+                model.edit { _ = $0.setKeyframeSpatial(at: index, ref: .layer(.position), layer: layer, mode: .bezier,
+                                                        tangentIn: isOut ? other : moved, tangentOut: isOut ? moved : other) }
+            case nil:
+                if let start = panStartView {
+                    if model.zoom == nil { model.zoom = geometry.scale }
+                    model.pan = CGSize(width: panStart.width + p.x - start.x, height: panStart.height + p.y - start.y)
+                }
             }
         }
 
         func mouseUp(_ p: CGPoint, event: NSEvent) {
-            if dragLayer != 0 {
+            if drag != nil {
                 model.engine.endUndoGroup()
                 model.refresh()
             }
-            dragLayer = 0
+            drag = nil
             panStartView = nil
         }
 

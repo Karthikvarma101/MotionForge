@@ -11,11 +11,41 @@ struct TimeMapper {
     func t(_ x: CGFloat) -> Double { start + Double(x / pxPerSecond) }
 }
 
+/// Rubber-band selection of keyframes across property rows.
+@MainActor
+final class MarqueeModel: ObservableObject {
+    @Published var rect: CGRect?        // while dragging, in the "rows" coordinate space
+    @Published var committed: CGRect?   // set when the drag ends
+    var additive = false
+    func update(_ a: CGPoint, _ b: CGPoint) {
+        rect = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+    func end() {
+        committed = rect
+        rect = nil
+    }
+}
+
+/// Where each keyframe row sits, so a marquee knows which rows it covers.
+struct KeyRowFrame: Equatable {
+    let layer: UInt64
+    let ref: MFPropRef
+    let minY: CGFloat
+    let maxY: CGFloat
+}
+
+struct KeyRowFramesKey: PreferenceKey {
+    static let defaultValue: [KeyRowFrame] = []
+    static func reduce(value: inout [KeyRowFrame], nextValue: () -> [KeyRowFrame]) { value += nextValue() }
+}
+
 struct TimelineView: View {
     @ObservedObject var model: EditorModel
     @ObservedObject var time: TimeModel
     @State private var zoom: Double = 1        // 1 = whole composition visible
     @State private var viewStart: Double = 0
+    @StateObject private var marquee = MarqueeModel()
+    @State private var rowFrames: [KeyRowFrame] = []
 
     static let nameWidth: CGFloat = 270
     static let rowHeight: CGFloat = 24
@@ -51,14 +81,14 @@ struct TimelineView: View {
                         ScrollView(.vertical) {
                             LazyVStack(spacing: 0) {
                                 ForEach(model.layers, id: \.layerID) { layer in
-                                    LayerRows(model: model, time: time, layer: layer, mapper: mapper)
+                                    LayerRows(model: model, time: time, layer: layer, mapper: mapper, marquee: marquee)
                                 }
                             }
+                            .coordinateSpace(name: "rows")
+                            .onPreferenceChange(KeyRowFramesKey.self) { rowFrames = $0 }
+                            .overlay(alignment: .topLeading) { MarqueeOverlay(marquee: marquee) }
                         }
-                        .background(Theme.panel.onTapGesture {
-                            model.selection = nil
-                            model.selectedKeyframe = nil
-                        })
+                        .background(Theme.panel.onTapGesture { model.clearSelection() })
                         if model.layers.isEmpty {
                             Text("Add a shape from the Layer menu or toolbar, or drop images on the viewer.")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -69,6 +99,11 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
                 }
+                .onChange(of: marquee.committed) { _, r in
+                    guard let r else { return }
+                    selectKeys(in: r, mapper: mapper)
+                    marquee.committed = nil
+                }
                 .onChange(of: time.time) { _, t in
                     // Keep the playhead in view while zoomed.
                     if zoom > 1, t < mapper.start || t > mapper.end { viewStart = max(0, t - visible * 0.1) }
@@ -76,6 +111,36 @@ struct TimelineView: View {
             }
         }
         .background(Theme.panel)
+    }
+}
+
+extension TimelineView {
+    /// Keys whose row overlaps the rectangle and whose time falls inside its x-range.
+    fileprivate func selectKeys(in r: CGRect, mapper: TimeMapper) {
+        let t0 = mapper.t(r.minX - Self.nameWidth), t1 = mapper.t(r.maxX - Self.nameWidth)
+        var found = Set<KeyframeRef>()
+        for row in rowFrames where row.maxY >= r.minY && row.minY <= r.maxY {
+            guard let layer = model.layers.first(where: { $0.layerID == row.layer }) else { continue }
+            for k in layer.keyframes(for: row.ref) where k.time >= t0 - 1e-9 && k.time <= t1 + 1e-9 {
+                found.insert(KeyframeRef(layer: row.layer, ref: row.ref, index: k.index))
+            }
+        }
+        model.selectedKeyframes = marquee.additive ? model.selectedKeyframes.union(found) : found
+        if let first = found.first, !model.selectedLayers.contains(first.layer) { model.selection = first.layer }
+    }
+}
+
+private struct MarqueeOverlay: View {
+    @ObservedObject var marquee: MarqueeModel
+    var body: some View {
+        if let r = marquee.rect {
+            Rectangle()
+                .fill(Theme.accent.opacity(0.12))
+                .overlay(Rectangle().stroke(Theme.accent.opacity(0.8), lineWidth: 1))
+                .frame(width: r.width, height: r.height)
+                .offset(x: r.minX, y: r.minY)
+                .allowsHitTesting(false)
+        }
     }
 }
 
@@ -221,6 +286,7 @@ private struct LayerRows: View {
     @ObservedObject var time: TimeModel
     let layer: MFLayerInfo
     let mapper: TimeMapper
+    let marquee: MarqueeModel
 
     var body: some View {
         let expanded = model.expandedLayers.contains(layer.layerID)
@@ -232,10 +298,11 @@ private struct LayerRows: View {
                     .frame(width: mapper.width, height: TimelineView.rowHeight)
                 Spacer(minLength: 0)
             }
-            .background(model.selection == layer.layerID ? Theme.rowSelected.opacity(0.45) : Theme.row)
+            .background(model.selection == layer.layerID ? Theme.rowSelected.opacity(0.55)
+                        : model.selectedLayers.contains(layer.layerID) ? Theme.rowSelected.opacity(0.32) : Theme.row)
             if expanded {
                 ForEach(trackSpecs) { spec in
-                    PropertyTrackRow(model: model, time: time, layer: layer, spec: spec, mapper: mapper)
+                    PropertyTrackRow(model: model, time: time, layer: layer, spec: spec, mapper: mapper, marquee: marquee)
                 }
             }
             Divider().opacity(0.4)
@@ -320,8 +387,9 @@ private struct LayerNameCell: View {
         .padding(.horizontal, 8)
         .contentShape(Rectangle())
         .onTapGesture {
-            model.selection = layer.layerID
-            model.selectedKeyframe = nil
+            let mode = SelectMode.current
+            model.selectLayer(layer.layerID, mode: mode)
+            if mode == .replace { model.selectedKeyframes = [] }
         }
         .contextMenu { LayerContextMenu(model: model, layer: layer) }
     }
@@ -331,8 +399,14 @@ struct LayerContextMenu: View {
     @ObservedObject var model: EditorModel
     let layer: MFLayerInfo
     var body: some View {
-        Button("Duplicate") { model.selection = layer.layerID; model.duplicateSelection() }
-        Button("Delete") { model.selection = layer.layerID; model.selectedKeyframe = nil; model.deleteSelection() }
+        Button(model.selectedLayers.count > 1 && model.selectedLayers.contains(layer.layerID) ? "Duplicate Layers" : "Duplicate") {
+            ensureSelected(); model.duplicateSelection()
+        }
+        Button(model.selectedLayers.count > 1 && model.selectedLayers.contains(layer.layerID) ? "Delete Layers" : "Delete") {
+            ensureSelected(); model.selectedKeyframes = []; model.deleteSelection()
+        }
+        Button("Copy") { ensureSelected(); model.selectedKeyframes = []; model.copySelection() }
+        Button("Paste") { ensureSelected(); model.paste() }
         Divider()
         Button("Bring Forward") { model.selection = layer.layerID; model.moveSelection(by: -1) }
         Button("Send Backward") { model.selection = layer.layerID; model.moveSelection(by: 1) }
@@ -343,6 +417,13 @@ struct LayerContextMenu: View {
         Button("Trim Out to Playhead") {
             model.edit { _ = $0.setLayer(layer.layerID, inPoint: layer.inPoint, outPoint: model.time.time) }
         }
+    }
+}
+
+extension LayerContextMenu {
+    /// Right-clicking a layer outside the selection acts on that layer alone.
+    fileprivate func ensureSelected() {
+        if !model.selectedLayers.contains(layer.layerID) { model.selectLayer(layer.layerID, mode: .replace) }
     }
 }
 
@@ -364,11 +445,12 @@ private struct LayerBar: View {
     let layer: MFLayerInfo
     let mapper: TimeMapper
     @State private var drag: (inPoint: Double, outPoint: Double)?
+    @State private var groupStart: [UInt64: (Double, Double)] = [:]  // other selected layers, when sliding
 
     var body: some View {
         let x0 = max(0, mapper.x(layer.inPoint))
         let x1 = min(mapper.width, mapper.x(layer.outPoint))
-        let selected = model.selection == layer.layerID
+        let selected = model.selectedLayers.contains(layer.layerID)
         ZStack(alignment: .leading) {
             if x1 > x0 {
                 RoundedRectangle(cornerRadius: 3)
@@ -392,8 +474,9 @@ private struct LayerBar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
-            model.selection = layer.layerID
-            model.selectedKeyframe = nil
+            let mode = SelectMode.current
+            model.selectLayer(layer.layerID, mode: mode)
+            if mode == .replace { model.selectedKeyframes = [] }
         }
         .contextMenu { LayerContextMenu(model: model, layer: layer) }
     }
@@ -410,7 +493,13 @@ private struct LayerBar: View {
             .onChanged { g in
                 if drag == nil {
                     drag = (layer.inPoint, layer.outPoint)
-                    model.selection = layer.layerID
+                    if !model.selectedLayers.contains(layer.layerID) { model.selectLayer(layer.layerID, mode: .replace) }
+                    groupStart = [:]
+                    if mode == .move {  // sliding moves every selected layer together
+                        for l in model.layers where model.selectedLayers.contains(l.layerID) && l.layerID != layer.layerID {
+                            groupStart[l.layerID] = (l.inPoint, l.outPoint)
+                        }
+                    }
                     model.engine.beginUndoGroup(mode == .move ? "Move Layer in Time" : "Trim Layer")
                 }
                 guard let d = drag else { return }
@@ -422,10 +511,15 @@ private struct LayerBar: View {
                 case .trimIn: i = min(d.inPoint + dt, d.outPoint - 1 / fps)
                 case .trimOut: o = max(d.outPoint + dt, d.inPoint + 1 / fps)
                 }
-                model.edit { _ = $0.setLayer(layer.layerID, inPoint: i, outPoint: o) }
+                let shift = mode == .move ? i - d.inPoint : 0
+                model.edit { e in
+                    _ = e.setLayer(layer.layerID, inPoint: i, outPoint: o)
+                    for (id, span) in groupStart { _ = e.setLayer(id, inPoint: span.0 + shift, outPoint: span.1 + shift) }
+                }
             }
             .onEnded { _ in
                 drag = nil
+                groupStart = [:]
                 model.engine.endUndoGroup()
                 model.refresh()
             }
@@ -440,6 +534,7 @@ private struct PropertyTrackRow: View {
     let layer: MFLayerInfo
     let spec: ParamSpec
     let mapper: TimeMapper
+    let marquee: MarqueeModel
 
     var body: some View {
         let ref = spec.ref
@@ -459,6 +554,13 @@ private struct PropertyTrackRow: View {
             .frame(width: TimelineView.nameWidth, height: TimelineView.propRowHeight)
             ZStack(alignment: .leading) {
                 Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 4, coordinateSpace: .named("rows"))
+                        .onChanged { g in
+                            if marquee.rect == nil { marquee.additive = SelectMode.current != .replace }
+                            marquee.update(g.startLocation, g.location)
+                        }
+                        .onEnded { _ in marquee.end() })
                 ForEach(layer.keyframes(for: ref), id: \.index) { k in
                     if k.time >= mapper.start - 1e-9 && k.time <= mapper.end + 1e-9 {
                         KeyframeHandle(model: model, layer: layer, spec: spec, key: k, mapper: mapper)
@@ -470,6 +572,11 @@ private struct PropertyTrackRow: View {
             Spacer(minLength: 0)
         }
         .background(Theme.panel)
+        .background(GeometryReader { g in
+            let f = g.frame(in: .named("rows"))
+            Color.clear.preference(key: KeyRowFramesKey.self,
+                                   value: [KeyRowFrame(layer: layer.layerID, ref: ref, minY: f.minY, maxY: f.maxY)])
+        })
     }
 
     private var valueSummary: String {
@@ -486,13 +593,15 @@ private struct KeyframeHandle: View {
     let spec: ParamSpec
     let key: MFKeyframeInfo
     let mapper: TimeMapper
-    @State private var dragIndex: Int?
+    @State private var dragging: [KeyframeRef]?  // the keys being moved (the whole selection)
     @State private var dragStartTime = 0.0
+    @State private var applied = 0.0
+    @State private var toggledOff = false
+
+    private var me: KeyframeRef { KeyframeRef(layer: layer.layerID, ref: spec.ref, index: key.index) }
 
     var body: some View {
-        let prop = spec.ref
-        let ref = KeyframeRef(layer: layer.layerID, ref: prop, index: key.index)
-        let selected = model.selectedKeyframe == ref
+        let selected = model.selectedKeyframes.contains(me)
         KeyframeGlyph(interp: key.outInterp == .hold ? .hold : (key.inInterp == .bezier || key.outInterp == .bezier ? .bezier : .linear),
                       selected: selected)
             .frame(width: 14, height: TimelineView.propRowHeight)
@@ -500,45 +609,78 @@ private struct KeyframeHandle: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
-                        if dragIndex == nil {
-                            dragIndex = key.index
+                        if dragging == nil {
+                            let mode = SelectMode.current
+                            toggledOff = mode != .replace && selected
+                            if !selected || mode != .replace { model.selectKeyframe(me, mode: selected ? mode : (mode == .replace ? .replace : mode)) }
+                            dragging = toggledOff ? [] : Array(model.selectedKeyframes)
                             dragStartTime = key.time
-                            model.selection = layer.layerID
-                            model.selectedKeyframe = ref
-                            model.engine.beginUndoGroup("Move Keyframe")
+                            applied = 0
+                            model.engine.beginUndoGroup(model.selectedKeyframes.count > 1 ? "Move Keyframes" : "Move Keyframe")
                         }
-                        guard let idx = dragIndex else { return }
-                        let t = model.snap(dragStartTime + Double(g.translation.width / mapper.pxPerSecond))
-                        let newIndex = model.engine.moveKeyframe(at: idx, ref: prop, layer: layer.layerID, toTime: t)
-                        if newIndex >= 0 {
-                            dragIndex = newIndex
-                            model.selectedKeyframe = KeyframeRef(layer: layer.layerID, ref: prop, index: newIndex)
-                        }
+                        guard let keys = dragging, !keys.isEmpty else { return }
+                        // Every selected key moves by the same frame-snapped offset as this one.
+                        let dt = model.snap(dragStartTime + Double(g.translation.width / mapper.pxPerSecond)) - dragStartTime
+                        guard abs(dt - applied) > 1e-9 else { return }
+                        let moved = model.engine.moveKeyframes(keys.map(\.address), by: dt - applied).map(KeyframeRef.init)
+                        applied = dt
+                        dragging = moved
+                        model.selectedKeyframes = Set(moved)
                         model.refresh()
                     }
                     .onEnded { g in
                         model.engine.endUndoGroup()
-                        if abs(g.translation.width) < 2 { model.time.time = key.time }  // click jumps to the key
-                        dragIndex = nil
+                        if abs(g.translation.width) < 2 && !toggledOff && SelectMode.current == .replace {
+                            model.time.time = key.time  // a plain click also jumps to the key
+                        }
+                        dragging = nil
                         model.refresh()
                     }
             )
             .contextMenu {
                 Button("Linear") { setInterp(.linear, .linear) }
                 Button("Easy Ease") { setInterp(.bezier, .bezier) }
-                Button("Ease In") { setInterp(.bezier, key.outInterp == .hold ? .linear : key.outInterp) }
-                Button("Ease Out") { setInterp(key.inInterp, .bezier) }
-                Button("Hold") { setInterp(key.inInterp, .hold) }
+                Button("Ease In") { setInterp(.bezier, nil) }
+                Button("Ease Out") { setInterp(nil, .bezier) }
+                Button("Hold") { setInterp(nil, .hold) }
+                if spec.ref.isSpatial {
+                    Divider()
+                    Button("Motion Path: Smooth (Auto Bezier)") { setSpatial(.auto) }
+                    Button("Motion Path: Corner (Linear)") { setSpatial(.linear) }
+                }
                 Divider()
-                Button("Delete Keyframe") {
-                    model.edit { _ = $0.removeKeyframe(at: key.index, ref: prop, layer: layer.layerID) }
-                    model.selectedKeyframe = nil
+                Button(targets.count > 1 ? "Copy \(targets.count) Keyframes" : "Copy Keyframe") {
+                    model.selectedKeyframes = Set(targets)
+                    model.copySelection()
+                }
+                Button(targets.count > 1 ? "Delete \(targets.count) Keyframes" : "Delete Keyframe") {
+                    let keys = targets.map(\.address)
+                    model.edit { _ = $0.removeKeyframes(keys) }
+                    model.selectedKeyframes = []
                 }
             }
-            .help("\(spec.label) keyframe at \(Timecode.string(key.time, fps: model.comp.fps)) — drag to retime, right-click for easing")
+            .help("\(spec.label) keyframe at \(Timecode.string(key.time, fps: model.comp.fps)) — drag to retime (moves every selected key), ⌘/⇧-click to add to the selection, right-click for easing")
     }
 
-    private func setInterp(_ i: MFInterp, _ o: MFInterp) {
-        model.edit { _ = $0.setKeyframeInterpolationAt(key.index, ref: spec.ref, layer: layer.layerID, in: i, out: o) }
+    /// The context menu acts on the whole selection when this key is part of it.
+    private var targets: [KeyframeRef] {
+        model.selectedKeyframes.contains(me) ? Array(model.selectedKeyframes) : [me]
+    }
+
+    private func setInterp(_ i: MFInterp?, _ o: MFInterp?) {
+        let keys = targets.map(\.address)
+        model.edit { _ = $0.setInterpolation(of: keys, in: i ?? .linear, out: o ?? .linear, setIn: i != nil, setOut: o != nil) }
+    }
+
+    private func setSpatial(_ mode: MFSpatial) {
+        let keys = targets.filter { $0.ref.isSpatial }
+        model.engine.beginUndoGroup("Motion Path")
+        model.edit { e in
+            for k in keys {
+                _ = e.setKeyframeSpatial(at: k.index, ref: k.ref, layer: k.layer, mode: mode,
+                                           tangentIn: MFValue(), tangentOut: MFValue())
+            }
+        }
+        model.engine.endUndoGroup()
     }
 }

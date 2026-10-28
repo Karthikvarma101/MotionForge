@@ -23,10 +23,26 @@ enum PreviewQuality: Int, CaseIterable, Identifiable {
     }
 }
 
-struct KeyframeRef: Equatable {
+struct KeyframeRef: Hashable {
     var layer: UInt64
     var ref: MFPropRef
     var index: Int
+    var address: MFKeyAddress { MFKeyAddress(layer: layer, ref: ref, index: index) }
+    init(layer: UInt64, ref: MFPropRef, index: Int) {
+        self.layer = layer
+        self.ref = ref
+        self.index = index
+    }
+    init(_ a: MFKeyAddress) { self.init(layer: a.layerID, ref: a.ref, index: a.index) }
+}
+
+/// How a click changes the selection: replace it, toggle one item (⌘), or extend a range (⇧).
+enum SelectMode {
+    case replace, toggle, extend
+    static var current: SelectMode {
+        let f = NSEvent.modifierFlags
+        return f.contains(.command) ? .toggle : f.contains(.shift) ? .extend : .replace
+    }
 }
 
 /// Playhead state is kept apart from the document model so that playback only re-renders the
@@ -63,8 +79,18 @@ final class EditorModel: ObservableObject {
     @Published private(set) var layers: [MFLayerInfo] = []
     @Published private(set) var comp: MFCompositionInfo
     @Published private(set) var assets: [MFAssetInfo] = []
-    @Published var selection: UInt64?
-    @Published var selectedKeyframe: KeyframeRef?
+    /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
+    @Published var selection: UInt64? {
+        didSet {
+            if let s = selection {
+                if !selectedLayers.contains(s) { selectedLayers = [s] }
+            } else if !selectedLayers.isEmpty {
+                selectedLayers = []
+            }
+        }
+    }
+    @Published var selectedLayers: Set<UInt64> = []
+    @Published var selectedKeyframes: Set<KeyframeRef> = []
     @Published var expandedLayers: Set<UInt64> = []
     @Published private(set) var projectURL: URL?
     @Published var alertMessage: String?
@@ -134,11 +160,13 @@ final class EditorModel: ObservableObject {
         layers = engine.layers()
         comp = engine.composition
         assets = engine.assets()
-        if let s = selection, !layers.contains(where: { $0.layerID == s }) { selection = nil }
-        if let k = selectedKeyframe {
-            let valid = engine.layer(withID: k.layer).map { k.index < $0.keyframes(for: k.ref).count } ?? false
-            if !valid { selectedKeyframe = nil }
+        let ids = Set(layers.map(\.layerID))
+        if !selectedLayers.isSubset(of: ids) { selectedLayers.formIntersection(ids) }
+        if let s = selection, !ids.contains(s) { selection = selectedLayers.first }
+        let validKeys = selectedKeyframes.filter { k in
+            engine.layer(withID: k.layer).map { k.index < $0.keyframes(for: k.ref).count } ?? false
         }
+        if validKeys.count != selectedKeyframes.count { selectedKeyframes = validKeys }
         time.time = min(time.time, max(0, comp.duration - frameDuration))
     }
 
@@ -149,6 +177,47 @@ final class EditorModel: ObservableObject {
     }
 
     var selectedLayer: MFLayerInfo? { selection.flatMap { id in layers.first { $0.layerID == id } } }
+
+    /// Selected layer ids in stacking order (top first).
+    var selectedLayerIDs: [UInt64] { layers.map(\.layerID).filter { selectedLayers.contains($0) } }
+
+    func selectLayer(_ id: UInt64, mode: SelectMode = .current) {
+        switch mode {
+        case .replace:
+            selectedLayers = [id]
+            selection = id
+        case .toggle:
+            if selectedLayers.contains(id) {
+                selectedLayers.remove(id)
+                selection = selection == id ? selectedLayerIDs.first : selection
+            } else {
+                selectedLayers.insert(id)
+                selection = id
+            }
+        case .extend:
+            let order = layers.map(\.layerID)
+            guard let anchor = selection, let a = order.firstIndex(of: anchor), let b = order.firstIndex(of: id) else {
+                selectLayer(id, mode: .replace)
+                return
+            }
+            selectedLayers.formUnion(order[min(a, b)...max(a, b)])
+            selection = id
+        }
+    }
+
+    func selectKeyframe(_ k: KeyframeRef, mode: SelectMode = .current) {
+        switch mode {
+        case .replace: selectedKeyframes = [k]
+        case .toggle, .extend:
+            if selectedKeyframes.contains(k) { selectedKeyframes.remove(k) } else { selectedKeyframes.insert(k) }
+        }
+        if selection != k.layer { selection = k.layer }
+    }
+
+    func clearSelection() {
+        selection = nil
+        selectedKeyframes = []
+    }
 
     /// Runs an edit and refreshes the UI snapshot.
     func edit(_ body: (MFEngine) -> Void) {
@@ -199,20 +268,91 @@ final class EditorModel: ObservableObject {
     }
 
     func deleteSelection() {
-        if let k = selectedKeyframe {
-            edit { _ = $0.removeKeyframe(at: k.index, ref: k.ref, layer: k.layer) }
-            selectedKeyframe = nil
-        } else if let s = selection {
-            edit { _ = $0.removeLayer(s) }
+        if !selectedKeyframes.isEmpty {
+            let keys = selectedKeyframes.map(\.address)
+            edit { _ = $0.removeKeyframes(keys) }
+            selectedKeyframes = []
+        } else if !selectedLayers.isEmpty {
+            let ids = selectedLayerIDs.map { NSNumber(value: $0) }
+            edit { _ = $0.removeLayers(ids) }
             selection = nil
         }
     }
 
     func duplicateSelection() {
-        guard let s = selection else { return }
-        var id: UInt64 = 0
-        edit { id = $0.duplicateLayer(s) }
-        if id != 0 { selection = id }
+        guard !selectedLayers.isEmpty else { return }
+        let ids = selectedLayerIDs.map { NSNumber(value: $0) }
+        var copies: [NSNumber] = []
+        edit { copies = $0.duplicateLayers(ids) }
+        selectLayers(copies.map(\.uint64Value))
+    }
+
+    func selectLayers(_ ids: [UInt64]) {
+        guard let first = ids.first else { return }
+        selectedLayers = Set(ids)
+        selection = first
+    }
+
+    // MARK: - Clipboard (system pasteboard, so it works between projects)
+
+    static let pasteboardType = NSPasteboard.PasteboardType("com.motionforge.clipboard")
+    /// The system pasteboard normally; scripted checks use a private one so they never touch
+    /// the user's clipboard.
+    var pasteboard = NSPasteboard.general
+
+    /// Copies the selected keyframes if any, otherwise the selected layers.
+    func copySelection() {
+        let text: String
+        if !selectedKeyframes.isEmpty {
+            text = engine.clipboard(forKeyframes: selectedKeyframes.map(\.address))
+        } else if !selectedLayers.isEmpty {
+            text = engine.clipboard(forLayers: selectedLayerIDs.map { NSNumber(value: $0) })
+        } else {
+            return
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: Self.pasteboardType)
+    }
+
+    func cutSelection() {
+        copySelection()
+        deleteSelection()
+    }
+
+    /// Layers paste above the topmost selected layer; keyframes paste at the playhead onto the
+    /// selected layer(s).
+    func paste() {
+        guard let text = pasteboard.string(forType: Self.pasteboardType) else { return }
+        closeCoalescedEdit()
+        switch engine.clipboardKind(text) {
+        case 1:
+            let top = layers.firstIndex { selectedLayers.contains($0.layerID) } ?? 0
+            do {
+                var ids: [NSNumber] = []
+                try tryEdit { ids = try $0.pasteLayers(text, at: top) }
+                selectLayers(ids.map(\.uint64Value))
+            } catch {
+                alertMessage = error.localizedDescription
+            }
+        case 2:
+            let targets = selectedLayerIDs
+            guard !targets.isEmpty else {
+                alertMessage = "Select the layer(s) to paste the keyframes onto."
+                return
+            }
+            var message: NSString?
+            var count = 0
+            edit { count = $0.pasteKeyframes(text, layers: targets.map { NSNumber(value: $0) }, time: time.time, message: &message) }
+            if count == 0 || message != nil {
+                alertMessage = (count == 0 ? "No keyframes were pasted. " : "Pasted \(count) keyframes. ") + ((message as String?) ?? "")
+            }
+        default:
+            break
+        }
+    }
+
+    func selectAll() {
+        selectLayers(layers.map(\.layerID))
     }
 
     func moveSelection(by delta: Int) {
@@ -221,13 +361,16 @@ final class EditorModel: ObservableObject {
     }
 
     func nudgeSelection(dx: Double, dy: Double) {
-        guard let s = selection else { return }
         let t = time.time
-        let v = engine.parentSpaceVector(CGPoint(x: dx, y: dy), layer: s, time: t)
-        var p = engine.value(of: .position, layer: s, time: t)
-        p.x += v.x
-        p.y += v.y
-        coalescedEdit("Nudge") { _ = $0.setPropertyValue(p, prop: .position, layer: s, time: t) }
+        coalescedEdit("Nudge") { e in
+            for s in selectedLayerIDs {
+                let v = e.parentSpaceVector(CGPoint(x: dx, y: dy), layer: s, time: t)
+                var p = e.value(of: .position, layer: s, time: t)
+                p.x += v.x
+                p.y += v.y
+                _ = e.setPropertyValue(p, prop: .position, layer: s, time: t)
+            }
+        }
     }
 
     // MARK: - Effects & masks
@@ -486,20 +629,29 @@ final class EditorModel: ObservableObject {
     private func handleKey(_ event: NSEvent) -> Bool {
         if let responder = event.window?.firstResponder, responder is NSText || responder is NSTextView { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control])
+        if mods == [.command] && !event.modifierFlags.contains(.shift) {
+            switch event.keyCode {
+            case 8: copySelection(); return true    // ⌘C
+            case 9: paste(); return true            // ⌘V
+            case 7: cutSelection(); return true     // ⌘X
+            case 0: selectAll(); return true        // ⌘A
+            default: return false
+            }
+        }
         guard mods.isEmpty else { return false }
         let shift = event.modifierFlags.contains(.shift)
         switch event.keyCode {
         case 49: togglePlayback(); return true                                   // space
         case 51, 117: deleteSelection(); return true                             // delete, fwd-delete
-        case 123: if selection != nil && !shift { nudgeSelection(dx: -1, dy: 0) } else { stepFrames(shift ? -10 : -1) }; return true
-        case 124: if selection != nil && !shift { nudgeSelection(dx: 1, dy: 0) } else { stepFrames(shift ? 10 : 1) }; return true
+        case 123: if selection != nil { nudgeSelection(dx: shift ? -10 : -1, dy: 0) } else { stepFrames(shift ? -10 : -1) }; return true
+        case 124: if selection != nil { nudgeSelection(dx: shift ? 10 : 1, dy: 0) } else { stepFrames(shift ? 10 : 1) }; return true
         case 126: nudgeSelection(dx: 0, dy: shift ? -10 : -1); return true       // up
         case 125: nudgeSelection(dx: 0, dy: shift ? 10 : 1); return true         // down
         case 116: stepFrames(-1); return true                                    // page up
         case 121: stepFrames(1); return true                                     // page down
         case 115: goToStart(); return true                                       // home
         case 119: goToEnd(); return true                                         // end
-        case 53: selection = nil; selectedKeyframe = nil; return true            // escape
+        case 53: clearSelection(); return true                                   // escape
         default: return false
         }
     }

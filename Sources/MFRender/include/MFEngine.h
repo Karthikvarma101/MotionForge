@@ -14,6 +14,8 @@ typedef NS_ENUM(NSInteger, MFBlendMode) {
     MFBlendModeOverlay, MFBlendModeDarken, MFBlendModeLighten
 };
 typedef NS_ENUM(NSInteger, MFInterp) { MFInterpLinear = 0, MFInterpHold, MFInterpBezier };
+// Motion-path shape through a keyframe of a spatial property (position).
+typedef NS_ENUM(NSInteger, MFSpatial) { MFSpatialLinear = 0, MFSpatialAuto, MFSpatialBezier };
 typedef NS_ENUM(NSInteger, MFProp) {
     MFPropAnchorPoint = 0, MFPropPosition, MFPropScale, MFPropRotation, MFPropOpacity,
     MFPropSize, MFPropRoundness, MFPropFillColor, MFPropStrokeColor, MFPropStrokeWidth,
@@ -63,6 +65,33 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) MFValue value;
 @property(nonatomic, readonly) MFInterp inInterp;
 @property(nonatomic, readonly) MFInterp outInterp;
+@property(nonatomic, readonly) MFSpatial spatial;
+@property(nonatomic, readonly) MFValue tangentIn;   // Bezier handles, relative to the value
+@property(nonatomic, readonly) MFValue tangentOut;
+@end
+
+// A keyframe anywhere in the composition (for multi-selection operations).
+@interface MFKeyAddress : NSObject
+- (instancetype)initWithLayer:(uint64_t)layerID ref:(MFPropRef)ref index:(NSInteger)index;
+@property(nonatomic, readonly) uint64_t layerID;
+@property(nonatomic, readonly) MFPropRef ref;
+@property(nonatomic, readonly) NSInteger index;
+@end
+
+// A layer's position motion path, in composition pixels at the current parent transform.
+@interface MFMotionPathKey : NSObject
+@property(nonatomic, readonly) NSInteger index;
+@property(nonatomic, readonly) double time;
+@property(nonatomic, readonly) CGPoint point;
+@property(nonatomic, readonly) CGPoint inHandle;   // absolute positions of the resolved handles
+@property(nonatomic, readonly) CGPoint outHandle;
+@property(nonatomic, readonly) MFSpatial spatial;
+@end
+
+@interface MFMotionPath : NSObject
+@property(nonatomic, readonly) MFPropRef ref;
+@property(nonatomic, readonly) NSArray<NSValue*>* points;  // CGPoint values along the path
+@property(nonatomic, readonly) NSArray<MFMotionPathKey*>* keys;
 @end
 
 // One animatable parameter with its definition and keyframes.
@@ -234,6 +263,8 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 - (uint64_t)addNullLayer;
 - (BOOL)removeLayer:(uint64_t)layerID;
 - (uint64_t)duplicateLayer:(uint64_t)layerID;
+- (BOOL)removeLayers:(NSArray<NSNumber*>*)layerIDs NS_SWIFT_NAME(removeLayers(_:));  // one undo step
+- (NSArray<NSNumber*>*)duplicateLayers:(NSArray<NSNumber*>*)layerIDs NS_SWIFT_NAME(duplicateLayers(_:));  // new ids, top first
 - (BOOL)moveLayer:(uint64_t)layerID toIndex:(NSInteger)index;
 - (BOOL)setLayer:(uint64_t)layerID name:(NSString*)name;
 - (BOOL)setLayer:(uint64_t)layerID visible:(BOOL)visible;
@@ -266,6 +297,40 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 - (NSInteger)moveKeyframeAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID toTime:(double)time;
 - (BOOL)setKeyframeInterpolationAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID
                                      in:(MFInterp)inInterp out:(MFInterp)outInterp;
+- (BOOL)setKeyframeValueAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID value:(MFValue)value
+    NS_SWIFT_NAME(setKeyframeValue(at:ref:layer:value:));
+- (BOOL)setKeyframeSpatialAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID
+                             mode:(MFSpatial)mode tangentIn:(MFValue)tangentIn tangentOut:(MFValue)tangentOut
+    NS_SWIFT_NAME(setKeyframeSpatial(at:ref:layer:mode:tangentIn:tangentOut:));
+
+// ---- several keyframes at once (one undo step each) ----
+- (NSArray<MFKeyAddress*>*)moveKeyframes:(NSArray<MFKeyAddress*>*)keys by:(double)dt
+    NS_SWIFT_NAME(moveKeyframes(_:by:));  // new addresses, same order
+- (BOOL)removeKeyframes:(NSArray<MFKeyAddress*>*)keys NS_SWIFT_NAME(removeKeyframes(_:));
+- (BOOL)setInterpolationForKeyframes:(NSArray<MFKeyAddress*>*)keys
+                                  in:(MFInterp)inInterp
+                                 out:(MFInterp)outInterp
+                               setIn:(BOOL)setIn
+                              setOut:(BOOL)setOut
+    NS_SWIFT_NAME(setInterpolation(of:in:out:setIn:setOut:));
+
+// ---- motion paths ----
+- (nullable MFMotionPath*)motionPathForLayer:(uint64_t)layerID time:(double)time
+    NS_SWIFT_NAME(motionPath(layer:time:));  // nil unless position is animated
+
+// ---- clipboard (JSON strings for the system pasteboard) ----
+- (NSString*)clipboardForLayers:(NSArray<NSNumber*>*)layerIDs NS_SWIFT_NAME(clipboard(forLayers:));
+- (NSString*)clipboardForKeyframes:(NSArray<MFKeyAddress*>*)keys NS_SWIFT_NAME(clipboard(forKeyframes:));
+- (NSInteger)clipboardKind:(NSString*)text NS_SWIFT_NAME(clipboardKind(_:));  // 0 none, 1 layers, 2 keyframes
+// Pastes at stack index (0 = top); returns the new layer ids (top first), or nil with `error`.
+- (nullable NSArray<NSNumber*>*)pasteLayers:(NSString*)text atIndex:(NSInteger)index error:(NSError**)error
+    NS_SWIFT_NAME(pasteLayers(_:at:));
+// Earliest key lands at `time`. Returns keys written; `message` explains skipped tracks.
+- (NSInteger)pasteKeyframes:(NSString*)text
+                     layers:(NSArray<NSNumber*>*)layerIDs
+                       time:(double)time
+                    message:(NSString* _Nullable* _Nullable)message
+    NS_SWIFT_NAME(pasteKeyframes(_:layers:time:message:));
 
 // ---- properties & keyframes (layer properties) ----
 - (MFValue)valueOf:(MFProp)prop layer:(uint64_t)layerID time:(double)time;

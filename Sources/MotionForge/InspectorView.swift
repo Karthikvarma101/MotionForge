@@ -7,7 +7,9 @@ struct InspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PanelHeader(title: model.selectedLayer == nil ? "Composition" : "Properties")
+            PanelHeader(title: model.selectedLayer == nil ? "Composition"
+                        : model.selectedLayers.count > 1 ? "Properties — \(model.selectedLayers.count) layers selected, editing “\(model.selectedLayer!.name)”"
+                        : "Properties")
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     if let layer = model.selectedLayer {

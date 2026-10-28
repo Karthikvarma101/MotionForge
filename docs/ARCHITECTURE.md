@@ -1,4 +1,4 @@
-# MotionForge architecture (Phases 1 and 3)
+# MotionForge architecture (Phases 1–3)
 
 ## Layers of the system
 
@@ -123,6 +123,34 @@ use): images are converted to sRGB on decode, colours are sRGB, blending happens
 values, and the `MTKView` layer is tagged sRGB so macOS colour-manages it on P3/XDR displays.
 The RGBA16F working buffer leaves room for a linear or wide-gamut working space later.
 
+## Motion paths (spatial interpolation)
+
+Position-like properties (layer position and anchor point, mask position) are *spatial*: each
+keyframe has a mode. *Linear* keys give straight segments. *Auto* (the default for new keys)
+derives handles along the line from the previous to the next key, a third as long as each
+adjacent segment, which gives a smooth path that never overshoots on uneven spacing. *Bezier*
+keys store explicit handles as offsets. A segment is a cubic bezier between the two keys'
+handles. The temporal easing gives a fraction of the segment's *arc length* (48-sample table), so
+linear timing moves at constant speed around curves. Segments whose handles lie on the chord take
+the plain linear path. The viewer draws the path with the parent's transform at the current time.
+
+## Selection and clipboard
+
+The UI keeps a primary layer (shown in the inspector), a set of selected layers, and a set of
+selected keyframes (layer + property reference + index). Multi-item operations go to the document
+as one call: `moveKeyframes` (returns the keys' new indices so the selection follows them),
+`removeKeyframes`, `setKeyframesInterpolation`, `removeLayers`, `duplicateLayers`. Each is one
+undo step.
+
+Copy/paste is JSON on the system pasteboard (type `com.motionforge.clipboard`):
+- `motionforge.layers`: layers in stacking order plus the media they reference (path and size).
+  `insertLayers` gives everything fresh ids, keeps parent and matte links inside the pasted set,
+  drops links to anything else, and reuses media already in the project with the same path.
+- `motionforge.keyframes`: tracks with times relative to the earliest key. A track names its
+  property by key, its effect by type plus slot (the n-th Glow), or its mask by slot, so it can be
+  pasted onto another layer with the same kind of property. With as many targets as copied layers,
+  the n-th layer's tracks go to the n-th target.
+
 ## Undo
 
 `Document` takes a snapshot of the project before each edit (projects hold no pixels, so a
@@ -130,9 +158,11 @@ snapshot is a few KB). This makes every operation undoable by construction, incl
 later. `beginGroup`/`endGroup` make an interactive drag or a scrub one step; no-op edits record
 nothing. History is capped at 500 steps.
 
-## Project file (`.mfproj`, version 2)
+## Project file (`.mfproj`, version 3)
 
-Version 2 adds optional `masks`, `effects` and `trackMatte` keys per layer (shown below the main
+Version 3 stores each spatial keyframe's `spatial` mode (`linear`, `auto`, `bezier`) and, for
+Bezier keys, its handles `ti` / `to`; keys without it (versions 1–2) load as straight paths.
+Version 2 added optional `masks`, `effects` and `trackMatte` keys per layer (shown below the main
 example); version-1 files load unchanged. Effects from a newer build that this build doesn't know
 are skipped instead of failing the load.
 
@@ -151,7 +181,7 @@ Main structure:
 ```json
 {
   "format": "motionforge.project",
-  "version": 2,
+  "version": 3,
   "nextId": 9,
   "activeComposition": 1,
   "assets": [{"id": 2, "kind": "image", "name": "photo.png",

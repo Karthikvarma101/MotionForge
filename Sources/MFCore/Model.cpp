@@ -10,8 +10,8 @@ namespace {
 constexpr double kBig = 1e9;
 
 const PropDef kPropDefs[kPropCount] = {
-    {"anchorPoint", "Anchor Point", 2, {0, 0, 0, 0}, -kBig, kBig, false},
-    {"position", "Position", 2, {960, 540, 0, 0}, -kBig, kBig, false},
+    {"anchorPoint", "Anchor Point", 2, {0, 0, 0, 0}, -kBig, kBig, false, true},
+    {"position", "Position", 2, {960, 540, 0, 0}, -kBig, kBig, false, true},
     {"scale", "Scale", 2, {100, 100, 0, 0}, -100000, 100000, false},
     {"rotation", "Rotation", 1, {0, 0, 0, 0}, -kBig, kBig, false},
     {"opacity", "Opacity", 1, {100, 0, 0, 0}, 0, 100, false},
@@ -32,6 +32,7 @@ std::optional<E> fromKey(std::string_view key, const char* const (&keys)[N]) {
 }
 
 const char* const kInterpKeys[] = {"linear", "hold", "bezier"};
+const char* const kSpatialKeys[] = {"linear", "auto", "bezier"};
 const char* const kLayerKindKeys[] = {"shape", "image", "null"};
 const char* const kShapeTypeKeys[] = {"rectangle", "ellipse", "polygon", "star"};
 const char* const kBlendKeys[] = {"normal", "add", "multiply", "screen", "overlay", "darken", "lighten"};
@@ -40,7 +41,7 @@ const char* const kMaskModeKeys[] = {"add", "subtract", "intersect", "difference
 const char* const kMatteModeKeys[] = {"none", "alpha", "alphaInverted", "luma", "lumaInverted"};
 
 const PropDef kMaskParamDefs[kMaskParamCount] = {
-    {"position", "Mask Position", 2, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"position", "Mask Position", 2, {0, 0, 0, 0}, -kBig, kBig, false, true},
     {"size", "Mask Size", 2, {200, 200, 0, 0}, 0, 100000, false},
     {"roundness", "Mask Roundness", 1, {0, 0, 0, 0}, 0, 100000, false},
     {"feather", "Mask Feather", 1, {0, 0, 0, 0}, 0, 10000, false},
@@ -113,6 +114,8 @@ const char* layerKindKey(LayerKind v) { return kLayerKindKeys[static_cast<size_t
 const char* shapeTypeKey(ShapeType v) { return kShapeTypeKeys[static_cast<size_t>(v)]; }
 const char* blendModeKey(BlendMode v) { return kBlendKeys[static_cast<size_t>(v)]; }
 std::optional<Interp> interpFromKey(std::string_view k) { return fromKey<Interp>(k, kInterpKeys); }
+const char* spatialKey(Spatial v) { return kSpatialKeys[static_cast<size_t>(v)]; }
+std::optional<Spatial> spatialFromKey(std::string_view k) { return fromKey<Spatial>(k, kSpatialKeys); }
 std::optional<LayerKind> layerKindFromKey(std::string_view k) { return fromKey<LayerKind>(k, kLayerKindKeys); }
 std::optional<ShapeType> shapeTypeFromKey(std::string_view k) { return fromKey<ShapeType>(k, kShapeTypeKeys); }
 std::optional<BlendMode> blendModeFromKey(std::string_view k) { return fromKey<BlendMode>(k, kBlendKeys); }
@@ -151,6 +154,105 @@ double cubicBezierTiming(double x1, double y1, double x2, double y2, double u) {
 
 Value evaluateProperty(const Property& p, PropId id, double time) { return evaluateProperty(p, propDef(id), time); }
 
+void spatialHandles(const std::vector<Keyframe>& keys, size_t i, Value& in, Value& out) {
+    in = out = Value{};
+    const Keyframe& k = keys[i];
+    if (k.spatial == Spatial::Bezier) {
+        in = k.tangentIn;
+        out = k.tangentOut;
+        return;
+    }
+    if (k.spatial == Spatial::Linear || i == 0 || i + 1 >= keys.size()) return;  // ends stay straight
+    // Auto: handles along the line from the previous to the next key, each a third as long as
+    // the segment it belongs to (smooth through the key, no overshoot on uneven spacing).
+    const Value& a = keys[i - 1].value;
+    const Value& b = keys[i + 1].value;
+    const double dx = b[0] - a[0], dy = b[1] - a[1];
+    const double len = std::hypot(dx, dy);
+    if (len < 1e-9) return;
+    const double lin = std::hypot(k.value[0] - a[0], k.value[1] - a[1]);
+    const double lout = std::hypot(b[0] - k.value[0], b[1] - k.value[1]);
+    in = {-dx / len * lin / 3, -dy / len * lin / 3, 0, 0};
+    out = {dx / len * lout / 3, dy / len * lout / 3, 0, 0};
+}
+
+namespace {
+
+struct Seg {
+    double p[4][2];  // cubic control points
+};
+
+Seg spatialSegment(const std::vector<Keyframe>& keys, size_t i0) {
+    Value in0, out0, in1, out1;
+    spatialHandles(keys, i0, in0, out0);
+    spatialHandles(keys, i0 + 1, in1, out1);
+    const Value& a = keys[i0].value;
+    const Value& b = keys[i0 + 1].value;
+    return Seg{{{a[0], a[1]}, {a[0] + out0[0], a[1] + out0[1]}, {b[0] + in1[0], b[1] + in1[1]}, {b[0], b[1]}}};
+}
+
+bool segmentCurved(const std::vector<Keyframe>& keys, size_t i0) {
+    const Seg s = spatialSegment(keys, i0);
+    // Straight if both handles lie on the chord (zero handles are the common case).
+    auto onChord = [&](const double* c) {
+        const double cx = s.p[3][0] - s.p[0][0], cy = s.p[3][1] - s.p[0][1];
+        const double vx = c[0] - s.p[0][0], vy = c[1] - s.p[0][1];
+        return std::abs(cx * vy - cy * vx) < 1e-9 * std::max(1.0, cx * cx + cy * cy);
+    };
+    return !(onChord(s.p[1]) && onChord(s.p[2]));
+}
+
+void bezierPoint(const Seg& s, double t, double& x, double& y) {
+    const double it = 1 - t;
+    const double a = it * it * it, b = 3 * it * it * t, c = 3 * it * t * t, d = t * t * t;
+    x = a * s.p[0][0] + b * s.p[1][0] + c * s.p[2][0] + d * s.p[3][0];
+    y = a * s.p[0][1] + b * s.p[1][1] + c * s.p[2][1] + d * s.p[3][1];
+}
+
+// Point at fraction `f` of the curve's arc length: temporal easing controls speed *along* the
+// path, so linear timing moves at constant speed even around curves.
+void bezierAtDistance(const Seg& s, double f, double& x, double& y) {
+    constexpr int N = 48;
+    double len[N + 1];
+    double px = s.p[0][0], py = s.p[0][1];
+    len[0] = 0;
+    for (int j = 1; j <= N; ++j) {
+        double qx, qy;
+        bezierPoint(s, double(j) / N, qx, qy);
+        len[j] = len[j - 1] + std::hypot(qx - px, qy - py);
+        px = qx;
+        py = qy;
+    }
+    if (len[N] <= 0) {
+        bezierPoint(s, f, x, y);
+        return;
+    }
+    const double target = std::clamp(f, 0.0, 1.0) * len[N];
+    int j = int(std::lower_bound(len, len + N + 1, target) - len);
+    j = std::clamp(j, 1, N);
+    const double seg = len[j] - len[j - 1];
+    const double t = (double(j - 1) + (seg > 0 ? (target - len[j - 1]) / seg : 0)) / N;
+    bezierPoint(s, t, x, y);
+}
+
+}  // namespace
+
+std::vector<std::array<double, 2>> sampleMotionPath(const Property& p, int perSegment) {
+    std::vector<std::array<double, 2>> pts;
+    const auto& keys = p.keyframes;
+    if (keys.empty()) return pts;
+    pts.push_back({keys[0].value[0], keys[0].value[1]});
+    for (size_t i = 0; i + 1 < keys.size(); ++i) {
+        const Seg s = spatialSegment(keys, i);
+        for (int j = 1; j <= perSegment; ++j) {
+            double x, y;
+            bezierPoint(s, double(j) / perSegment, x, y);
+            pts.push_back({x, y});
+        }
+    }
+    return pts;
+}
+
 Value evaluateProperty(const Property& p, const PropDef& def, double time) {
     const auto& keys = p.keyframes;
     if (keys.empty()) return clampValue(p.value, def);
@@ -173,6 +275,10 @@ Value evaluateProperty(const Property& p, const PropDef& def, double time) {
 
     Value out{};
     for (int i = 0; i < def.dims; ++i) out[i] = k0.value[i] + (k1.value[i] - k0.value[i]) * f;
+    if (def.spatial && def.dims >= 2) {
+        const size_t i0 = size_t(it - keys.begin()) - 1;
+        if (segmentCurved(keys, i0)) bezierAtDistance(spatialSegment(keys, i0), f, out[0], out[1]);
+    }
     return clampValue(out, def);
 }
 

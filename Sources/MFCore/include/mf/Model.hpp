@@ -43,6 +43,7 @@ struct PropDef {
     Value defaultValue;
     double minValue, maxValue;  // applied per component
     bool isColor;
+    bool spatial = false;  // a 2D position: keyframes follow a (bezier) motion path
 };
 const PropDef& propDef(PropId id);
 std::optional<PropId> propFromKey(std::string_view key);
@@ -50,6 +51,13 @@ std::optional<PropId> propFromKey(std::string_view key);
 enum class Interp : uint8_t { Linear = 0, Hold, Bezier };
 const char* interpKey(Interp);
 std::optional<Interp> interpFromKey(std::string_view);
+
+// How a spatial property's motion path passes through a keyframe. Linear: straight segments
+// (a corner at the key). Auto: smooth curve with handles derived from the neighbouring keys.
+// Bezier: explicit handles (tangentIn / tangentOut, offsets from the key's value).
+enum class Spatial : uint8_t { Linear = 0, Auto, Bezier };
+const char* spatialKey(Spatial);
+std::optional<Spatial> spatialFromKey(std::string_view);
 
 // Temporal interpolation of the segment leaving a keyframe is decided by `outInterp` of the earlier
 // key and `inInterp` of the later key. Bezier sides use the influence (0–1, like "Easy Ease" 33%)
@@ -61,6 +69,8 @@ struct Keyframe {
     Interp outInterp = Interp::Linear;
     double easeIn = 1.0 / 3.0;
     double easeOut = 1.0 / 3.0;
+    Spatial spatial = Spatial::Linear;  // spatial properties only
+    Value tangentIn{}, tangentOut{};    // Bezier handles, relative to `value`
     bool operator==(const Keyframe&) const = default;
 };
 
@@ -76,6 +86,11 @@ Value evaluateProperty(const Property& p, const PropDef& def, double time);
 Value evaluateProperty(const Property& p, PropId id, double time);
 // Cubic-bezier timing (CSS semantics): returns progress for normalized time u in [0,1].
 double cubicBezierTiming(double x1, double y1, double x2, double y2, double u);
+
+// Resolved spatial handles of keys[i] (Auto computed from neighbours, Linear = zero), as offsets.
+void spatialHandles(const std::vector<Keyframe>& keys, size_t i, Value& in, Value& out);
+// Points along a spatial property's whole motion path (x, y of the value), `perSegment` per segment.
+std::vector<std::array<double, 2>> sampleMotionPath(const Property& p, int perSegment);
 
 // ---------------------------------------------------------------------------------------------
 // Layers
@@ -234,7 +249,7 @@ struct Composition {
 };
 
 struct Project {
-    static constexpr int kFormatVersion = 2;  // 2: masks, effects, track mattes
+    static constexpr int kFormatVersion = 3;  // 2: masks, effects, track mattes; 3: spatial keyframes
     ObjectId nextId = 1;
     ObjectId activeComposition = 0;
     std::vector<Asset> assets;
