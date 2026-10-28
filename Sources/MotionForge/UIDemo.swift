@@ -302,6 +302,112 @@ enum UIDemo {
         }
     }
 
+    /// Set by scripted runs so keystrokes meant for another app can't play, stop or move the playhead.
+    static var ignoresKeys = false
+
+    /// Audio layers, playback sync, the account card and the export window on a real project
+    /// (`scripts/ui-demo-audio.sh`): a screenshot per step plus the values behind it.
+    static func runAudio(model: EditorModel, outputDirectory: String) {
+        ignoresKeys = true
+        Task { @MainActor in
+            let out = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            var log: [[String: Any]] = []
+            guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) else {
+                print("ui-demo-audio: no window"); exit(4)
+            }
+            window.makeKeyAndOrderFront(nil)
+            @MainActor func capture(_ w: NSWindow, _ name: String) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                p.arguments = ["-x", "-o", "-l", "\(w.windowNumber)", out.appendingPathComponent("\(name).png").path]
+                try? p.run()
+                p.waitUntilExit()
+                // The view drawn offscreen as well: Stage Manager can shrink the window on screen. (The
+                // Metal viewer stays blank in this one.)
+                if let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: out.appendingPathComponent("\(name)-view.png"))
+                }
+            }
+            @MainActor func record(_ name: String, _ w: NSWindow? = nil, _ extra: [String: Any] = [:]) async {
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(w ?? window, name)
+                var e: [String: Any] = ["step": name, "comp": model.comp.name, "time": model.time.time]
+                e.merge(extra) { a, _ in a }
+                log.append(e)
+                print("ui-demo-audio \(name): \(e)")
+            }
+
+            try? await Task.sleep(for: .seconds(2))  // media, waveform peaks
+            let clips = model.engine.audioClips()
+            if let mix = model.layers.first(where: { $0.kind == .audio && $0.visible }) {
+                model.edit { _ = $0.moveLayer(mix.layerID, to: 0) }  // into view (not saved)
+                model.selectLayer(mix.layerID, mode: .replace)
+                model.expandedLayers.insert(mix.layerID)
+            }
+            model.time.time = 25
+            model.zoomTimeline(by: 4)
+            await record("audio-01-timeline", nil, ["audioLayers": model.layers.filter { $0.kind == .audio }.count,
+                                                     "clips": clips.map { "\($0.path.split(separator: "/").last ?? "") \($0.start)+\($0.duration)" },
+                                                     "audible": model.audio.isAudible])
+
+            // Playback: after a couple of seconds the picture should follow the audio clock.
+            model.time.isPlaying = true
+            try? await Task.sleep(for: .seconds(2.5))
+            let clock = model.audio.clockTime
+            let shown = model.time.time
+            await record("audio-02-playing", nil, ["audioClock": clock ?? -1, "playhead": shown,
+                                                    "driftMs": clock.map { abs($0 - shown) * 1000 } ?? -1])
+            model.time.isPlaying = false
+            var afterStop: [Double] = [model.time.time]
+            for _ in 0..<6 {
+                try? await Task.sleep(for: .seconds(0.05))
+                afterStop.append(model.time.time)
+            }
+            await record("audio-03-stopped", nil, ["audioClockAfterStop": model.audio.clockTime ?? -1, "playheadAfterStop": afterStop])
+            if ProcessInfo.processInfo.environment["MOTIONFORGE_UIDEMO_QUICK"] != nil { exit(0) }
+
+            // The account card (normally a popover under the avatar), in a window of its own.
+            if let user = model.account.user {
+                let card = NSWindow(contentRect: NSRect(x: 240, y: 240, width: 290, height: 260), styleMask: [.titled], backing: .buffered, defer: false)
+                card.contentView = NSHostingView(rootView: AccountCard(account: model.account, user: user) {}.background(Theme.panel).preferredColorScheme(.dark))
+                card.setContentSize(card.contentView!.fittingSize)
+                card.orderFront(nil)
+                await record("audio-04-account-card", card)
+                card.orderOut(nil)
+            }
+
+            // Export window: settings, then a running export with its load figures, then done.
+            model.showExportWindow()
+            try? await Task.sleep(for: .seconds(0.5))
+            guard let panel = NSApp.windows.first(where: { $0.title == "Export" && $0.isVisible }) else {
+                print("ui-demo-audio: no export window"); exit(5)
+            }
+            await record("audio-05-export-settings", panel)
+            let settings = MFExportSettings()
+            settings.format = .h264
+            settings.scale = 1
+            settings.startTime = 20
+            settings.endTime = 80
+            settings.bitsPerSecond = 35_000_000
+            let movie = out.appendingPathComponent("export-audio.mp4")
+            model.startExport(settings, to: movie, summary: "H.264 · 1920×1080 · 35 Mb/s · with audio")
+            try? await Task.sleep(for: .seconds(4.5))
+            await record("audio-06-exporting", panel, ["done": model.exportStatus?.done ?? -1, "total": model.exportStatus?.total ?? -1])
+            for _ in 0..<600 where model.exporter != nil { try? await Task.sleep(for: .seconds(0.25)) }
+            let size = (try? FileManager.default.attributesOfItem(atPath: movie.path)[.size] as? Int) ?? 0
+            await record("audio-07-exported", panel, ["finished": model.exportStatus?.finished ?? false,
+                                                       "error": model.exportStatus?.error ?? "", "bytes": size,
+                                                       "seconds": model.exportStatus?.elapsed ?? 0])
+            if let data = try? JSONSerialization.data(withJSONObject: log, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: out.appendingPathComponent("ui-demo-audio.json"))
+            }
+            model.applicationWillTerminate()
+            exit(0)
+        }
+    }
+
     /// Composition tabs / breadcrumb and timeline zoom + scroll on a real nested project
     /// (`scripts/ui-demo-nav.sh`). Precomps are opened through the same call as double-clicking one;
     /// scroll events go through the app's own event dispatch, so the cursor never moves.
@@ -359,7 +465,10 @@ enum UIDemo {
 
             // Down one level: the scene precomp under the playhead.
             let t = model.time.time
-            if let scene = model.layers.first(where: { $0.kind == .precomp && $0.inPoint <= t && t < $0.outPoint && $0.name.hasPrefix("YB") }) {
+            let isScene: (MFLayerInfo) -> Bool = { l in
+                l.kind == .precomp && l.inPoint <= t && t < l.outPoint && l.name.hasPrefix("YB")
+            }
+            if let scene = model.layers.first(where: isScene) {
                 model.openComposition(scene.sourceCompID, fromLayer: scene)
                 await record("nav-02-scene", ["expectedTime": t - scene.startTime])
             }
@@ -406,7 +515,7 @@ enum UIDemo {
             // a window of its own for the screenshot.
             let sheetWindow = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 520, height: 560),
                                        styleMask: [.titled], backing: .buffered, defer: false)
-            sheetWindow.contentView = NSHostingView(rootView: ExportSheet(model: model).preferredColorScheme(.dark))
+            sheetWindow.contentView = NSHostingView(rootView: ExportPanel(model: model) {}.preferredColorScheme(.dark))
             sheetWindow.setContentSize(sheetWindow.contentView!.fittingSize)
             sheetWindow.orderFront(nil)
             try? await Task.sleep(for: .seconds(0.8))

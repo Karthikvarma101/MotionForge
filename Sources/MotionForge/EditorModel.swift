@@ -96,8 +96,12 @@ final class EditorModel: ObservableObject {
     let skipLaunchAnimation: Bool
     /// Whether the workspace has been shown (Home then offers to go back to it).
     private(set) var hasOpenWork = false
+    /// Google account and MotionForge Pro (exporting needs Pro).
+    let account = AccountModel()
+    /// The active composition's audio layers, played with the viewer.
+    let audio = AudioPlayback()
+    @Published var showPaywall = false
     /// Video export (see ExportView.swift).
-    @Published var showExportSheet = false
     @Published var exportStatus: ExportStatus?
     var exporter: MFVideoExporter?
     /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
@@ -179,6 +183,7 @@ final class EditorModel: ObservableObject {
             if let error { self.alertMessage = error }
             self.refresh()
         }
+        audio.playhead = { [weak self] in self?.time.time ?? 0 }
         seedStarterContent()
         reloadUserPresets()
         engine.markCleanForNewDocument()
@@ -196,6 +201,7 @@ final class EditorModel: ObservableObject {
         comp = engine.composition
         assets = engine.assets()
         compositions = engine.compositions
+        audio.update(clips: engine.audioClips())
         syncCompNavigation()
         let ids = Set(layers.map(\.layerID))
         if !selectedLayers.isSubset(of: ids) { selectedLayers.formIntersection(ids) }
@@ -410,6 +416,12 @@ final class EditorModel: ObservableObject {
         if id != 0 { openComposition(id) }
     }
 
+    /// Export button / ⌘M: the export settings for Pro, the paywall otherwise.
+    /// The export window (its progress while an export runs); the Pro sheet first if export isn't unlocked.
+    func requestExport() {
+        if exporter != nil || account.canExport { showExportWindow() } else { showPaywall = true }
+    }
+
     func zoomTimeline(by factor: Double) {
         viewport.zoom(by: factor, anchorX: viewport.x(of: time.time))
     }
@@ -417,6 +429,14 @@ final class EditorModel: ObservableObject {
     func addImageLayer(asset: UInt64) {
         var id: UInt64 = 0
         edit { id = $0.addImageLayer(withAsset: asset) }
+        if id != 0 { selection = id }
+    }
+
+    /// An image or audio layer for the asset, whichever it is.
+    func addLayer(asset: UInt64) {
+        guard assets.first(where: { $0.assetID == asset })?.isAudio == true else { return addImageLayer(asset: asset) }
+        var id: UInt64 = 0
+        edit { id = $0.addAudioLayer(withAsset: asset) }
         if id != 0 { selection = id }
     }
 
@@ -632,9 +652,12 @@ final class EditorModel: ObservableObject {
     func importMedia(urls: [URL], addToComposition: Bool) {
         for url in urls {
             do {
+                let isAudio = UTType(filenameExtension: url.pathExtension)?.conforms(to: .audio) ?? false
                 var assetID: UInt64 = 0
-                try tryEdit { engine in assetID = try engine.importImage(atPath: url.path).uint64Value }
-                if addToComposition && assetID != 0 { addImageLayer(asset: assetID) }
+                try tryEdit { engine in
+                    assetID = try (isAudio ? engine.importAudio(atPath: url.path) : engine.importImage(atPath: url.path)).uint64Value
+                }
+                if addToComposition && assetID != 0 { addLayer(asset: assetID) }
             } catch {
                 alertMessage = "Could not import \(url.lastPathComponent): \(error.localizedDescription)"
             }
@@ -648,9 +671,9 @@ final class EditorModel: ObservableObject {
 
     func presentImportPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = [.image, .audio]
         panel.allowsMultipleSelection = true
-        panel.message = "Import images (PNG, JPEG, HEIC, TIFF, …)"
+        panel.message = "Import images (PNG, JPEG, HEIC, TIFF, …) or audio (WAV, MP3, AAC, AIFF, …)"
         if panel.runModal() == .OK { importMedia(urls: panel.urls, addToComposition: true) }
     }
 
@@ -863,6 +886,10 @@ final class EditorModel: ObservableObject {
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+            if UIDemo.ignoresKeys {  // scripted runs: typing elsewhere must not steer them
+                print("ui-demo: ignored key \(event.keyCode)")
+                return nil
+            }
             nonisolated(unsafe) let e = event  // local monitors run on the main thread
             return MainActor.assumeIsolated { self.handleKey(e) } ? nil : event
         }

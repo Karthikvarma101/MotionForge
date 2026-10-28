@@ -64,9 +64,12 @@ public:
     // A layer showing `source` in `comp`; refused when it would make a composition contain itself.
     ObjectId addPrecompLayer(ObjectId comp, ObjectId source);
     bool setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime);
+    // Precomp and audio layers: where their source's time 0 sits (moves the content in time).
+    bool setLayerStartTime(ObjectId comp, ObjectId layer, double startTime);
 
     // --- assets & layers --------------------------------------------------------------------
     ObjectId addImageAsset(const std::string& path, const std::string& name, int width, int height);
+    ObjectId addAudioAsset(const std::string& path, const std::string& name, double duration);
     ObjectId addLayer(ObjectId comp, LayerKind kind, ShapeType shape = ShapeType::Rectangle, ObjectId asset = 0);
     bool removeLayer(ObjectId comp, ObjectId layer);
     ObjectId duplicateLayer(ObjectId comp, ObjectId layer);

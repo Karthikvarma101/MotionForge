@@ -134,10 +134,17 @@ int cmdInfo(const char* path) {
     std::printf("%s: %ldx%ld, %.3f fps, %.2f s, %lu layers, %lu media\n", c.name.UTF8String, long(c.width),
                 long(c.height), c.fps, c.duration, (unsigned long)e.layers.count, (unsigned long)e.assets.count);
     for (MFLayerInfo* l in e.layers) {
-        const char* kinds[] = {"shape", "image", "null"};
+        const char* kinds[] = {"shape", "image", "null", "text", "precomp", "audio"};
         MFValue p = [e valueOf:MFPropPosition layer:l.layerID time:0];
         std::printf("  %-20s %-6s in %.2f out %.2f  pos(0) %.1f, %.1f%s\n", l.name.UTF8String, kinds[l.kind], l.inPoint,
                     l.outPoint, p.x, p.y, l.allKeyframeTimes.count ? "  [animated]" : "");
+    }
+    NSArray<MFAudioClipInfo*>* clips = e.audioClips;
+    if (clips.count) {
+        std::printf("audio: %lu clip(s)\n", (unsigned long)clips.count);
+        for (MFAudioClipInfo* a in clips)
+            std::printf("  %-36s %.2f–%.2f s (file from %.2f s)\n", a.path.lastPathComponent.UTF8String, a.start, a.start + a.duration,
+                        a.sourceStart);
     }
     return 0;
 }

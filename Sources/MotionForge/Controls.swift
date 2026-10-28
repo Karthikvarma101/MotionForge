@@ -13,6 +13,9 @@ enum Theme {
     static let bar = Color(red: 0.36, green: 0.42, blue: 0.55)
     static let barSelected = Color(red: 0.42, green: 0.55, blue: 0.80)
     static let value = Color(red: 0.45, green: 0.72, blue: 1.0)
+    static let audio = Color(red: 0.36, green: 0.82, blue: 0.68)
+    static let audioBar = Color(red: 0.16, green: 0.40, blue: 0.36)
+    static let audioBarSelected = Color(red: 0.20, green: 0.52, blue: 0.47)
 }
 
 /// Number display you can drag left/right to scrub (Shift = ×10, Option = ×0.1) or click to type.
@@ -158,6 +161,7 @@ extension MFLayerInfo {
         case .text: return "textformat"
         case .null: return "square.dashed"
         case .precomp: return "square.stack.3d.up"
+        case .audio: return "waveform"
         default:
             switch shape {
             case .ellipse: return "circle"
@@ -171,6 +175,7 @@ extension MFLayerInfo {
 
     /// Properties shown for this layer, in display order.
     var editableProps: [MFProp] {
+        if kind == .audio { return [.audioLevel] }
         var p: [MFProp] = [.anchorPoint, .position, .scale, .rotation, .opacity]
         if kind == .text { return p + [.fontSize, .tracking, .lineHeight, .fillColor, .strokeColor, .strokeWidth] }
         if kind == .precomp { return timeRemapEnabled ? p + [.timeRemap] : p }
@@ -193,7 +198,7 @@ extension MFProp {
         case .scale, .opacity, .trimStart, .trimEnd, .trimOffset, .fontSize: return 0.5
         case .lineHeight: return 0.01
         case .rotation: return 0.5
-        case .points: return 0.1
+        case .points, .audioLevel: return 0.1
         case .innerRatio: return 0.005
         default: return 1
         }
@@ -209,6 +214,7 @@ extension MFProp {
         switch self {
         case .scale, .opacity, .trimStart, .trimEnd, .trimOffset: return "%"
         case .rotation: return "°"
+        case .audioLevel: return " dB"
         default: return ""
         }
     }

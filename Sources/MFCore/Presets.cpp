@@ -149,7 +149,7 @@ int applyPreset(Document& doc, ObjectId comp, const std::vector<ObjectId>& layer
     doc.beginGroup("Apply Preset: " + root.get("name").string());
     for (ObjectId lid : layers) {
         const Layer* l = doc.project().findComposition(comp)->findLayer(lid);
-        if (!l || l->kind == LayerKind::Null) continue;
+        if (!l || l->kind == LayerKind::Null || l->kind == LayerKind::Audio) continue;
         std::vector<std::pair<PropRef, std::vector<Keyframe>>> tracks;
 
         for (const Json& tj : root.get("tracks").items()) {

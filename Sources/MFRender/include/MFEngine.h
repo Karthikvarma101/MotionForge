@@ -1,13 +1,16 @@
 // MotionForge — Objective-C bridge between the C++ engine (document, evaluation, Metal renderer)
 // and the Swift/SwiftUI application. Pure Objective-C so Swift can import it directly.
 #import <CoreGraphics/CoreGraphics.h>
+#import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef NS_ENUM(NSInteger, MFLayerKind) { MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull, MFLayerKindText, MFLayerKindPrecomp };
+typedef NS_ENUM(NSInteger, MFLayerKind) {
+    MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull, MFLayerKindText, MFLayerKindPrecomp, MFLayerKindAudio
+};
 typedef NS_ENUM(NSInteger, MFShapeType) { MFShapeTypeRectangle = 0, MFShapeTypeEllipse, MFShapeTypePolygon, MFShapeTypeStar, MFShapeTypePath };
 typedef NS_ENUM(NSInteger, MFBlendMode) {
     MFBlendModeNormal = 0, MFBlendModeAdd, MFBlendModeMultiply, MFBlendModeScreen,
@@ -20,7 +23,7 @@ typedef NS_ENUM(NSInteger, MFProp) {
     MFPropAnchorPoint = 0, MFPropPosition, MFPropScale, MFPropRotation, MFPropOpacity,
     MFPropSize, MFPropRoundness, MFPropFillColor, MFPropStrokeColor, MFPropStrokeWidth,
     MFPropPoints, MFPropInnerRatio, MFPropFontSize, MFPropTracking, MFPropLineHeight,
-    MFPropTrimStart, MFPropTrimEnd, MFPropTrimOffset, MFPropTimeRemap
+    MFPropTrimStart, MFPropTrimEnd, MFPropTrimOffset, MFPropTimeRemap, MFPropAudioLevel
 };
 typedef NS_ENUM(NSInteger, MFMemoryPressure) { MFMemoryPressureNormal = 0, MFMemoryPressureWarning, MFMemoryPressureCritical };
 typedef NS_ENUM(NSInteger, MFEffectType) {
@@ -209,7 +212,7 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 // Bezier path shape layers (layer space)
 @property(nonatomic, readonly) NSArray<MFPathVertex*>* pathVertices;
 @property(nonatomic, readonly) BOOL pathClosed;
-// Precomp layers
+// Precomp layers (startTime also for audio layers: where the source's time 0 sits)
 @property(nonatomic, readonly) uint64_t sourceCompID;
 @property(nonatomic, readonly) double startTime;
 @property(nonatomic, readonly) BOOL timeRemapEnabled;
@@ -238,6 +241,31 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) NSInteger height;
 @property(nonatomic, readonly) BOOL missing;
 @property(nonatomic, readonly) BOOL loaded;
+@property(nonatomic, readonly) BOOL isAudio;
+@property(nonatomic, readonly) double duration;  // seconds (audio)
+@end
+
+// One stretch of an audio file on the active composition's timeline (from its audio layers, including
+// those inside precomps). Gain ramps linearly between the breakpoints.
+@interface MFAudioClipInfo : NSObject
+@property(nonatomic, readonly) uint64_t layerID;
+@property(nonatomic, readonly, copy) NSString* path;
+@property(nonatomic, readonly) double start;        // seconds on the composition's timeline
+@property(nonatomic, readonly) double sourceStart;  // seconds into the file
+@property(nonatomic, readonly) double duration;
+@property(nonatomic, readonly) NSArray<NSNumber*>* gainTimes;   // composition seconds
+@property(nonatomic, readonly) NSArray<NSNumber*>* gainValues;  // linear 0–1
+@end
+
+// A playable / exportable mix: an AVComposition whose time 0 is the composition's time `origin`.
+@interface MFAudioMix : NSObject
+@property(nonatomic, readonly) AVComposition* composition;
+@property(nonatomic, readonly) AVAudioMix* audioMix;
+@property(nonatomic, readonly) double origin;
+// Builds the mix (reads the files' track info, so call it off the main thread). nil when there is
+// nothing to hear; `error` names a file that could not be read.
++ (nullable MFAudioMix*)mixWithClips:(NSArray<MFAudioClipInfo*>*)clips origin:(double)origin error:(NSError**)error
+    NS_SWIFT_NOTHROW NS_SWIFT_NAME(make(clips:origin:error:));
 @end
 
 @interface MFViewerFrameInfo : NSObject
@@ -292,7 +320,8 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 @property(nonatomic) double endTime;                   // seconds; <= startTime means to the end
 @property(nonatomic) BOOL motionBlur;
 @property(nonatomic) NSInteger bitsPerSecond;          // H.264 / HEVC; 0 = automatic
-@property(nonatomic, copy, nullable) NSString* audioPath;  // encoded as AAC, trimmed to the video
+@property(nonatomic, copy, nullable) NSString* audioPath;  // extra soundtrack at composition time 0, mixed in
+@property(nonatomic) BOOL includeAudioLayers;              // default YES: the composition's audio layers
 @end
 
 @interface MFExportProgress : NSObject
@@ -365,6 +394,9 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 // ---- media ----
 - (NSArray<MFAssetInfo*>*)assets;
 - (nullable NSNumber*)importImageAtPath:(NSString*)path error:(NSError**)error;  // asset id
+- (nullable NSNumber*)importAudioAtPath:(NSString*)path error:(NSError**)error;  // asset id (WAV, MP3, AAC, AIFF, …)
+// The active composition's audible clips (cheap; compare to see whether the mix changed).
+- (NSArray<MFAudioClipInfo*>*)audioClips;
 - (BOOL)waitForMediaWithTimeout:(NSTimeInterval)seconds;               // tests / CLI only
 
 // ---- layers (index 0 = top of the stack) ----
@@ -372,6 +404,7 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (nullable MFLayerInfo*)layerWithID:(uint64_t)layerID;
 - (uint64_t)addShapeLayer:(MFShapeType)shape;
 - (uint64_t)addImageLayerWithAsset:(uint64_t)assetID;
+- (uint64_t)addAudioLayerWithAsset:(uint64_t)assetID;  // starts at the composition's time 0
 - (uint64_t)addNullLayer;
 - (BOOL)removeLayer:(uint64_t)layerID;
 - (uint64_t)duplicateLayer:(uint64_t)layerID;
@@ -381,6 +414,8 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (BOOL)setLayer:(uint64_t)layerID name:(NSString*)name;
 - (BOOL)setLayer:(uint64_t)layerID visible:(BOOL)visible;
 - (BOOL)setLayer:(uint64_t)layerID inPoint:(double)inPoint outPoint:(double)outPoint;
+// Precomp and audio layers: moves their content in time (where the source's time 0 sits).
+- (BOOL)setLayer:(uint64_t)layerID startTime:(double)startTime;
 - (BOOL)setLayer:(uint64_t)layerID parent:(uint64_t)parentID;
 - (BOOL)setLayer:(uint64_t)layerID blendMode:(MFBlendMode)mode;
 - (BOOL)setLayer:(uint64_t)layerID shapeType:(MFShapeType)shape;

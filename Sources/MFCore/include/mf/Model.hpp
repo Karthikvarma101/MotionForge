@@ -42,6 +42,7 @@ enum class PropId : uint8_t {
     TrimEnd,          // percent
     TrimOffset,       // percent, shifts the trimmed range along the path
     TimeRemap,        // seconds of source time shown (precomp layers with time remapping)
+    AudioLevel,       // dB relative to the source, -48 (silent) to 0 (audio layers)
     Count
 };
 inline constexpr int kPropCount = static_cast<int>(PropId::Count);
@@ -137,7 +138,7 @@ std::vector<std::array<double, 2>> sampleMotionPath(const Property& p, int perSe
 // Layers
 // ---------------------------------------------------------------------------------------------
 
-enum class LayerKind : uint8_t { Shape = 0, Image, Null, Text, Precomp };
+enum class LayerKind : uint8_t { Shape = 0, Image, Null, Text, Precomp, Audio };
 enum class ShapeType : uint8_t { Rectangle = 0, Ellipse, Polygon, Star, Path };
 
 // A cubic bezier path: each vertex has handles relative to its point (zero = sharp corner).
@@ -291,7 +292,7 @@ struct Layer {
     double inPoint = 0;    // seconds; the layer is active on [inPoint, outPoint)
     double outPoint = 10;
     ObjectId parent = 0;
-    ObjectId asset = 0;    // image layers
+    ObjectId asset = 0;    // image and audio layers
     std::array<Property, kPropCount> props{};
     std::vector<Mask> masks;      // applied in order
     std::vector<Effect> effects;  // applied in order, after masks
@@ -306,7 +307,7 @@ struct Layer {
     // precomps draw their layers straight into this composition (no clipping to the source's
     // frame); others are composited as one group, clipped to the source's frame.
     ObjectId source = 0;
-    double startTime = 0;
+    double startTime = 0;  // precomp and audio layers: where source time 0 sits in this composition
     bool timeRemap = false;
     bool collapse = false;
     bool motionBlur = false;  // blurred along its motion when the composition renders with motion blur
@@ -347,14 +348,15 @@ const PropDef* propertyDef(const Layer& l, PropRef r);
 // Assets, compositions, project
 // ---------------------------------------------------------------------------------------------
 
-enum class AssetKind : uint8_t { Image = 0 };
+enum class AssetKind : uint8_t { Image = 0, Audio };
 
 struct Asset {
     ObjectId id = 0;
     AssetKind kind = AssetKind::Image;
     std::string name;
     std::string path;          // absolute, resolved at load time
-    int width = 0, height = 0; // pixels
+    int width = 0, height = 0; // pixels (images)
+    double duration = 0;       // seconds (audio)
     bool missing = false;      // could not be found on load
     uint32_t generation = 0;   // bumped when the media is relinked/reloaded (invalidates caches)
     bool operator==(const Asset&) const = default;
@@ -386,8 +388,9 @@ struct Composition {
 };
 
 struct Project {
-    // 2: masks, effects, mattes; 3: spatial keys; 4: text, paths, ease speed; 5: precomps, baked tracks
-    static constexpr int kFormatVersion = 5;
+    // 2: masks, effects, mattes; 3: spatial keys; 4: text, paths, ease speed; 5: precomps, baked tracks;
+    // 6: audio assets and layers
+    static constexpr int kFormatVersion = 6;
     ObjectId nextId = 1;
     ObjectId activeComposition = 0;
     std::vector<Asset> assets;

@@ -219,6 +219,13 @@ ObjectId Document::addPrecompLayer(ObjectId comp, ObjectId source) {
     return l.id;
 }
 
+bool Document::setLayerStartTime(ObjectId comp, ObjectId layer, double startTime) {
+    const Layer* l0 = layerFor(comp, layer);
+    if (!l0 || (l0->kind != LayerKind::Precomp && l0->kind != LayerKind::Audio) || l0->startTime == startTime) return false;
+    edit("Move Layer in Time").findComposition(comp)->findLayer(layer)->startTime = startTime;
+    return true;
+}
+
 bool Document::setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime) {
     const Layer* l0 = layerFor(comp, layer);
     if (!l0 || l0->kind != LayerKind::Precomp) return false;
@@ -255,9 +262,26 @@ ObjectId Document::addImageAsset(const std::string& path, const std::string& nam
     return a.id;
 }
 
+ObjectId Document::addAudioAsset(const std::string& path, const std::string& name, double duration) {
+    for (const Asset& a : project_.assets)
+        if (a.path == path) return a.id;
+    Project& p = edit("Import");
+    Asset a;
+    a.id = p.allocateId();
+    a.kind = AssetKind::Audio;
+    a.path = path;
+    a.name = name;
+    a.duration = duration;
+    p.assets.push_back(a);
+    return a.id;
+}
+
 ObjectId Document::addLayer(ObjectId comp, LayerKind kind, ShapeType shape, ObjectId asset) {
     if (!project_.findComposition(comp)) return 0;
-    if (kind == LayerKind::Image && !project_.findAsset(asset)) return 0;
+    if (kind == LayerKind::Image || kind == LayerKind::Audio) {
+        const Asset* a = project_.findAsset(asset);
+        if (!a || (a->kind == AssetKind::Audio) != (kind == LayerKind::Audio)) return 0;
+    }
     Project& p = edit("New Layer");
     Composition& c = *p.findComposition(comp);
     Layer l = makeLayer(kind, c, p.allocateId(), p.findAsset(asset));
@@ -519,7 +543,7 @@ bool Document::setKeyframeInterpolation(ObjectId comp, ObjectId layer, PropRef p
 
 ObjectId Document::addEffect(ObjectId comp, ObjectId layer, EffectType type) {
     Layer* l0 = layerFor(comp, layer);
-    if (!l0 || l0->kind == LayerKind::Null || type == EffectType::Count) return 0;
+    if (!l0 || l0->kind == LayerKind::Null || l0->kind == LayerKind::Audio || type == EffectType::Count) return 0;
     Project& p = edit(std::string("Add ") + effectDef(type).label);
     Effect e = makeEffect(type, p.allocateId());
     layerFor(comp, layer)->effects.push_back(e);
@@ -563,7 +587,7 @@ bool Document::setEffectEnabled(ObjectId comp, ObjectId layer, ObjectId effect, 
 
 ObjectId Document::addMask(ObjectId comp, ObjectId layer, MaskShape shape) {
     Layer* l0 = layerFor(comp, layer);
-    if (!l0 || l0->kind == LayerKind::Null) return 0;
+    if (!l0 || l0->kind == LayerKind::Null || l0->kind == LayerKind::Audio) return 0;
     Vec2 mn, mx;
     layerLocalBounds(project_, *l0, 0, mn, mx);
     Project& p = edit("Add Mask");
@@ -869,7 +893,7 @@ std::vector<ObjectId> Document::insertLayers(ObjectId comp, std::vector<Layer> l
         for (Mask& m : l.masks) m.id = p.allocateId();
         for (Effect& e : l.effects) e.id = p.allocateId();
         for (TextAnimator& a : l.animators) a.id = p.allocateId();
-        if (l.kind == LayerKind::Image) {
+        if (l.kind == LayerKind::Image || l.kind == LayerKind::Audio) {
             auto it = assetMap.find(l.asset);
             if (it != assetMap.end()) l.asset = it->second;
             else if (!p.findAsset(l.asset)) l.asset = 0;
@@ -990,7 +1014,7 @@ bool Document::setLayerPath(ObjectId comp, ObjectId layer, const BezierPath& pat
 
 ObjectId Document::addPathMask(ObjectId comp, ObjectId layer, const BezierPath& path) {
     Layer* l0 = layerFor(comp, layer);
-    if (!l0 || l0->kind == LayerKind::Null || path.empty()) return 0;
+    if (!l0 || l0->kind == LayerKind::Null || l0->kind == LayerKind::Audio || path.empty()) return 0;
     Project& p = edit("Draw Mask");
     Layer& l = *layerFor(comp, layer);
     Mask m;

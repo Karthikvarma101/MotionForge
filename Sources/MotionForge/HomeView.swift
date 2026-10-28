@@ -151,6 +151,8 @@ struct HomeView: View {
                 ForgeWordmark(size: 22)
                     .matchedGeometryEffect(id: "word", in: logo)
                 Spacer()
+                AccountBadge(account: model.account) { model.showPaywall = true }
+                    .padding(.trailing, 8)
                 if model.hasOpenWork {
                     Button {
                         model.showHome = false

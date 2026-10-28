@@ -14,8 +14,12 @@ struct InspectorView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     if let layer = model.selectedLayer {
                         LayerSection(model: model, layer: layer)
-                        PropertySection(title: "Transform", model: model, time: time, layer: layer,
-                                        specs: [MFProp.anchorPoint, .position, .scale, .rotation, .opacity].map(ParamSpec.init))
+                        if layer.kind == .audio {
+                            AudioSection(model: model, time: time, layer: layer)
+                        } else {
+                            PropertySection(title: "Transform", model: model, time: time, layer: layer,
+                                            specs: [MFProp.anchorPoint, .position, .scale, .rotation, .opacity].map(ParamSpec.init))
+                        }
                         if layer.kind == .shape {
                             ShapeSection(model: model, time: time, layer: layer)
                         }
@@ -26,7 +30,7 @@ struct InspectorView: View {
                         if layer.kind == .precomp {
                             PrecompSection(model: model, time: time, layer: layer)
                         }
-                        if layer.kind != .null {
+                        if layer.kind != .null && layer.kind != .audio {
                             MasksSection(model: model, time: time, layer: layer)
                             EffectsSection(model: model, time: time, layer: layer)
                         }
@@ -103,6 +107,7 @@ private struct LayerSection: View {
                 .onChange(of: layer.name) { _, n in name = n }
 
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                if layer.kind != .audio {
                 GridRow {
                     Text("Blend").foregroundStyle(.secondary)
                     Picker("", selection: Binding(get: { layer.blend },
@@ -159,6 +164,7 @@ private struct LayerSection: View {
                         }
                         .help("Track matte: show this layer only where the chosen layer has alpha (or brightness). The matte layer is hidden automatically.")
                     }
+                }
                 }
                 GridRow {
                     Text("In / Out").foregroundStyle(.secondary)
@@ -326,6 +332,53 @@ private struct TextSection: View {
 
     private func setFont(_ f: String) {
         model.edit { _ = $0.setLayer(layer.layerID, text: layer.text, font: f, align: layer.textAlign) }
+    }
+}
+
+private struct AudioSection: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var time: TimeModel
+    let layer: MFLayerInfo
+
+    var body: some View {
+        let asset = model.assets.first { $0.assetID == layer.assetID }
+        let fps = max(model.comp.fps, 1)
+        VStack(alignment: .leading, spacing: 10) {
+            SectionBox(title: "Audio") {
+                HStack {
+                    Image(systemName: asset?.missing == false ? "waveform" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(asset?.missing == false ? Theme.audio : Theme.warning)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(asset?.name ?? "Missing file").lineLimit(1)
+                        if let a = asset {
+                            Text(a.missing ? "Missing — \(a.path)" : Timecode.string(a.duration, fps: fps))
+                                .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    Spacer()
+                    Button {
+                        model.edit { _ = $0.setLayer(layer.layerID, visible: !layer.visible) }
+                    } label: {
+                        Image(systemName: layer.visible ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(layer.visible ? "Mute" : "Unmute")
+                }
+                .font(.system(size: 11))
+                HStack {
+                    Text("File starts at").foregroundStyle(.secondary)
+                    ScrubField(value: layer.startTime, step: 1 / fps, precision: 2, suffix: " s",
+                               onBegin: { model.closeCoalescedEdit() },
+                               onChange: { v in model.edit { _ = $0.setLayer(layer.layerID, startTime: v) } },
+                               onEnd: {})
+                }
+                .font(.system(size: 11))
+                .help("Where the file's first sample sits on the timeline. Dragging the layer in the timeline moves it too; trimming its ends doesn't.")
+            }
+            PropertySection(title: "Levels", model: model, time: time, layer: layer, specs: [ParamSpec(.audioLevel)])
+            Text("0 dB plays the file as recorded; −48 dB is silent. Keyframe the level to fade or duck.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+        }
     }
 }
 

@@ -348,7 +348,7 @@ private struct LayerRows: View {
 
     /// Transform rows always; other layer properties, mask and effect parameters once animated.
     private var trackSpecs: [ParamSpec] {
-        layer.editableProps.filter { layer.isAnimated($0) || isCoreTransform($0) }.map(ParamSpec.init)
+        layer.editableProps.filter { layer.isAnimated($0) || isCoreTransform($0) || $0 == .audioLevel }.map(ParamSpec.init)
             + layer.animatedEffectAndMaskParams.map(ParamSpec.init)
     }
 }
@@ -365,12 +365,13 @@ private struct LayerNameCell: View {
             Button {
                 model.edit { _ = $0.setLayer(layer.layerID, visible: !layer.visible) }
             } label: {
-                Image(systemName: layer.visible ? "eye" : "eye.slash")
+                Image(systemName: layer.kind == .audio ? (layer.visible ? "speaker.wave.2" : "speaker.slash")
+                                                       : (layer.visible ? "eye" : "eye.slash"))
                     .foregroundStyle(layer.visible ? .primary : .secondary)
                     .frame(width: 16)
             }
             .buttonStyle(.plain)
-            .help("Show / hide")
+            .help(layer.kind == .audio ? "Mute / unmute" : "Show / hide")
             Button {
                 if expanded { model.expandedLayers.remove(layer.layerID) } else { model.expandedLayers.insert(layer.layerID) }
             } label: {
@@ -378,7 +379,9 @@ private struct LayerNameCell: View {
                     .frame(width: 12)
             }
             .buttonStyle(.plain)
-            Image(systemName: layer.icon).foregroundStyle(layer.kind == .precomp ? Theme.accent : .secondary).frame(width: 16)
+            Image(systemName: layer.icon)
+                .foregroundStyle(layer.kind == .precomp ? Theme.accent : layer.kind == .audio ? Theme.audio : .secondary)
+                .frame(width: 16)
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) { if layer.kind == .precomp { model.openComposition(layer.sourceCompID, fromLayer: layer) } }
                 .help(layer.kind == .precomp ? "Double-click to open this precomp" : "")
@@ -490,20 +493,27 @@ private struct LayerBar: View {
     @ObservedObject var model: EditorModel
     let layer: MFLayerInfo
     let mapper: TimeMapper
-    @State private var drag: (inPoint: Double, outPoint: Double)?
-    @State private var groupStart: [UInt64: (Double, Double)] = [:]  // other selected layers, when sliding
+    @State private var drag: (inPoint: Double, outPoint: Double, startTime: Double)?
+    @State private var groupStart: [UInt64: (Double, Double, Double)] = [:]  // other selected layers, when sliding
 
     var body: some View {
         let x0 = max(0, mapper.x(layer.inPoint))
         let x1 = min(mapper.width, mapper.x(layer.outPoint))
         let selected = model.selectedLayers.contains(layer.layerID)
+        let audio = layer.kind == .audio
         ZStack(alignment: .leading) {
             if x1 > x0 {
                 RoundedRectangle(cornerRadius: 3)
-                    .fill((selected ? Theme.barSelected : Theme.bar).opacity(layer.visible ? 1 : 0.4))
+                    .fill((audio ? (selected ? Theme.audioBarSelected : Theme.audioBar) : (selected ? Theme.barSelected : Theme.bar))
+                        .opacity(layer.visible ? 1 : 0.4))
                     .frame(width: x1 - x0, height: TimelineView.rowHeight - 8)
                     .offset(x: x0)
                     .gesture(dragGesture(mode: .move))
+                if audio, let asset = model.assets.first(where: { $0.assetID == layer.assetID }), !asset.missing {
+                    WaveformView(path: asset.path, startTime: layer.startTime, mapper: mapper, x0: x0, x1: x1)
+                        .frame(width: mapper.width, height: TimelineView.rowHeight - 10)
+                        .opacity(layer.visible ? 1 : 0.35)
+                }
                 // trim handles
                 handle.offset(x: x0).gesture(dragGesture(mode: .trimIn))
                 handle.offset(x: x1 - 6).gesture(dragGesture(mode: .trimOut))
@@ -544,12 +554,12 @@ private struct LayerBar: View {
         DragGesture(minimumDistance: 2)
             .onChanged { g in
                 if drag == nil {
-                    drag = (layer.inPoint, layer.outPoint)
+                    drag = (layer.inPoint, layer.outPoint, layer.startTime)
                     if !model.selectedLayers.contains(layer.layerID) { model.selectLayer(layer.layerID, mode: .replace) }
                     groupStart = [:]
                     if mode == .move {  // sliding moves every selected layer together
                         for l in model.layers where model.selectedLayers.contains(l.layerID) && l.layerID != layer.layerID {
-                            groupStart[l.layerID] = (l.inPoint, l.outPoint)
+                            groupStart[l.layerID] = (l.inPoint, l.outPoint, l.startTime)
                         }
                     }
                     model.engine.beginUndoGroup(mode == .move ? "Move Layer in Time" : "Trim Layer")
@@ -564,9 +574,14 @@ private struct LayerBar: View {
                 case .trimOut: o = max(d.outPoint + dt, d.inPoint + 1 / fps)
                 }
                 let shift = mode == .move ? i - d.inPoint : 0
+                // Sliding a precomp or audio layer takes its content along (its source time 0 moves too).
                 model.edit { e in
                     _ = e.setLayer(layer.layerID, inPoint: i, outPoint: o)
-                    for (id, span) in groupStart { _ = e.setLayer(id, inPoint: span.0 + shift, outPoint: span.1 + shift) }
+                    if mode == .move { _ = e.setLayer(layer.layerID, startTime: d.startTime + shift) }
+                    for (id, span) in groupStart {
+                        _ = e.setLayer(id, inPoint: span.0 + shift, outPoint: span.1 + shift)
+                        _ = e.setLayer(id, startTime: span.2 + shift)
+                    }
                 }
             }
             .onEnded { _ in

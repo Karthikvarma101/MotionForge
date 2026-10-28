@@ -3,6 +3,7 @@
 //
 //   swift run -c release mftests            # all tests
 //   swift run -c release mftests render     # only tests whose name contains "render"
+#import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
@@ -19,6 +20,7 @@
 #include "MFEngine.h"
 #include "MFRender/MetalRenderer.hpp"
 #include "../MFRender/TextEngine.hpp"
+#include "mf/Audio.hpp"
 #include "mf/Clipboard.hpp"
 #include "mf/Presets.hpp"
 #include "mf/Document.hpp"
@@ -1818,6 +1820,186 @@ TEST(render_engine_bridge_png) {
     CHECK([e undo]);
     MFValue p = [e valueOf:MFPropPosition layer:l time:0];
     CHECK_NEAR(p.x, 320, 0);
+}
+
+// ---- audio ----------------------------------------------------------------------------------
+
+static Asset audioAsset(Project& p, const std::string& path, double duration) {
+    Asset a;
+    a.id = p.allocateId();
+    a.kind = AssetKind::Audio;
+    a.name = fs::path(path).filename().string();
+    a.path = path;
+    a.duration = duration;
+    p.assets.push_back(a);
+    return a;
+}
+
+TEST(audio_clips_through_precomps_trims_and_levels) {
+    Project p = makeDefaultProject(640, 360, 30, 20);
+    const Asset a = audioAsset(p, "/tmp/mf-voice.wav", 10);
+    Composition src;
+    src.id = p.allocateId();
+    src.duration = 5;
+    Layer inner = makeLayer(LayerKind::Audio, src, p.allocateId(), &a);
+    CHECK(inner.outPoint == 10 && inner.asset == a.id);
+    src.layers = {inner};
+    p.compositions.push_back(src);
+    Composition& c = *p.activeComp();
+    Layer top = makeLayer(LayerKind::Audio, c, p.allocateId(), &a);
+    top.startTime = 1;
+    top.inPoint = 2;
+    top.outPoint = 8;
+    top.prop(PropId::AudioLevel).value = {-6, 0, 0, 0};
+    Layer muted = top;
+    muted.id = p.allocateId();
+    muted.visible = false;
+    Layer pre = makePrecompLayer(c, src, p.allocateId());
+    pre.startTime = 3;
+    pre.inPoint = 4;
+    pre.outPoint = 20;
+    c.layers = {top, muted, pre};
+
+    auto clips = collectAudio(p, c.id);
+    CHECK(clips.size() == 2);
+    if (clips.size() == 2) {
+        // Sorted by start: the top layer plays from 2 s (1 s into the file) for 6 s.
+        CHECK_NEAR(clips[0].start, 2, 1e-9);
+        CHECK_NEAR(clips[0].sourceStart, 1, 1e-9);
+        CHECK_NEAR(clips[0].duration, 6, 1e-9);
+        CHECK(clips[0].gain.size() == 1);
+        CHECK_NEAR(clips[0].gain[0].second, std::pow(10.0, -6 / 20.0), 1e-9);
+        // The nested layer is heard only while the precomp shows its source: [4, 8) on top.
+        CHECK(clips[1].layer == inner.id);
+        CHECK_NEAR(clips[1].start, 4, 1e-9);
+        CHECK_NEAR(clips[1].sourceStart, 1, 1e-9);
+        CHECK_NEAR(clips[1].duration, 4, 1e-9);
+    }
+    // A window cuts clips; time-remapped precomps are not followed.
+    clips = collectAudio(p, c.id, 5, 6);
+    CHECK(clips.size() == 2);
+    if (!clips.empty()) {
+        CHECK_NEAR(clips[0].start, 5, 1e-9);
+        CHECK_NEAR(clips[0].sourceStart, 4, 1e-9);
+        CHECK_NEAR(clips[0].duration, 1, 1e-9);
+    }
+    c.layers[2].timeRemap = true;
+    CHECK(collectAudio(p, c.id).size() == 1);
+
+    // An animated level becomes gain breakpoints; the bottom of the range is silence.
+    Keyframe k0, k1;
+    k0.time = 2;
+    k0.value = {0, 0, 0, 0};
+    k1.time = 4;
+    k1.value = {-48, 0, 0, 0};
+    c.layers[0].prop(PropId::AudioLevel).keyframes = {k0, k1};
+    clips = collectAudio(p, c.id);
+    CHECK(!clips.empty() && clips[0].gain.size() > 10);
+    if (!clips.empty() && clips[0].gain.size() > 10) {
+        CHECK_NEAR(clips[0].gain.front().second, 1, 1e-9);
+        CHECK_NEAR(clips[0].gain.back().first, 8, 1e-9);
+        CHECK(clips[0].gain.back().second == 0);
+        for (size_t i = 1; i < clips[0].gain.size(); ++i) CHECK(clips[0].gain[i].second <= clips[0].gain[i - 1].second + 1e-12);
+    }
+    CHECK(audioLevelGain(-48) == 0 && audioLevelGain(0) == 1);
+
+    // Audio layers draw nothing and can't be clicked.
+    CHECK(evaluateFrame(p, c, 3).items.empty());
+    CHECK(hitTest(p, c, 3, {320, 180}) == 0);
+
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(p, ""), "", back, err));
+    back.assets[0].missing = false;  // the file doesn't exist here
+    CHECK(back == p);
+}
+
+// A 1 s 440 Hz tone, written as a WAV file.
+static std::string writeTone(const char* name, double seconds) {
+    const std::string path = (fs::path(tempDir("audio")) / name).string();
+    AVAudioFormat* fmt = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:48000 channels:2];
+    NSError* e = nil;
+    AVAudioFile* f = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:@(path.c_str())]
+                                                settings:@{AVFormatIDKey : @(kAudioFormatLinearPCM), AVSampleRateKey : @48000,
+                                                           AVNumberOfChannelsKey : @2, AVLinearPCMBitDepthKey : @16}
+                                                   error:&e];
+    const AVAudioFrameCount n = AVAudioFrameCount(seconds * 48000);
+    AVAudioPCMBuffer* buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:n];
+    buf.frameLength = n;
+    for (AVAudioFrameCount i = 0; i < n; ++i)
+        buf.floatChannelData[0][i] = buf.floatChannelData[1][i] = float(0.5 * std::sin(2 * M_PI * 440 * i / 48000.0));
+    [f writeFromBuffer:buf error:&e];
+    return path;
+}
+
+static double audioSeconds(const std::string& movie) {
+    AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:@(movie.c_str())] options:nil];
+    __block NSArray<AVAssetTrack*>* tracks = nil;
+    __block CMTimeRange range = kCMTimeRangeZero;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [asset loadTracksWithMediaType:AVMediaTypeAudio completionHandler:^(NSArray<AVAssetTrack*>* t, NSError*) {
+        tracks = t;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (tracks.count == 0) return 0;
+    [tracks[0] loadValuesAsynchronouslyForKeys:@[ @"timeRange" ] completionHandler:^{ dispatch_semaphore_signal(sem); }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    range = tracks[0].timeRange;
+    return CMTimeGetSeconds(range.duration);
+}
+
+TEST(audio_import_mix_and_export_bridge) {
+    NSError* error = nil;
+    MFEngine* e = [[MFEngine alloc] initWithDevice:nil error:&error];
+    CHECK(e != nil);
+    if (!e) return;
+    [e newProjectWithWidth:320 height:180 fps:30 duration:2];
+    const std::string tone = writeTone("tone.wav", 1);
+    NSNumber* aid = [e importAudioAtPath:@(tone.c_str()) error:&error];
+    CHECK(aid != nil);
+    if (!aid) return;
+    MFAssetInfo* info = [e assets].firstObject;
+    CHECK(info.isAudio && info.loaded);
+    CHECK_NEAR(info.duration, 1, 1e-6);
+    CHECK([e importImageAtPath:@(tone.c_str()) error:nil] == nil);  // not an image
+    const uint64_t l = [e addAudioLayerWithAsset:aid.unsignedLongLongValue];
+    CHECK(l != 0);
+    CHECK([e addImageLayerWithAsset:aid.unsignedLongLongValue] == 0);
+    MFLayerInfo* layer = [e layerWithID:l];
+    CHECK(layer.kind == MFLayerKindAudio);
+    CHECK_NEAR(layer.outPoint, 1, 1e-6);
+    CHECK([e setLayer:l startTime:0.5]);
+    CHECK([e setLayer:l inPoint:0.5 outPoint:1.5]);
+    NSArray<MFAudioClipInfo*>* clips = [e audioClips];
+    CHECK(clips.count == 1);
+    if (clips.count == 1) {
+        CHECK_NEAR(clips[0].start, 0.5, 1e-9);
+        CHECK_NEAR(clips[0].duration, 1, 1e-9);
+    }
+    MFAudioMix* mix = [MFAudioMix mixWithClips:clips origin:0 error:&error];
+    CHECK(mix != nil && mix.composition.tracks.count == 1);
+    if (mix) CHECK_NEAR(CMTimeGetSeconds(mix.composition.duration), 1.5, 1e-3);
+
+    // Export: the movie carries the mixed audio for the composition's whole length.
+    MFExportSettings* s = [MFExportSettings new];
+    s.scale = 0.5;
+    const std::string out = (fs::path(tempDir("audio")) / "with-audio.mp4").string();
+    MFVideoExporter* x = [[MFVideoExporter alloc] initWithEngine:e settings:s outputPath:@(out.c_str()) error:&error];
+    CHECK(x != nil);
+    if (!x) return;
+    __block bool finished = false;
+    __block NSError* failure = nil;
+    [x startWithProgress:^(MFExportProgress*) {} completion:^(NSError* err) {
+        failure = err;
+        finished = true;
+    }];
+    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:60];
+    while (!finished && [deadline timeIntervalSinceNow] > 0) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    CHECK(finished && failure == nil);
+    if (failure) std::printf("    export: %s\n", failure.localizedDescription.UTF8String);
+    const double secs = audioSeconds(out);
+    CHECK(secs > 1.4 && secs < 2.1);  // silence before 0.5 s, the tone, silence to the end (AAC padding)
 }
 
 // ---------------------------------------------------------------------------------------------

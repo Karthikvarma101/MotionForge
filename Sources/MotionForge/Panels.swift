@@ -147,22 +147,24 @@ struct ProjectPanel: View {
                 }
                 Section("Media") {
                     if model.assets.isEmpty {
-                        Text("Drop images here or use Import").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("Drop images or audio here, or use Import").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                     ForEach(model.assets, id: \.assetID) { a in
                         HStack(spacing: 8) {
-                            Image(systemName: a.missing ? "exclamationmark.triangle.fill" : "photo")
-                                .foregroundStyle(a.missing ? Theme.warning : .secondary)
+                            Image(systemName: a.missing ? "exclamationmark.triangle.fill" : a.isAudio ? "waveform" : "photo")
+                                .foregroundStyle(a.missing ? Theme.warning : a.isAudio ? Theme.audio : .secondary)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(a.name).lineLimit(1)
-                                Text(a.missing ? "Missing — \(a.path)" : "\(a.width)×\(a.height)\(a.loaded ? "" : " · loading…")")
+                                Text(a.missing ? "Missing — \(a.path)"
+                                     : a.isAudio ? "Audio · \(Timecode.string(a.duration, fps: model.comp.fps))"
+                                     : "\(a.width)×\(a.height)\(a.loaded ? "" : " · loading…")")
                                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                             }
                         }
                         .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { model.addImageLayer(asset: a.assetID) }
+                        .onTapGesture(count: 2) { model.addLayer(asset: a.assetID) }
                         .contextMenu {
-                            Button("Add to Composition") { model.addImageLayer(asset: a.assetID) }
+                            Button("Add to Composition") { model.addLayer(asset: a.assetID) }
                             Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: a.path)]) }
                                 .disabled(a.missing)
                         }

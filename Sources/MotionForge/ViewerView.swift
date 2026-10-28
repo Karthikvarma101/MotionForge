@@ -422,8 +422,15 @@ struct MetalViewer: NSViewRepresentable {
                     playStartTime = t
                     lastFrameIndex = -1
                     dropped = 0
+                    model.audio.play(from: t)
                 }
                 var elapsed = playStartTime + (now - playStartWall)
+                if let a = model.audio.clockTime {
+                    // Sound leads: the picture follows the audio clock (and the wall clock is kept in
+                    // line with it for when the sound ends).
+                    elapsed = a
+                    playStartWall = now - (a - playStartTime)
+                }
                 let lastFrameTime = max(0, model.comp.duration - 1 / fps)
                 if elapsed > lastFrameTime + 1 / fps - 1e-9 {
                     if clock.loop {
@@ -431,9 +438,11 @@ struct MetalViewer: NSViewRepresentable {
                         playStartTime = 0
                         elapsed = 0
                         lastFrameIndex = -1
+                        model.audio.play(from: 0)
                     } else {
                         clock.isPlaying = false
                         elapsed = lastFrameTime
+                        model.audio.stop()
                     }
                 }
                 let frameIndex = Int((elapsed * fps + 1e-6).rounded(.down))
@@ -443,6 +452,7 @@ struct MetalViewer: NSViewRepresentable {
                 t = Double(frameIndex) / fps
                 clock.time = t
             } else {
+                if wasPlaying { model.audio.stop() }
                 wasPlaying = false
             }
 

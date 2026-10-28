@@ -3,7 +3,8 @@
 // The exporter copies the project when it is created (cheap: baked tracks are shared), renders it
 // with its own MetalRenderer on a serial queue and feeds AVAssetWriter (hardware H.264 / HEVC /
 // ProRes). Motion-blur subframes are averaged on the GPU and frames come back as 8-bit BGRA, so
-// the CPU only copies rows. An optional soundtrack is decoded and re-encoded as AAC alongside.
+// the CPU only copies rows. The composition's audio layers (and an optional extra soundtrack) are
+// mixed to PCM and encoded as AAC alongside.
 #import "MFEngine.h"
 
 #import <AVFoundation/AVFoundation.h>
@@ -18,7 +19,9 @@
 #include <string>
 #include <vector>
 
+#include "MFAudioInternal.h"
 #include "MFRender/MetalRenderer.hpp"
+#include "mf/Audio.hpp"
 #include "mf/Evaluator.hpp"
 
 using namespace mf;
@@ -33,6 +36,7 @@ using namespace mf;
         _format = MFExportFormatH264;
         _scale = 1;
         _motionBlur = YES;
+        _includeAudioLayers = YES;
     }
     return self;
 }
@@ -60,22 +64,6 @@ std::vector<FrameDesc> subframesAt(const Project& p, const Composition& c, doubl
         if (f.hash != frames[0].hash) return frames;
     frames.resize(1);
     return frames;
-}
-
-// The same samples, `shift` earlier (a partial export's soundtrack starts at its first frame).
-CMSampleBufferRef retimed(CMSampleBufferRef s, CMTime shift) {
-    CMItemCount n = 0;
-    CMSampleBufferGetSampleTimingInfoArray(s, 0, nullptr, &n);
-    std::vector<CMSampleTimingInfo> timing(size_t(std::max<CMItemCount>(n, 1)));
-    CMSampleBufferGetSampleTimingInfoArray(s, n, timing.data(), &n);
-    for (CMItemCount i = 0; i < n; ++i) {
-        timing[size_t(i)].presentationTimeStamp = CMTimeSubtract(timing[size_t(i)].presentationTimeStamp, shift);
-        if (CMTIME_IS_VALID(timing[size_t(i)].decodeTimeStamp))
-            timing[size_t(i)].decodeTimeStamp = CMTimeSubtract(timing[size_t(i)].decodeTimeStamp, shift);
-    }
-    CMSampleBufferRef out = nullptr;
-    CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, n, timing.data(), &out);
-    return out;
 }
 
 }  // namespace
@@ -126,7 +114,7 @@ CMSampleBufferRef retimed(CMSampleBufferRef s, CMTime shift) {
     if (!renderer) return exportError(21, err);
     renderer->setCachePolicy(CachePolicy::Off);
     for (const Asset& a : _project.assets)
-        if (!a.missing && !renderer->loadImageSync(a.id, a.generation, a.path, err)) return exportError(22, "Media: " + err);
+        if (!a.missing && a.kind == AssetKind::Image && !renderer->loadImageSync(a.id, a.generation, a.path, err)) return exportError(22, "Media: " + err);
 
     const Composition& c = *_project.findComposition(_comp);
     const double fps = c.fps;
@@ -244,33 +232,39 @@ CMSampleBufferRef retimed(CMSampleBufferRef s, CMTime shift) {
     if (![writer canAddInput:vin]) return exportError(26, "The encoder rejected these video settings");
     [writer addInput:vin];
 
-    // Soundtrack: decoded to PCM, re-encoded as AAC, cut to the video's length.
+    // Audio: the composition's audio layers plus the optional soundtrack (its time 0 at the
+    // composition's), mixed to PCM from the export's first frame, re-encoded as AAC.
     const double seconds = double(f1 - f0) / fps;
     AVAssetReader* reader = nil;
-    AVAssetReaderTrackOutput* aout = nil;
+    AVAssetReaderAudioMixOutput* aout = nil;
     AVAssetWriterInput* ain = nil;
+    std::vector<AudioClip> clips;
+    if (_settings.includeAudioLayers) clips = collectAudio(_project, _comp);
     if (_settings.audioPath.length) {
-        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:_settings.audioPath] options:nil];
-        __block NSArray<AVAssetTrack*>* tracks = nil;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [asset loadTracksWithMediaType:AVMediaTypeAudio completionHandler:^(NSArray<AVAssetTrack*>* t, NSError*) {
-            tracks = t;
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        if (tracks.count == 0) return exportError(27, std::string("No audio track in ") + _settings.audioPath.UTF8String);
-        reader = [AVAssetReader assetReaderWithAsset:asset error:&e];
+        AVAudioFile* file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:_settings.audioPath] error:&e];
+        const double sr = file.processingFormat.sampleRate;
+        if (!file || sr <= 0) return exportError(27, std::string("No audio in ") + _settings.audioPath.UTF8String);
+        AudioClip track;
+        track.path = _settings.audioPath.fileSystemRepresentation;
+        track.duration = double(file.length) / sr;
+        track.gain = {{0.0, 1.0}};
+        clips.push_back(track);
+    }
+    MFAudioMix* mix = clips.empty() ? nil : [MFAudioMix mixWithClips:MFAudioClipInfos(clips) origin:double(f0) / fps error:&e];
+    if (!mix && e) return e;
+    if (mix) {
+        reader = [AVAssetReader assetReaderWithAsset:mix.composition error:&e];
         if (!reader) return e;
-        // The soundtrack's time 0 is the composition's time 0, so a partial export reads from its start.
-        reader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(double(f0) / fps, 48000), CMTimeMakeWithSeconds(seconds, 48000));
-        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:tracks[0]
-                                                          outputSettings:@{AVFormatIDKey : @(kAudioFormatLinearPCM),
-                                                                           AVSampleRateKey : @48000,
-                                                                           AVNumberOfChannelsKey : @2,
-                                                                           AVLinearPCMBitDepthKey : @32,
-                                                                           AVLinearPCMIsFloatKey : @YES,
-                                                                           AVLinearPCMIsNonInterleaved : @NO,
-                                                                           AVLinearPCMIsBigEndianKey : @NO}];
+        reader.timeRange = CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(seconds, 48000));
+        aout = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:mix.composition.tracks
+                                                                       audioSettings:@{AVFormatIDKey : @(kAudioFormatLinearPCM),
+                                                                                       AVSampleRateKey : @48000,
+                                                                                       AVNumberOfChannelsKey : @2,
+                                                                                       AVLinearPCMBitDepthKey : @32,
+                                                                                       AVLinearPCMIsFloatKey : @YES,
+                                                                                       AVLinearPCMIsNonInterleaved : @NO,
+                                                                                       AVLinearPCMIsBigEndianKey : @NO}];
+        aout.audioMix = mix.audioMix;
         [reader addOutput:aout];
         AudioChannelLayout layout = {};
         layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
@@ -288,7 +282,7 @@ CMSampleBufferRef retimed(CMSampleBufferRef s, CMTime shift) {
     if (![writer startWriting]) return writer.error ?: exportError(25, "Cannot start writing");
     if (reader && ![reader startReading]) {
         [writer cancelWriting];
-        return reader.error ?: exportError(27, "Cannot read the soundtrack");
+        return reader.error ?: exportError(27, "Cannot read the audio");
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
 
@@ -355,10 +349,7 @@ CMSampleBufferRef retimed(CMSampleBufferRef s, CMTime shift) {
                     dispatch_group_leave(group);
                     return;
                 }
-                const CMTime shift = CMTimeMakeWithSeconds(double(f0) / fps, 48000);
-                CMSampleBufferRef t = f0 > 0 ? retimed(s, shift) : s;
-                if (t) [ain appendSampleBuffer:t];
-                if (t && t != s) CFRelease(t);
+                [ain appendSampleBuffer:s];  // the mix already starts at the export's first frame
                 CFRelease(s);
             }
         }];

@@ -60,6 +60,7 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `mfcli export project.mfproj out.mp4 [--format h264\|hevc\|prores\|prores4444\|png] [--from S --to S] [--mbps N] [--audio file]` | The app's exporter without the app |
 | `scripts/ui-demo-home.sh` | Screenshots of the launch animation and Home window at fixed times after launch (`build/ui-demo-home/`) |
 | `scripts/ui-demo-nav.sh project.mfproj` | Open a nested project and go master › scene › rig through tabs and breadcrumb; zoom with ⌥-scroll and scroll with sideways swipes (scroll events sent inside the app). Screenshots go to `build/ui-demo-nav/` |
+| `scripts/ui-demo-audio.sh project.mfproj` | Select the audible audio layer (waveform, inspector), play and compare the picture with the audio clock, show the account card, run a 60 s export in the export window. Screenshots (plus offscreen `-view.png` renders, which Stage Manager can't shrink) go to `build/ui-demo-audio/`. While it runs the app ignores the keyboard |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
 
@@ -93,17 +94,47 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Keys:** = and − zoom around the playhead; \\ shows the whole composition. The slider is
     logarithmic.
   - **Navigator bar:** drag it to scroll; double-click it to fit the whole composition.
-- **Export**: the toolbar's *Export* button or *File → Export Video…* (⌘M).
+- **Audio layers**: import WAV, MP3, AAC/M4A, AIFF or CAF (*Import*, ⌘I, or drop a file on the
+  viewer). The file becomes a layer from the composition's time 0.
+  - **Timeline:** audio bars are teal and show the waveform. The speaker switch mutes the layer.
+    Trimming the ends cuts the sound; sliding the bar moves it (precomp bars now carry their content
+    too).
+  - **Inspector:** shows the file and where its first sample sits.
+  - **Audio Level:** in dB (0 = as recorded, −48 = silent), animatable for fades and ducking.
+  - **Precomps:** audio layers inside precomps are heard in the parent, clipped to the precomp
+    layer's span. Time-remapped precomps aren't followed yet.
+  - **Playback:** the active composition's audio plays with the viewer. While sound plays, the
+    picture follows the audio clock (measured 10–28 ms apart, under one frame), so long previews
+    stay in sync.
+- **Export**: the toolbar's *Export* button or *File → Export Video…* (⌘M) opens the export window,
+  a floating panel above the editor.
   - **Formats:** H.264 or HEVC (.mp4), ProRes 422, ProRes 4444 with alpha (.mov), or a PNG
     sequence.
   - **Settings:** full, half or quarter size; the whole composition or a custom range; bitrate
-    presets (Reels 10 Mb/s, YouTube 35 Mb/s, or custom); motion blur; and an optional soundtrack
-    file. MotionForge has no audio layers yet, so add the mix there.
+    presets (Reels 10 Mb/s, YouTube 35 Mb/s, or custom); motion blur.
+  - **Audio:** the composition's audio layers are mixed at their levels (AAC 256 kb/s, 48 kHz
+    stereo). An optional extra soundtrack file is mixed in at time 0.
+  - **While it runs:** the same window shows progress, frames, current and average speed, time
+    left with the finish time, elapsed time and ×real time.
+  - **Load:** CPU load (the whole Mac, and MotionForge's own share), with a one-minute sparkline.
+    GPU utilisation, read from IOKit's "Device Utilization %", the figure Activity Monitor shows.
   - **Background:** the export renders from a snapshot of the project, so you can keep editing.
-    Progress, fps and time left show in the status bar, with *Cancel* while it runs and *Reveal*
-    when it's done.
+    *Hide* closes the window while the export carries on; the status bar keeps a progress pill,
+    and clicking it reopens the window. *Reveal* / *Open* appear when it's done.
   - **Destination:** the save panel starts in `/Volumes/Extreme SSD/YOGA/eXPORTED` when that drive
     is mounted, otherwise in ~/Movies.
+- **Home**: the house button at the left of the toolbar (or ⇧⌘H) goes back to the Home window
+  and its recent projects.
+- **Account and MotionForge Pro**:
+  - **Sign-in:** *Sign in with Google* sits in the Home header and the editor toolbar.
+  - **Signed in:** you get a round avatar (gold ring with Pro). Clicking it opens a card with your
+    name, email and plan, *Get Pro* / *Manage Subscription*, *Check Subscription* and *Sign Out*.
+  - **Pro:** exporting needs MotionForge Pro, at ₹199 a month or ₹399 a year through Razorpay. Editing,
+    previewing and saving stay free.
+  - **Paywall:** *Export* opens the Pro sheet until the subscription is active, and *File → MotionForge
+    Pro…* opens it any time.
+  - **Backend:** the Supabase project, its functions and the setup steps are in
+    [supabase/README.md](supabase/README.md).
 - **Compositions and precomps**:
   - **Open a precomp:** double-click it (or double-tap on a trackpad) anywhere: its name or bar
     in the timeline, its pixels in the viewer, or its row in the Project panel. You can also use
@@ -222,7 +253,11 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | Project format v4 | text, animators, bezier paths, path masks and speed handles round-trip losslessly (`back == original`); v1–v3 files still load |
 | Phase 4 in the real app | UI demo: a text layer typed "MotionForge" in Avenir Next Heavy, the Typewriter preset applied (1 animator, 2 Start keys; screenshot `18-text-typewriter.png` shows "MotionF" at 60%); the pen tool drew a closed 4-point path with 2 smooth (dragged) points (`19-pen-shape.png`); the graph editor (`20-graph-editor.png`) and node workspace (`21-node-workspace.png`) were opened and screenshotted. Playback of the full scene afterwards: 31/30 fps presented, 0 dropped, 126 frames cached; save + reopen gave an identical document; the 4K stress step dropped to quarter resolution ("GPU 58.5 ms > 33.3 ms frame budget") with 6 dropped frames during the switch |
 
-Test run: **55 tests, 473 checks, 0 failures** on the M5.
+| Audio layers | `audio_clips_through_precomps_trims_and_levels`: trims and start offsets give the right file ranges; a nested layer is heard only inside its precomp layer's span; muted and time-remapped sources are left out; −6 dB → 0.501 gain; an animated level becomes falling gain breakpoints ending silent; audio layers draw nothing and can't be clicked; format v6 round-trips. `audio_import_mix_and_export_bridge`: a WAV imports with its exact length, the layer moves with its start time, the mix builds, and an exported MP4 carries the audio |
+| Audio export matches the source | 6 s of the Kids Yoga master exported from 20 s: the AAC track's level equals the source mix (−17.2 dB mean, −2.4 dB peak) and its envelope lines up with the file at 20.000 s (correlation 1.000) |
+| Audio in the real app | `scripts/ui-demo-audio.sh` on Kids Yoga: 4 audio layers, 1 audible clip; after 2.5 s of playback the picture was 10–28 ms from the audio clock (5 runs); the export window during a 60 s 1080p export showed 50 fps, 30 s left, CPU 29% (MotionForge 6%), GPU 90% |
+
+Test run: **66 tests, 649 checks, 0 failures** on the M5.
 
 ## Benchmark
 
@@ -323,6 +358,7 @@ MotionForge/
 │   ├── MFCore/                C++20, no platform dependencies
 │   │   ├── include/mf/Math.hpp        2D affine math
 │   │   ├── include/mf/Model.hpp       project / composition / layer / keyframe model
+│   │   ├── Audio.cpp                  audio layers (through precomps) → clips with gain breakpoints
 │   │   ├── Model.cpp                  property defs, keyframe interpolation (linear, hold, bezier)
 │   │   ├── Evaluator.cpp              timeline → flat draw list + 64-bit content hash, hit testing
 │   │   ├── Document.cpp               all edits, snapshot undo/redo with groups, dirty tracking
@@ -335,7 +371,8 @@ MotionForge/
 │   │   ├── MetalRenderer.mm           pipelines, path flattening, offscreen effect/matte layers (MPS blur), pools, frame cache, media
 │   │   ├── TextEngine.mm              CoreText layout cache + GPU glyph sheets
 │   │   ├── MFEngine.mm                Objective-C API that Swift uses
-│   │   ├── MFExport.mm                background video export: AVAssetWriter, hardware encoders, soundtrack
+│   │   ├── MFExport.mm                background video export: AVAssetWriter, hardware encoders, audio mix
+│   │   ├── MFAudio.mm                 clips → AVComposition + audio mix (shared by playback and export)
 │   │   └── include/MFEngine.h         the Swift-visible bridge (module map exposes only this)
 │   ├── MotionForge/           Swift — SwiftUI/AppKit editor
 │   │   ├── MotionForgeApp.swift       app, window layout, toolbar, menus
@@ -343,9 +380,13 @@ MotionForge/
 │   │   ├── ViewerView.swift           MTKView viewer, playback clock, direct manipulation
 │   │   ├── TimelineView.swift         ruler, layer bars, property rows, keyframes
 │   │   ├── TimelineNavigation.swift   composition tabs + breadcrumb, timeline zoom/scroll gestures
-│   │   ├── ExportView.swift           export sheet, background export state, status-bar progress
+│   │   ├── ExportView.swift           export window (settings, progress, load), status-bar progress
+│   │   ├── SystemLoad.swift           CPU (Mac + MotionForge) and GPU utilisation sampler
+│   │   ├── AudioPlayback.swift        audio-clock playback, waveform peaks, waveform drawing
 │   │   ├── HomeView.swift             launch animation (vector logo) + Home window with recent projects
 │   │   ├── RecentProjects.swift       recent-project list and thumbnails
+│   │   ├── AccountModel.swift         Google sign-in (Supabase), Keychain session, Pro entitlement, Razorpay checkout
+│   │   ├── AccountViews.swift         account avatar + card, Pro paywall sheet
 │   │   ├── GraphEditorView.swift      value curves with ease / speed handles
 │   │   ├── NodeGraphView.swift        node workspace (layer stack as Source → Masks → Effects → Composite)
 │   │   ├── InspectorView.swift        layer / transform / shape / text / animator / mask / effect properties
@@ -378,7 +419,7 @@ so large imports stay cheap to edit.
 The first import is the 5:38 *Kids Yoga for Beginners* film (`KIDS_YOGA_BEGINNERS.aep`: 37 comps,
 eight scenes with three rigged characters each). It became a project of 795 compositions and
 about 5,400 layers, because each AE shape layer becomes a small composition holding its groups. The pipeline,
-the mapping and what doesn't convert (audio, adjustment layers, 3D) are in
+the mapping and what doesn't convert (audio levels, adjustment layers, 3D) are in
 `kids_yoga_beginners/motionforge/README.md`. `mfcli time` measures a real project: CPU evaluation
 and GPU composite per frame, with and without motion blur.
 
@@ -408,7 +449,9 @@ and GPU composite per frame, with and without motion blur.
   (`mfcli`, *File → Export Frame*). The interactive viewer shows the frame without it.
 - Drop Shadow and Glow work on the layer's own pixels in layer space, like most motion tools; Glow
   uses the layer's own colours (no tint option yet).
-- No video, audio, adjustment layers or render queue yet — see the roadmap. PNG still/sequence
+- **Audio:** no video layers or their sound yet, no scrubbing audio, levels capped at 0 dB, and no
+  audio through time-remapped or stretched precomps. Waveforms show the file, not the level.
+- No video, adjustment layers or render queue yet — see the roadmap. PNG still/sequence
   export exists in `mfcli` and *File → Export Frame*. Non-collapsed precomps render as a group at
   the parent's resolution (sharper than AE's rasterise-then-transform when scaled up).
 - **Paths**: a path's points can be dragged but not keyframed; animated paths exist only as baked
@@ -434,7 +477,7 @@ and GPU composite per frame, with and without motion blur.
 | 2 | Keyframes, playback, interpolation, undo/redo, saving | **Done** (plus spatial bezier paths, multi-selection, copy/paste) |
 | 3 | Metal effects (blur, glow, shadow, colour), masks, track mattes, memory manager, background caching | **Done** (6 effects, parametric masks, 4 matte modes, cost-aware 8-bit cache, prefetch, adaptive resolution) |
 | 4 | Text animation, shape tools (pen/bezier paths), graph editor, presets, node compositing | **Done** (text + range-selector animators, pen paths + bezier masks + Trim Paths, value graph with speed handles, 13 built-in + user presets, node view of the layer stack) |
-| 5 | Video import (AVFoundation/VideoToolbox), audio, proxies, hardware export, render queue | Planned |
+| 5 | Video import (AVFoundation/VideoToolbox), audio, proxies, hardware export, render queue | Started: audio layers + mixing, hardware export with an export window |
 | 6 | Whole-app profiling on the M5, long-session stability | Planned |
 
 ## Third-party code and licences

@@ -110,7 +110,7 @@ bool buildItem(const CompIndex& ix, const Composition& comp, const Layer& l, dou
                const Affine& toTarget, FrameDesc& f, DrawItem& d, int depth) {
     const Project& project = ix.project;
     const double time = l.motionBlur ? baseTime + shutter : baseTime;
-    if (l.kind == LayerKind::Null) return false;
+    if (l.kind == LayerKind::Null || l.kind == LayerKind::Audio) return false;
     d.layerId = l.id;
     d.kind = l.kind;
     d.shape = l.shape;
@@ -380,6 +380,9 @@ void layerLocalBounds(const Project& project, const Layer& layer, double time, V
             mx = src ? Vec2{double(src->width), double(src->height)} : Vec2{100, 100};
             return;
         }
+        case LayerKind::Audio:
+            mn = mx = {0, 0};
+            return;
     }
 }
 
@@ -563,7 +566,7 @@ namespace {
 // only drawn content makes it "hit").
 ObjectId hitTestIn(const Project& project, const Composition& comp, double time, Vec2 p, bool nulls, int depth) {
     for (const Layer& l : comp.layers) {  // top first
-        if (!l.activeAt(time) || (!nulls && l.kind == LayerKind::Null)) continue;
+        if (!l.activeAt(time) || l.kind == LayerKind::Audio || (!nulls && l.kind == LayerKind::Null)) continue;
         if (l.kind != LayerKind::Null && evaluateProperty(l.prop(PropId::Opacity), PropId::Opacity, time)[0] <= 0) continue;
         Affine inv;
         if (!layerWorldTransform(comp, l, time).inverse(inv)) continue;

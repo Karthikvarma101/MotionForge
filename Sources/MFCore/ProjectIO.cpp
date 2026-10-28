@@ -257,6 +257,7 @@ Json layerToJson(const Layer& l) {
         lj.set("timeRemap", Json(l.timeRemap));
         lj.set("collapse", Json(l.collapse));
     }
+    if (l.kind == LayerKind::Audio) lj.set("startTime", Json(l.startTime));
     Json props = Json::object();
     for (int i = 0; i < kPropCount; ++i) {
         const auto id = static_cast<PropId>(i);
@@ -362,6 +363,7 @@ Layer layerFromJson(const Json& lj, const Composition& c, ObjectId* maxId) {
         l.timeRemap = lj.get("timeRemap").boolean(false);
         l.collapse = lj.get("collapse").boolean(false);
     }
+    if (kind == LayerKind::Audio) l.startTime = lj.get("startTime").number(0);
     const Json& props = lj.get("properties");
     for (int i = 0; i < kPropCount; ++i) {
         const auto id = static_cast<PropId>(i);
@@ -444,12 +446,13 @@ std::string serializeProject(const Project& project, const std::string& projectD
     for (const Asset& a : project.assets) {
         Json aj = Json::object();
         aj.set("id", Json(a.id));
-        aj.set("kind", Json("image"));
+        aj.set("kind", Json(a.kind == AssetKind::Audio ? "audio" : "image"));
         aj.set("name", Json(a.name));
         aj.set("relativePath", Json(relativeTo(a.path, projectDir)));
         aj.set("absolutePath", Json(a.path));
         aj.set("width", Json(a.width));
         aj.set("height", Json(a.height));
+        if (a.kind == AssetKind::Audio) aj.set("duration", Json(a.duration));
         assets.push(std::move(aj));
     }
     root.set("assets", std::move(assets));
@@ -512,8 +515,10 @@ bool deserializeProject(const std::string& text, const std::string& projectDir, 
         Asset a;
         a.id = static_cast<ObjectId>(aj.get("id").number());
         a.name = aj.get("name").string();
+        a.kind = aj.get("kind").string() == "audio" ? AssetKind::Audio : AssetKind::Image;
         a.width = static_cast<int>(aj.get("width").number());
         a.height = static_cast<int>(aj.get("height").number());
+        a.duration = aj.get("duration").number(0);
         const std::string rel = aj.get("relativePath").string();
         const std::string abs = aj.get("absolutePath").string();
         const std::string relResolved = (!rel.empty() && !projectDir.empty())

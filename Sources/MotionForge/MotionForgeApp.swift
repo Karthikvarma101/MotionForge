@@ -54,6 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if let dir = ProcessInfo.processInfo.environment["MOTIONFORGE_UIDEMO_NAV"] {
                         UIDemo.runNavigation(model: model, outputDirectory: dir)
                     }
+                    // Audio layers, playback sync, account card, export window (scripts/ui-demo-audio.sh).
+                    if let dir = ProcessInfo.processInfo.environment["MOTIONFORGE_UIDEMO_AUDIO"] {
+                        UIDemo.runAudio(model: model, outputDirectory: dir)
+                    }
                 }
             }
         }
@@ -140,7 +144,12 @@ struct ContentView: View {
         .navigationTitle(model.showHome ? "MotionForge" : model.displayName + (model.engine.dirty ? " — Edited" : ""))
         .toolbar { EditorToolbar(model: model) }
         .sheet(isPresented: $model.showCompSettings) { CompSettingsSheet(model: model) }
-        .sheet(isPresented: $model.showExportSheet) { ExportSheet(model: model) }
+        .sheet(isPresented: $model.showPaywall) {
+            // Subscribing from here carries on to the export it was opened for.
+            PaywallSheet(account: model.account) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { model.showExportWindow() }
+            }
+        }
         .alert("MotionForge", isPresented: Binding(get: { model.alertMessage != nil }, set: { if !$0 { model.alertMessage = nil } })) {
             Button("OK") { model.alertMessage = nil }
         } message: {
@@ -160,6 +169,10 @@ struct EditorToolbar: ToolbarContent {
     }
 
     @ToolbarContentBuilder private var editingTools: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button { model.showHome = true } label: { Label("Home", systemImage: "house") }
+                .help("Home — recent projects (⇧⌘H)")
+        }
         ToolbarItemGroup(placement: .navigation) {
             Button { model.addShape(.rectangle) } label: { Label("Rectangle", systemImage: "rectangle") }
                 .help("New rectangle layer")
@@ -186,7 +199,7 @@ struct EditorToolbar: ToolbarContent {
                 .help("Draw a new shape layer, or a bezier mask on the selected layer")
             }
             Button { model.presentImportPanel() } label: { Label("Import", systemImage: "photo.badge.plus") }
-                .help("Import images as layers")
+                .help("Import images or audio as layers (⌘I)")
         }
         ToolbarItem(placement: .principal) {
             Picker("", selection: $model.workspace) {
@@ -205,9 +218,9 @@ struct EditorToolbar: ToolbarContent {
                 .help(model.engine.canRedo ? "Redo \(model.engine.redoLabel)" : "Nothing to redo")
             Button { model.showCompSettings = true } label: { Label("Composition", systemImage: "aspectratio") }
                 .help("Composition settings (size, aspect ratio, frame rate)")
-            Button { model.showExportSheet = true } label: { Label("Export", systemImage: "square.and.arrow.up") }
-                .disabled(model.exporter != nil)
-                .help(model.exporter != nil ? "An export is running (see the status bar)" : "Export the composition as a video or image sequence (⌘M)")
+            Button { model.requestExport() } label: { Label("Export", systemImage: "square.and.arrow.up") }
+                .help(model.exporter != nil ? "Show the running export" : "Export the composition as a video or image sequence (⌘M)")
+            AccountBadge(account: model.account, compact: true) { model.showPaywall = true }
         }
     }
 }
@@ -227,7 +240,8 @@ struct AppCommands: Commands {
             Button("Save As…") { model.saveAs() }.keyboardShortcut("s", modifiers: [.command, .shift])
             Divider()
             Button("Import Media…") { model.presentImportPanel() }.keyboardShortcut("i")
-            Button("Export Video…") { model.showExportSheet = true }.keyboardShortcut("m").disabled(model.exporter != nil)
+            Button(model.exporter != nil ? "Show Export Progress" : "Export Video…") { model.requestExport() }.keyboardShortcut("m")
+            Button("MotionForge Pro…") { model.showPaywall = true }
             Button("Export Frame as PNG…") { model.exportFramePanel() }.keyboardShortcut("e", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .undoRedo) {

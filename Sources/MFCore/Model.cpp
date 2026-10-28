@@ -29,6 +29,7 @@ const PropDef kPropDefs[kPropCount] = {
     {"trimEnd", "Trim End", 1, {100, 0, 0, 0}, 0, 100, false},
     {"trimOffset", "Trim Offset", 1, {0, 0, 0, 0}, -kBig, kBig, false},
     {"timeRemap", "Time Remap", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"audioLevel", "Audio Level", 1, {0, 0, 0, 0}, -48, 0, false},
 };
 
 const PropDef kAnimParamDefs[kAnimParamCount] = {
@@ -51,7 +52,7 @@ std::optional<E> fromKey(std::string_view key, const char* const (&keys)[N]) {
 
 const char* const kInterpKeys[] = {"linear", "hold", "bezier"};
 const char* const kSpatialKeys[] = {"linear", "auto", "bezier"};
-const char* const kLayerKindKeys[] = {"shape", "image", "null", "text", "precomp"};
+const char* const kLayerKindKeys[] = {"shape", "image", "null", "text", "precomp", "audio"};
 const char* const kShapeTypeKeys[] = {"rectangle", "ellipse", "polygon", "star", "path"};
 const char* const kTextAlignKeys[] = {"left", "center", "right"};
 const char* const kSelectorShapeKeys[] = {"square", "rampUp", "rampDown", "triangle", "round", "smooth"};
@@ -586,6 +587,13 @@ Layer makeLayer(LayerKind kind, const Composition& comp, ObjectId id, const Asse
             break;
         case LayerKind::Precomp:
             l.name = "Precomp";
+            break;
+        case LayerKind::Audio:
+            l.name = asset ? asset->name : "Audio";
+            if (asset) {
+                l.asset = asset->id;
+                if (asset->duration > 0) l.outPoint = asset->duration;
+            }
             break;
     }
     return l;

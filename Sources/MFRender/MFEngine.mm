@@ -11,6 +11,7 @@
 #include <set>
 #include <unordered_map>
 
+#include "MFAudioInternal.h"
 #include "MFRender/MetalRenderer.hpp"
 #include "mf/Clipboard.hpp"
 #include "mf/Document.hpp"
@@ -440,6 +441,8 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         _height = a.height;
         _missing = a.missing;
         _loaded = loaded;
+        _isAudio = a.kind == AssetKind::Audio;
+        _duration = a.duration;
     }
     return self;
 }
@@ -512,6 +515,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (void)requestMedia:(const Asset&)a {
+    if (a.kind != AssetKind::Image) return;  // audio is read by AVFoundation when it plays
     __weak MFEngine* weakSelf = self;
     const ObjectId aid = a.id;
     _renderer->requestImage(a.id, a.generation, a.path, [weakSelf, aid](bool ok, const std::string& err) {
@@ -623,7 +627,8 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (NSArray<MFAssetInfo*>*)assets {
     NSMutableArray* out = [NSMutableArray array];
     for (const Asset& a : _doc.project().assets)
-        [out addObject:[[MFAssetInfo alloc] initWithAsset:a loaded:_renderer->hasImage(a.id, a.generation)]];
+        [out addObject:[[MFAssetInfo alloc] initWithAsset:a
+                                                   loaded:a.kind == AssetKind::Audio ? !a.missing : _renderer->hasImage(a.id, a.generation)]];
     return out;
 }
 
@@ -641,6 +646,22 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     const ObjectId aid = _doc.addImageAsset(path.fileSystemRepresentation, path.lastPathComponent.UTF8String, w, h);
     if (const Asset* a = _doc.project().findAsset(aid)) [self requestMedia:*a];
     return @(aid);
+}
+
+- (NSNumber*)importAudioAtPath:(NSString*)path error:(NSError**)error {
+    NSError* e = nil;
+    AVAudioFile* file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:path] error:&e];
+    const double sr = file.processingFormat.sampleRate;
+    if (!file || sr <= 0 || file.length <= 0) {
+        if (error) *error = e ?: makeError(4, "No audio in " + std::string(path.lastPathComponent.UTF8String));
+        return nil;
+    }
+    const ObjectId aid = _doc.addAudioAsset(path.fileSystemRepresentation, path.lastPathComponent.UTF8String, double(file.length) / sr);
+    return @(aid);
+}
+
+- (NSArray<MFAudioClipInfo*>*)audioClips {
+    return MFAudioClipInfos(collectAudio(_doc.project(), [self compID]));
 }
 
 - (BOOL)waitForMediaWithTimeout:(NSTimeInterval)seconds {
@@ -674,6 +695,9 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (uint64_t)addImageLayerWithAsset:(uint64_t)assetID {
     return _doc.addLayer([self compID], LayerKind::Image, ShapeType::Rectangle, assetID);
 }
+- (uint64_t)addAudioLayerWithAsset:(uint64_t)assetID {
+    return _doc.addLayer([self compID], LayerKind::Audio, ShapeType::Rectangle, assetID);
+}
 - (uint64_t)addNullLayer { return _doc.addLayer([self compID], LayerKind::Null); }
 - (BOOL)removeLayer:(uint64_t)layerID { return _doc.removeLayer([self compID], layerID); }
 - (uint64_t)duplicateLayer:(uint64_t)layerID { return _doc.duplicateLayer([self compID], layerID); }
@@ -686,6 +710,9 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (BOOL)setLayer:(uint64_t)layerID visible:(BOOL)visible { return _doc.setLayerVisible([self compID], layerID, visible); }
 - (BOOL)setLayer:(uint64_t)layerID inPoint:(double)inPoint outPoint:(double)outPoint {
     return _doc.setLayerTiming([self compID], layerID, inPoint, outPoint);
+}
+- (BOOL)setLayer:(uint64_t)layerID startTime:(double)startTime {
+    return _doc.setLayerStartTime([self compID], layerID, startTime);
 }
 - (BOOL)setLayer:(uint64_t)layerID parent:(uint64_t)parentID {
     return _doc.setLayerParent([self compID], layerID, parentID);

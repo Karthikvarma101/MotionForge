@@ -37,7 +37,7 @@ let package = Package(
             name: "MotionForge",
             dependencies: ["MFRender"],
             swiftSettings: [.swiftLanguageMode(.v5)],
-            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("SwiftUI")]
+            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("SwiftUI"), .linkedFramework("IOKit")]
         ),
         .executableTarget(name: "mftests", dependencies: ["MFRender", "MFCore"]),
         .executableTarget(name: "mfbench", dependencies: ["MFRender", "MFCore"]),

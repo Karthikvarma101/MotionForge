@@ -55,7 +55,7 @@ std::string copyLayers(const Project& project, ObjectId comp, const std::vector<
     for (const Layer& l : c->layers) {  // stacking order, not selection order
         if (std::find(ids.begin(), ids.end(), l.id) == ids.end()) continue;
         layers.push(layerToJson(l));
-        if (l.kind == LayerKind::Image && l.asset &&
+        if ((l.kind == LayerKind::Image || l.kind == LayerKind::Audio) && l.asset &&
             std::find(usedAssets.begin(), usedAssets.end(), l.asset) == usedAssets.end())
             usedAssets.push_back(l.asset);
     }
@@ -68,6 +68,10 @@ std::string copyLayers(const Project& project, ObjectId comp, const std::vector<
         aj.set("path", Json(a->path));
         aj.set("width", Json(a->width));
         aj.set("height", Json(a->height));
+        if (a->kind == AssetKind::Audio) {
+            aj.set("kind", Json("audio"));
+            aj.set("duration", Json(a->duration));
+        }
         assets.push(std::move(aj));
     }
     root.set("assets", std::move(assets));
@@ -92,6 +96,8 @@ std::vector<ObjectId> pasteLayers(Document& doc, ObjectId comp, const std::strin
         a.path = aj.get("path").string();
         a.width = int(aj.get("width").number());
         a.height = int(aj.get("height").number());
+        a.kind = aj.get("kind").string() == "audio" ? AssetKind::Audio : AssetKind::Image;
+        a.duration = aj.get("duration").number(0);
         assets.push_back(a);
     }
     std::vector<Layer> layers;
