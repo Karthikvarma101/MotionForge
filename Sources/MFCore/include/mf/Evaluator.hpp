@@ -147,7 +147,8 @@ double effectReach(const FrameDesc& f, const DrawItem& d);
 double effectScale(const DrawItem& d);
 
 // Topmost visible, active layer under a composition-space point (null layers included so they can
-// be selected in the viewer). Returns 0 when nothing is hit.
+// be selected in the viewer). A precomp is hit only where one of its own layers is. Returns 0 when
+// nothing is hit.
 ObjectId hitTest(const Project& project, const Composition& comp, double time, Vec2 compPoint);
 
 // Four corners (TL, TR, BR, BL) of a layer's bounds in composition pixels, for selection overlays.

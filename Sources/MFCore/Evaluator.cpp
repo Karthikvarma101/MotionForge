@@ -557,14 +557,28 @@ uint64_t hashFrame(const FrameDesc& f) {
     return h.h;
 }
 
-ObjectId hitTest(const Project& project, const Composition& comp, double time, Vec2 p) {
+namespace {
+
+// `nulls`: whether null layers count (they are selectable at the top level, but inside a precomp
+// only drawn content makes it "hit").
+ObjectId hitTestIn(const Project& project, const Composition& comp, double time, Vec2 p, bool nulls, int depth) {
     for (const Layer& l : comp.layers) {  // top first
-        if (!l.activeAt(time)) continue;
+        if (!l.activeAt(time) || (!nulls && l.kind == LayerKind::Null)) continue;
+        if (l.kind != LayerKind::Null && evaluateProperty(l.prop(PropId::Opacity), PropId::Opacity, time)[0] <= 0) continue;
         Affine inv;
         if (!layerWorldTransform(comp, l, time).inverse(inv)) continue;
         const Vec2 q = inv.apply(p);
         Vec2 mn, mx;
         layerLocalBounds(project, l, time, mn, mx);
+        if (l.kind == LayerKind::Precomp) {
+            // Hit where the precomp draws something, not anywhere in its frame (collapsed precomps
+            // aren't clipped to it at all).
+            const Composition* src = project.findComposition(l.source);
+            if (!src || src->id == comp.id || depth + 1 >= kMaxNesting) continue;
+            if (!l.collapse && (q.x < mn.x || q.y < mn.y || q.x > mx.x || q.y > mx.y)) continue;
+            if (hitTestIn(project, *src, l.sourceTime(time), q, false, depth + 1) == 0) continue;
+            return l.id;
+        }
         if (q.x < mn.x || q.y < mn.y || q.x > mx.x || q.y > mx.y) continue;
         if (l.kind == LayerKind::Shape && l.shape == ShapeType::Ellipse) {
             const double rx = (mx.x - mn.x) * 0.5, ry = (mx.y - mn.y) * 0.5;
@@ -575,6 +589,12 @@ ObjectId hitTest(const Project& project, const Composition& comp, double time, V
         return l.id;
     }
     return 0;
+}
+
+}  // namespace
+
+ObjectId hitTest(const Project& project, const Composition& comp, double time, Vec2 p) {
+    return hitTestIn(project, comp, time, p, true, 0);
 }
 
 std::array<Vec2, 4> layerCorners(const Project& project, const Composition& comp, const Layer& layer, double time) {

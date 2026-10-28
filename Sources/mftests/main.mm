@@ -1524,8 +1524,9 @@ TEST(precomp_layer_transforms_and_clips) {
     img = render(d.project());
     CHECK(img.at(376, 200)[0] > 0.99);
     CHECK(img.a(340, 200) < 0.01);  // child x 280
-    // Hit-testing and bounds use the child's frame.
-    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {300, 200}) == pl);
+    // Hit-testing goes into the precomp: only where its rectangle is (child x 300..500 at 50%).
+    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {380, 200}) == pl);   // child (360, 100)
+    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {300, 200}) == 0);    // child (200, 100): empty
 }
 
 TEST(precomp_group_opacity_and_time) {

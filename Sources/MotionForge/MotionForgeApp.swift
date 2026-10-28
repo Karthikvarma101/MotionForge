@@ -40,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated { if let model = self.model { UIDemo.run(model: model, outputDirectory: dir) } }
             }
         }
+        // Launch animation + Home window frames (scripts/ui-demo-home.sh).
+        if let dir = ProcessInfo.processInfo.environment["MOTIONFORGE_UIDEMO_HOME"] {
+            UIDemo.runHome(outputDirectory: dir) { [weak self] in self?.model }
+        }
         // Open a project at launch (scripts, or launching the binary directly).
         if let path = ProcessInfo.processInfo.environment["MOTIONFORGE_OPEN"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -100,6 +104,17 @@ struct ContentView: View {
     @ObservedObject var model: EditorModel
 
     var body: some View {
+        ZStack {
+            workspace
+            if model.showHome {
+                HomeView(model: model)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
+        }
+    }
+
+    private var workspace: some View {
         VStack(spacing: 0) {
             HSplitView {
                 LeftPanel(model: model)
@@ -122,7 +137,7 @@ struct ContentView: View {
             }
             StatusBar(model: model, perf: model.perf, time: model.time)
         }
-        .navigationTitle(model.displayName + (model.engine.dirty ? " — Edited" : ""))
+        .navigationTitle(model.showHome ? "MotionForge" : model.displayName + (model.engine.dirty ? " — Edited" : ""))
         .toolbar { EditorToolbar(model: model) }
         .sheet(isPresented: $model.showCompSettings) { CompSettingsSheet(model: model) }
         .sheet(isPresented: $model.showExportSheet) { ExportSheet(model: model) }
@@ -138,6 +153,13 @@ struct EditorToolbar: ToolbarContent {
     @ObservedObject var model: EditorModel
 
     var body: some ToolbarContent {
+        // Home keeps the title bar (window buttons, dragging) but none of the editing tools.
+        if !model.showHome {
+            editingTools
+        }
+    }
+
+    @ToolbarContentBuilder private var editingTools: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
             Button { model.addShape(.rectangle) } label: { Label("Rectangle", systemImage: "rectangle") }
                 .help("New rectangle layer")
@@ -195,6 +217,8 @@ struct AppCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
+            Button("Home") { model.showHome = true }.keyboardShortcut("h", modifiers: [.command, .shift])
+            Divider()
             Button("New Project") { model.newProject() }.keyboardShortcut("n")
             Button("Open Project…") { model.openProjectPanel() }.keyboardShortcut("o")
         }

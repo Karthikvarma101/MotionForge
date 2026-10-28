@@ -393,9 +393,15 @@ private struct LayerNameCell: View {
             } else {
                 Text(layer.name).lineLimit(1)
                     .onTapGesture(count: 2) {
-                        name = layer.name
-                        renaming = true
+                        // Precomps open (as in After Effects; rename them in the inspector); other layers rename.
+                        if layer.kind == .precomp {
+                            model.openComposition(layer.sourceCompID, fromLayer: layer)
+                        } else {
+                            name = layer.name
+                            renaming = true
+                        }
                     }
+                    .help(layer.kind == .precomp ? "Double-click to open this precomp" : "Double-click to rename")
             }
             Spacer(minLength: 4)
             if layer.parentID != 0, let p = model.layers.first(where: { $0.layerID == layer.parentID }) {
@@ -514,6 +520,12 @@ private struct LayerBar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
+            // The second click of a double-click (or trackpad double tap) opens a precomp. Reading the
+            // event's click count keeps single clicks instant (no waiting to see if a second follows).
+            if NSApp.currentEvent?.clickCount == 2, layer.kind == .precomp {
+                model.openComposition(layer.sourceCompID, fromLayer: layer)
+                return
+            }
             let mode = SelectMode.current
             model.selectLayer(layer.layerID, mode: mode)
             if mode == .replace { model.selectedKeyframes = [] }

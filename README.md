@@ -58,11 +58,21 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `make sample` | Render the position / scale / opacity demo into `Examples/demo/`, the effects sheet into `Examples/effects/` and the text / path sheet into `Examples/phase4/` |
 | `scripts/ui-demo.sh` | Launch the real app, drive it (click, drag, edit, undo, play, save), screenshot each step into `build/ui-demo/` |
 | `mfcli export project.mfproj out.mp4 [--format h264\|hevc\|prores\|prores4444\|png] [--from S --to S] [--mbps N] [--audio file]` | The app's exporter without the app |
+| `scripts/ui-demo-home.sh` | Screenshots of the launch animation and Home window at fixed times after launch (`build/ui-demo-home/`) |
 | `scripts/ui-demo-nav.sh project.mfproj` | Open a nested project and go master › scene › rig through tabs and breadcrumb; zoom with ⌥-scroll and scroll with sideways swipes (scroll events sent inside the app). Screenshots go to `build/ui-demo-nav/` |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
 
 ## Using it
+
+- **Home**: the app opens with a short animation of the logo being built, then the Home window.
+  - **Recent projects:** opened and saved projects appear as cards with a rendered thumbnail, size,
+    length, composition count and when you last opened them. Click a card to open it; right-click
+    for *Show in Finder* or *Remove from Recents*.
+  - **Starting points:** *New Project*, *Open Project…*, and *Starter Scene* (a small animated demo).
+  - **Coming back:** *File → Home* (⇧⌘H) returns here, and *Back to …* resumes the open project.
+  - **Skipping the animation:** click to skip it. With *Reduce Motion* on it's a plain fade.
+    Opening a project file from Finder goes straight to the workspace.
 
 - **Add layers**: toolbar or *Layer* menu (rectangle, ellipse, polygon, star, null, text); import
   images with ⌘I, the toolbar, or by dropping files on the viewer / project panel.
@@ -95,8 +105,9 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Destination:** the save panel starts in `/Volumes/Extreme SSD/YOGA/eXPORTED` when that drive
     is mounted, otherwise in ~/Movies.
 - **Compositions and precomps**:
-  - **Open a precomp:** double-click its icon in the timeline, choose *Open Precomp* from its
-    context menu, or use *Open* in the inspector. The playhead moves to the matching time inside
+  - **Open a precomp:** double-click it (or double-tap on a trackpad) anywhere: its name or bar
+    in the timeline, its pixels in the viewer, or its row in the Project panel. You can also use
+    *Open Precomp* in its context menu, or *Open* in the inspector. The playhead moves to the matching time inside
     it, including through time remapping.
   - **Tabs:** every composition you open gets a tab above the timeline. Switching back to one
     restores its playhead, zoom and scroll position.
@@ -333,6 +344,8 @@ MotionForge/
 │   │   ├── TimelineView.swift         ruler, layer bars, property rows, keyframes
 │   │   ├── TimelineNavigation.swift   composition tabs + breadcrumb, timeline zoom/scroll gestures
 │   │   ├── ExportView.swift           export sheet, background export state, status-bar progress
+│   │   ├── HomeView.swift             launch animation (vector logo) + Home window with recent projects
+│   │   ├── RecentProjects.swift       recent-project list and thumbnails
 │   │   ├── GraphEditorView.swift      value curves with ease / speed handles
 │   │   ├── NodeGraphView.swift        node workspace (layer stack as Source → Masks → Effects → Composite)
 │   │   ├── InspectorView.swift        layer / transform / shape / text / animator / mask / effect properties

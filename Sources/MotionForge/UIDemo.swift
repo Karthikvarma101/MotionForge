@@ -335,6 +335,28 @@ enum UIDemo {
             model.time.time = 50  // inside the Mountain Pose scene
             await record("nav-01-master")
 
+            // Double-clicks open precomps: a layer's bar in the timeline, then a character in the viewer.
+            if let gestures = findGestureView(in: window.contentView),
+               let i = model.layers.firstIndex(where: { $0.name == "YB02_MOUNTAIN" }) {
+                let l = model.layers[i]
+                let midX = gestures.trackOffset + model.viewport.x(of: (l.inPoint + l.outPoint) / 2)
+                let rowY = 27 + CGFloat(i) * (TimelineView.rowHeight + 1) + TimelineView.rowHeight / 2
+                doubleClick(gestures, at: CGPoint(x: midX, y: rowY))
+                await record("nav-01b-doubleclick-timeline-bar")
+                if let teacher = model.layers.first(where: { $0.kind == .precomp && $0.name.contains("TEACHER") }),
+                   let viewer = findViewer(in: window.contentView) {
+                    let q = model.engine.quad(forLayer: teacher.layerID, time: model.time.time)
+                    let centre = CGPoint(x: (q.topLeft.x + q.bottomRight.x) / 2, y: q.topLeft.y + (q.bottomRight.y - q.topLeft.y) * 0.55)
+                    doubleClick(viewer, at: viewer.coordinator!.geometry.toView(centre))
+                    await record("nav-01c-doubleclick-viewer")
+                }
+                if let root = model.compTrail.first { model.openComposition(root) }
+                model.closeCompositionTab(model.compTabs.last ?? 0)
+                model.closeCompositionTab(model.compTabs.last ?? 0)
+                model.time.time = 50
+                try? await Task.sleep(for: .seconds(0.4))
+            }
+
             // Down one level: the scene precomp under the playhead.
             let t = model.time.time
             if let scene = model.layers.first(where: { $0.kind == .precomp && $0.inPoint <= t && t < $0.outPoint && $0.name.hasPrefix("YB") }) {
@@ -418,6 +440,33 @@ enum UIDemo {
         }
     }
 
+    /// Screenshots of the launch animation and the Home window it settles into, at fixed times
+    /// after launch; then quits. Nothing is clicked.
+    static func runHome(outputDirectory: String, model currentModel: @escaping @MainActor () -> EditorModel?) {
+        Task { @MainActor in
+            let out = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            var last = 0.0
+            for t in [0.2, 0.5, 0.8, 1.1, 1.5, 1.9, 3.0] {
+                try? await Task.sleep(for: .seconds(t - last))
+                last = t
+                guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) else { continue }
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                p.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", out.appendingPathComponent(String(format: "home-%.1fs.png", t)).path]
+                try? p.run()
+                p.waitUntilExit()
+            }
+            print("ui-demo-home: recents \(RecentProjects.all().map(\.name))")
+            // What clicking the first recent card does (the card's tap calls this).
+            if let model = currentModel(), let first = RecentProjects.all().first {
+                model.openRecent(first)
+                print("ui-demo-home: after opening the first recent, home shown \(model.showHome), project \(model.displayName), comps \(model.compositions.count)")
+            }
+            exit(0)
+        }
+    }
+
     private static func findGestureView(in view: NSView?) -> TimelineGestureView? {
         guard let view else { return nil }
         if let v = view as? TimelineGestureView { return v }
@@ -447,11 +496,22 @@ enum UIDemo {
         return nil
     }
 
-    private static func event(_ type: NSEvent.EventType, _ view: NSView, _ p: CGPoint, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
+    private static func event(_ type: NSEvent.EventType, _ view: NSView, _ p: CGPoint, _ flags: NSEvent.ModifierFlags = [],
+                              clickCount: Int = 1) -> NSEvent {
         let w = view.convert(p, to: nil)
         return NSEvent.mouseEvent(with: type, location: w, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
                                   windowNumber: view.window!.windowNumber, context: nil, eventNumber: 0,
-                                  clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+                                  clickCount: clickCount, pressure: type == .leftMouseUp ? 0 : 1)!
+    }
+
+    /// Two clicks, the second with clickCount 2, as a real double-click (or trackpad double tap)
+    /// sends. Posted to the app's own event queue (not the system's), so they arrive exactly like
+    /// real input, NSApp.currentEvent included.
+    private static func doubleClick(_ view: NSView, at p: CGPoint) {
+        for n in 1...2 {
+            NSApp.postEvent(event(.leftMouseDown, view, p, clickCount: n), atStart: false)
+            NSApp.postEvent(event(.leftMouseUp, view, p, clickCount: n), atStart: false)
+        }
     }
 
     private static func click(_ view: NSView, at p: CGPoint, flags: NSEvent.ModifierFlags = []) {

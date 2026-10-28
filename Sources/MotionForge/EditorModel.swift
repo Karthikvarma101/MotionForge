@@ -90,6 +90,12 @@ final class EditorModel: ObservableObject {
     /// Playhead and timeline zoom per composition, restored when you come back to it.
     private var compMemory: [UInt64: (time: Double, zoom: Double, start: Double)] = [:]
     let viewport = TimelineViewport()
+    /// The Home window (launch animation, recent projects) covers the workspace until a project is
+    /// chosen. Scripted runs and file opens go straight to the workspace.
+    @Published var showHome: Bool
+    let skipLaunchAnimation: Bool
+    /// Whether the workspace has been shown (Home then offers to go back to it).
+    private(set) var hasOpenWork = false
     /// Video export (see ExportView.swift).
     @Published var showExportSheet = false
     @Published var exportStatus: ExportStatus?
@@ -159,6 +165,11 @@ final class EditorModel: ObservableObject {
             exit(1)
         }
         comp = engine.composition
+        let env = ProcessInfo.processInfo.environment
+        let scripted = ["MOTIONFORGE_UIDEMO", "MOTIONFORGE_SNAPSHOT", "MOTIONFORGE_OPEN"].contains { env[$0] != nil }
+        showHome = !scripted
+        skipLaunchAnimation = scripted || env["MOTIONFORGE_NO_SPLASH"] != nil
+        RecentProjects.importSystemRecentsIfEmpty()
         let defaults = UserDefaults.standard
         cachePolicy = MFCachePolicy(rawValue: defaults.integer(forKey: "cachePolicy")) ?? .smart
         let savedBudget = defaults.integer(forKey: "cacheBudgetMB")
@@ -701,6 +712,7 @@ final class EditorModel: ObservableObject {
         refresh()
         resetCompNavigation()
         RecoveryStore.clear()
+        enterWorkspace()
     }
 
     func openProjectPanel() {
@@ -722,6 +734,8 @@ final class EditorModel: ObservableObject {
             resetCompNavigation()
             RecoveryStore.clear()
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            RecentProjects.note(url, engine: engine)
+            enterWorkspace()
             let missing = assets.filter(\.missing).map(\.name)
             if !missing.isEmpty { alertMessage = "Missing media: " + missing.joined(separator: ", ") }
         } catch {
@@ -751,6 +765,7 @@ final class EditorModel: ObservableObject {
             projectURL = url
             RecoveryStore.clear()
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            RecentProjects.note(url, engine: engine, time: time.time)  // thumbnail of what you were looking at
             refresh()
             return true
         } catch {
@@ -855,6 +870,7 @@ final class EditorModel: ObservableObject {
 
     /// Editor shortcuts that must not fire while typing into a text field.
     private func handleKey(_ event: NSEvent) -> Bool {
+        if showHome { return false }  // the workspace is covered
         if let responder = event.window?.firstResponder, responder is NSText || responder is NSTextView { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control])
         if mods == [.command] && event.modifierFlags.contains(.shift) && event.keyCode == 126 {  // ⌘⇧↑
@@ -901,6 +917,40 @@ final class EditorModel: ObservableObject {
     // MARK: - Starter content
 
     /// A small animated scene so a fresh launch shows something to play with.
+    // MARK: - Home
+
+    func enterWorkspace() {
+        hasOpenWork = true
+        withAnimation(.easeInOut(duration: 0.3)) { showHome = false }
+    }
+
+    func openRecent(_ r: RecentProject) {
+        guard r.exists else {
+            alertMessage = "“\(r.name)” isn’t at \(r.path) any more."
+            return
+        }
+        if projectURL?.path == r.path, hasOpenWork {  // already open: just go back to it
+            enterWorkspace()
+            return
+        }
+        guard confirmDiscardChanges() else { return }
+        open(url: r.url)
+    }
+
+    /// The small animated scene a fresh launch starts with.
+    func showStarterScene() {
+        if projectURL != nil || engine.dirty {
+            guard confirmDiscardChanges() else { return }
+            seedStarterContent()
+            engine.markCleanForNewDocument()
+            projectURL = nil
+            time.time = 1
+            refresh()
+            resetCompNavigation()
+        }
+        enterWorkspace()
+    }
+
     private func seedStarterContent() {
         let e = engine
         e.newProject(withWidth: 1920, height: 1080, fps: 30, duration: 6)

@@ -539,6 +539,11 @@ struct MetalViewer: NSViewRepresentable {
             }
             // 2. Layers: ⌘ toggles, ⇧ adds, a plain click on an unselected layer selects only it.
             let hit = model.engine.hitTest(at: cp, time: t)
+            // Double-clicking a precomp opens it.
+            if event.clickCount == 2, hit != 0, let l = model.engine.layer(withID: hit), l.kind == .precomp {
+                model.openComposition(l.sourceCompID, fromLayer: l)
+                return
+            }
             if hit != 0 && !flags.contains(.option) {
                 if flags.contains(.command) {
                     model.selectLayer(hit, mode: .toggle)
