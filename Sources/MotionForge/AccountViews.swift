@@ -81,7 +81,7 @@ struct AccountCard: View {
                     .font(.system(size: 16))
                     .foregroundStyle(e.pro ? AnyShapeStyle(ForgeGlyph.gradient) : AnyShapeStyle(Color.secondary))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(e.pro ? (account.isGrantedPro ? "MotionForge Pro · Complimentary" : planName(e.planID)) : "Free plan")
+                    Text(e.pro ? (account.isTrial ? "MotionForge Pro · Free trial" : account.isGrantedPro ? "MotionForge Pro · Complimentary" : planName(e.planID)) : "Free plan")
                         .font(.system(size: 12, weight: .semibold))
                     Text(planDetail(e)).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
@@ -89,7 +89,7 @@ struct AccountCard: View {
             }
             .padding(10)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
-            if e.pro {
+            if e.pro && !account.isTrial {
                 if !account.isGrantedPro { Button("Manage Subscription…") { showPaywall() }.frame(maxWidth: .infinity) }
             } else {
                 Button { showPaywall() } label: {
@@ -102,6 +102,9 @@ struct AccountCard: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+            }
+            if !e.pro || account.isTrial {
+                FreeAccessOfferRow(offer: account.settings.offer, compact: true)
             }
             Divider()
             HStack {
@@ -126,8 +129,45 @@ struct AccountCard: View {
         }
         guard let end = e.currentEnd else { return account.isGrantedPro ? "Given to you — no end date" : "Active" }
         let date = end.formatted(date: .abbreviated, time: .omitted)
+        if account.isTrial { return "Trial ends \(date) — subscribe to keep exporting" }
         if account.isGrantedPro { return "Given to you until \(date)" }
         return e.cancelAtPeriodEnd ? "Ends \(date)" : "Renews \(date)"
+    }
+}
+
+/// The creator offer from the admin console, with a button that drafts the email.
+struct FreeAccessOfferRow: View {
+    let offer: FreeAccessOffer
+    var compact = false
+
+    var body: some View {
+        if offer.enabled {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Free access for creators", systemImage: "gift.fill")
+                    .font(.system(size: compact ? 11 : 12, weight: .semibold))
+                    .foregroundStyle(ForgeGlyph.gradient)
+                Text(offer.text).font(.system(size: compact ? 10 : 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button {
+                        if let url = offer.mailURL { NSWorkspace.shared.open(url) }
+                    } label: {
+                        Label("Email \(offer.email)", systemImage: "envelope")
+                    }
+                    .controlSize(.small)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(offer.email, forType: .string)
+                    } label: { Image(systemName: "doc.on.doc") }
+                    .controlSize(.small)
+                    .help("Copy the email address")
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color(red: 0.97, green: 0.78, blue: 0.4).opacity(0.25)))
+        }
     }
 }
 
@@ -200,12 +240,14 @@ struct PaywallSheet: View {
                 ForgeGlyph().frame(width: 34)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("MotionForge Pro").font(.system(size: 20, weight: .bold))
-                    Text("Exporting is part of Pro").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(account.settings.trialDays > 0 ? "Exporting is part of Pro · new accounts get \(account.settings.trialDays) days free"
+                                                        : "Exporting is part of Pro")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
                 AccountBadge(account: account, compact: true) {}
             }
-            if account.entitlement.pro {
+            if account.entitlement.pro && !account.isTrial {
                 activePlan
             } else {
                 choosePlan
@@ -218,13 +260,14 @@ struct PaywallSheet: View {
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
                 Spacer()
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
-                if !account.entitlement.pro { subscribeButton }
+                if !account.entitlement.pro || account.isTrial { subscribeButton }
             }
         }
         .padding(22)
         .frame(width: 520)
-        .onChange(of: account.entitlement.pro) { _, pro in
-            if pro {
+        // Paid Pro arriving (not the trial someone already had) closes the sheet and carries on.
+        .onChange(of: account.entitlement.pro && !account.isTrial) { _, paid in
+            if paid {
                 dismiss()
                 onPro()
             }
@@ -234,6 +277,14 @@ struct PaywallSheet: View {
 
     private var choosePlan: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if account.isTrial, let end = account.entitlement.currentEnd {
+                Label("Your free trial ends \(end.formatted(date: .long, time: .omitted)). Subscribe to keep exporting after that.",
+                      systemImage: "clock")
+                    .font(.system(size: 12, weight: .medium))
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.accent.opacity(0.12)))
+            }
             VStack(alignment: .leading, spacing: 6) {
                 feature("Export H.264, HEVC, ProRes 422 / 4444 and PNG sequences")
                 feature("Up to the composition's full size, with motion blur")
@@ -243,6 +294,7 @@ struct PaywallSheet: View {
             HStack(spacing: 12) {
                 ForEach(account.plans) { p in planCard(p) }
             }
+            FreeAccessOfferRow(offer: account.settings.offer)
             if account.awaitingPayment {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)

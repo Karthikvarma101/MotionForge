@@ -129,14 +129,28 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Sign-in:** *Sign in with Google* sits in the Home header and the editor toolbar.
   - **Signed in:** you get a round avatar (gold ring with Pro). Clicking it opens a card with your
     name, email and plan, *Get Pro* / *Manage Subscription*, *Check Subscription* and *Sign Out*.
-  - **Pro:** exporting needs MotionForge Pro, at ₹199 a month or ₹399 a year through Razorpay. Editing,
+  - **Pro:** exporting needs MotionForge Pro, at ₹199 a month or ₹499 a year through Razorpay. Editing,
     previewing and saving stay free.
+  - **Free trial:** every new account starts with 7 days of Pro free. It ends on its own and never charges.
+  - **Creators:** the Pro sheet, the account card and the website offer free access. One promotion reel gets
+    1 month, with 5,000+ followers required, up to 1 year depending on the audience. The **Email** button drafts
+    a message to karthikvarmaedu@gmail.com.
+  - **Changing them:** the trial length and offer text are set in the admin console.
   - **Paywall:** *Export* opens the Pro sheet until the subscription is active, and *File → MotionForge
     Pro…* opens it any time.
   - **Backend:** the Supabase project, its functions and the setup steps are in
     [supabase/README.md](supabase/README.md).
   - **Admin console:** customers, free Pro, cancellations, prices, the export switch and the Home announcement
     can all be managed at https://motionforge-admin.pages.dev ([admin/README.md](admin/README.md)).
+  - **Website:** https://motionforge-app.pages.dev (`site/`, static, Cloudflare Pages).
+    - It has the home page with the download link and live prices, plus `/privacy` and `/terms`.
+    - Google sign-in's branding links to these pages, and the Google app is published, so any Google account can
+      sign in.
+    - To redeploy, run this from `site/`:
+
+      ```bash
+      npx wrangler@3.114.0 pages deploy . --project-name motionforge-app --branch main
+      ```
   - **Picking up changes:** the app reads prices and settings when it comes to the front, at most every
     five minutes.
 - **Compositions and precomps**:

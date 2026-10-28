@@ -19,6 +19,7 @@ export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
 /** What a customer has, as one badge. */
 export function PlanBadge({ c }: { c: Customer }) {
   if (c.banned_until) return <Badge tone="blocked">Blocked</Badge>;
+  if (c.source === "trial") return <Badge tone="ok">Pro · trial</Badge>;
   if (c.source === "grant") return <Badge tone="grant">Pro · given</Badge>;
   if (c.source === "subscription") return <Badge tone="pro">Pro · {c.plan_id === "pro_yearly" ? "yearly" : "monthly"}</Badge>;
   if (c.status === "created") return <Badge tone="muted">Checkout started</Badge>;

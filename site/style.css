@@ -1,0 +1,81 @@
+/* MotionForge website — the editor's dark palette and the forge's amber gradient. */
+:root {
+  color-scheme: dark;
+  --bg: #111113;
+  --panel: #1b1b1e;
+  --line: #2a2a2f;
+  --text: #ececf0;
+  --text-2: #a8a8b2;
+  --text-3: #74747e;
+  --accent: #5b9dff;
+  --gold-1: #f2994a;
+  --gold-2: #f8d06b;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+img { max-width: 100%; height: auto; display: block; }
+.wrap { width: min(1080px, 100% - 32px); margin: 0 auto; }
+
+header.top { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+.logo { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-weight: 700; font-size: 18px; }
+.logo img { width: 32px; height: 32px; border-radius: 8px; }
+nav a { color: var(--text-2); text-decoration: none; margin-left: 20px; font-size: 14px; }
+nav a:hover { color: var(--text); }
+
+.hero { text-align: center; padding: 56px 0 28px; }
+.hero h1 { font-size: clamp(34px, 6vw, 60px); line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 16px; }
+.hero h1 span { background: linear-gradient(90deg, var(--gold-1), var(--gold-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p { color: var(--text-2); font-size: 19px; max-width: 640px; margin: 0 auto 28px; }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.button { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 999px; font-weight: 600; text-decoration: none; font-size: 15px; }
+.button.primary { background: linear-gradient(90deg, var(--gold-1), var(--gold-2)); color: #241300; }
+.button.secondary { border: 1px solid var(--line); color: var(--text); background: var(--panel); }
+.fine { color: var(--text-3); font-size: 13px; margin-top: 12px; }
+
+.shot { margin: 40px auto 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55); }
+
+section { padding: 64px 0 0; }
+section h2 { font-size: 28px; letter-spacing: -0.02em; margin: 0 0 8px; }
+section > .wrap > p.lead { color: var(--text-2); margin: 0 0 28px; max-width: 700px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.feature { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+.feature h3 { margin: 0 0 6px; font-size: 16px; }
+.feature p { margin: 0; color: var(--text-2); font-size: 14px; }
+.split { display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; align-items: center; }
+.split img { border-radius: 12px; border: 1px solid var(--line); }
+
+.plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.plan { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+.plan.pro { border-color: rgba(248, 208, 107, 0.45); background: linear-gradient(160deg, rgba(242, 153, 74, 0.1), var(--panel) 60%); }
+.plan h3 { margin: 0; font-size: 15px; color: var(--text-2); font-weight: 600; }
+.price { font-size: 36px; font-weight: 700; letter-spacing: -0.02em; margin: 6px 0 2px; }
+.price small { font-size: 15px; color: var(--text-2); font-weight: 500; }
+.plan ul { margin: 12px 0 0; padding-left: 18px; color: var(--text-2); font-size: 14px; }
+
+.offer { margin-top: 14px; display: flex; gap: 18px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+         background: var(--panel); border: 1px dashed rgba(248, 208, 107, 0.45); border-radius: 14px; padding: 18px 22px; }
+.offer[hidden] { display: none; }
+.offer h3 { margin: 0 0 4px; font-size: 16px; }
+.offer p { margin: 0; color: var(--text-2); font-size: 14px; max-width: 640px; }
+
+footer { margin-top: 80px; border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--text-3); font-size: 13px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+footer a { color: var(--text-2); margin-right: 16px; text-decoration: none; }
+
+/* legal pages */
+.doc { max-width: 760px; padding: 24px 0 0; }
+.doc h1 { font-size: 34px; letter-spacing: -0.02em; margin: 24px 0 4px; }
+.doc .updated { color: var(--text-3); font-size: 14px; margin-bottom: 28px; }
+.doc h2 { font-size: 20px; margin: 32px 0 8px; }
+.doc p, .doc li { color: #d6d6dc; }
+.doc ul { padding-left: 20px; }
+
+@media (max-width: 760px) {
+  nav a { margin-left: 12px; }
+  .split { grid-template-columns: 1fr; }
+  .hero { padding-top: 32px; }
+}

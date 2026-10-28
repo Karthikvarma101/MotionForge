@@ -1,7 +1,8 @@
 # MotionForge backend (Supabase + Razorpay)
 
-Google sign-in and **MotionForge Pro**: ₹199 / month or ₹399 / year through Razorpay Subscriptions. Exporting
-needs Pro; editing, previewing and saving stay free.
+Google sign-in and **MotionForge Pro**: ₹199 / month or ₹499 / year through Razorpay Subscriptions. Every new
+account gets 7 days of Pro free. Exporting needs Pro; editing, previewing and saving stay free. Creators can ask for
+free Pro (one promotion reel = 1 month, 5,000+ followers, up to 1 year), which admins give from the console.
 
 | Piece | What it does |
 |---|---|
@@ -10,6 +11,7 @@ needs Pro; editing, previewing and saving stay free.
 | `functions/subscription-status` | Re-reads the user's subscriptions from Razorpay and answers whether they're Pro; `{"action":"cancel"}` cancels at the end of the period |
 | `functions/razorpay-subscription-webhook` | Razorpay's server-to-server notices (signature-checked), so renewals and cancellations land even while the app is closed |
 | `migrations/20261028010000_admin_console.sql` | `admins`, `pro_grants` (free Pro), `app_config` (export switch, announcement), `admin_audit`, the sale price on each subscription; the entitlement counts grants |
+| `migrations/20261028020000_trial_and_creator_offer.sql` | A free Pro trial for every new account (trigger on `auth.users` → a `pro_grants` row with `granted_by = 'trial'`, length from `app_config.trial_days`); launch prices ₹199 / month and ₹499 / year; the `free_access_offer` setting |
 | `functions/admin-api` | Everything the [admin console](../admin/README.md) does, for admins only: customers, grants, cancellations, blocking, plans, settings, admins, the activity log |
 
 Live project: **MotionForge** (`hknpofgdsqqsnztriguy`, South Asia/Mumbai) in Karthikvarma101's Org. Steps 1–5 and

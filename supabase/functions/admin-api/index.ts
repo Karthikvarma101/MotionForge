@@ -123,7 +123,7 @@ function summarize(u: User, subs: SubRow[], grants: GrantRow[]) {
   return {
     ...profile(u),
     pro: !!paid || !!grant,
-    source: paid ? "subscription" : grant ? "grant" : null,
+    source: paid ? "subscription" : grant ? (grant.granted_by === "trial" ? "trial" : "grant") : null,
     plan_id: shown?.plan_id ?? null,
     status: shown?.status ?? null,
     current_end: shown?.current_end ?? null,
@@ -183,7 +183,8 @@ async function handle(db: SupabaseClient, me: string, action: string, a: Args) {
       const events = [
         ...users.map((u) => ({ at: u.created_at, kind: "signed_up", email: u.email ?? "" })),
         ...subs.map((s) => ({ at: s.created_at, kind: s.status === "created" ? "checkout_started" : "subscribed", email: users.find((u) => u.id === s.user_id)?.email ?? "", plan_id: s.plan_id })),
-        ...grants.map((g) => ({ at: g.created_at, kind: "pro_granted", email: users.find((u) => u.id === g.user_id)?.email ?? "", by: g.granted_by })),
+        ...grants.map((g) => ({ at: g.created_at, kind: g.granted_by === "trial" ? "pro_trial" : "pro_granted",
+          email: users.find((u) => u.id === g.user_id)?.email ?? "", by: g.granted_by === "trial" ? undefined : g.granted_by })),
       ].sort((x, y) => y.at.localeCompare(x.at)).slice(0, 12);
       const cancelled = subs.filter((s) => s.cancel_at_period_end || s.status === "cancelled").map((s) => s.updated_at);
       const { data: cfgRows } = await db.from("app_config").select("key,value");
@@ -192,6 +193,7 @@ async function handle(db: SupabaseClient, me: string, action: string, a: Args) {
         pro: list.filter((c) => c.pro).length,
         pro_paid: list.filter((c) => c.source === "subscription").length,
         pro_granted: list.filter((c) => c.source === "grant").length,
+        on_trial: list.filter((c) => c.source === "trial").length,
         blocked: list.filter((c) => c.banned_until).length,
         active_7d: users.filter((u) => u.last_sign_in_at && now() - Date.parse(u.last_sign_in_at) < 7 * 86_400_000).length,
         by_plan: byPlan,
@@ -340,9 +342,16 @@ async function handle(db: SupabaseClient, me: string, action: string, a: Args) {
 
     case "set_config": {
       const key = str(a.key, "key");
-      if (!["export_requires_pro", "announcement"].includes(key)) throw new Fail("unknown_setting");
+      if (!["export_requires_pro", "announcement", "trial_days", "free_access_offer"].includes(key)) throw new Fail("unknown_setting");
       const value = a.value;
       if (key === "export_requires_pro" && typeof value !== "boolean") throw new Fail("bad_value");
+      if (key === "trial_days" && !(Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 365)) throw new Fail("bad_trial_days");
+      if (key === "free_access_offer") {
+        const v = value as { enabled?: unknown; email?: unknown; text?: unknown };
+        if (typeof v?.enabled !== "boolean" || typeof v.text !== "string" || typeof v.email !== "string") throw new Fail("bad_value");
+        if (v.text.length > 500) throw new Fail("offer_too_long");
+        if (v.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v.email)) throw new Fail("bad_email");
+      }
       if (key === "announcement") {
         const v = value as { text?: unknown; style?: unknown };
         if (typeof v?.text !== "string" || !["info", "success", "warning"].includes(String(v.style))) throw new Fail("bad_value");

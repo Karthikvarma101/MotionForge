@@ -42,7 +42,7 @@ struct ProPlan: Identifiable, Hashable, Codable {
     var period: String { yearly ? "/year" : "/month" }
 
     static let monthly = ProPlan(id: "pro_monthly", title: "Monthly", amountPaise: 19900, yearly: false)
-    static let yearly = ProPlan(id: "pro_yearly", title: "Yearly", amountPaise: 39900, yearly: true)
+    static let yearly = ProPlan(id: "pro_yearly", title: "Yearly", amountPaise: 49900, yearly: true)
     static let builtIn = withSavings([monthly, yearly])
 
     /// "Save 83% vs monthly" on yearly plans, against the cheapest monthly one.
@@ -62,6 +62,27 @@ struct AppSettings: Codable, Equatable {
     var exportRequiresPro = true
     var announcement = ""
     var announcementStyle = "info"   // info | success | warning
+    var trialDays = 7                // Pro for this long after signing up; 0 = no trial
+    var offer = FreeAccessOffer()
+}
+
+/// "Free access for creators": promote MotionForge, get Pro free (granted from the admin console).
+struct FreeAccessOffer: Codable, Equatable {
+    var enabled = true
+    var email = "karthikvarmaedu@gmail.com"
+    var text = "Post one reel promoting MotionForge and get 1 month of Pro free. You need at least 5,000 followers — "
+        + "the bigger your audience, the longer the free access, up to 1 year."
+
+    /// A ready-to-send email asking for free access.
+    var mailURL: URL? {
+        var c = URLComponents()
+        c.scheme = "mailto"
+        c.path = email
+        c.queryItems = [URLQueryItem(name: "subject", value: "MotionForge free access for creators"),
+                        URLQueryItem(name: "body", value: "Hi! I'd like free MotionForge Pro for a promotion reel.\n\n"
+                                     + "My profile: \nFollowers: \nMotionForge account email: \n")]
+        return c.url
+    }
 }
 
 /// The signed-in user (Google, through Supabase Auth) and whether they have MotionForge Pro, which exporting needs.
@@ -171,6 +192,13 @@ final class AccountModel: NSObject, ObservableObject {
             for r in rows {
                 switch r["key"] as? String {
                 case "export_requires_pro": s.exportRequiresPro = r["value"] as? Bool ?? true
+                case "trial_days": s.trialDays = r["value"] as? Int ?? 7
+                case "free_access_offer":
+                    if let v = r["value"] as? [String: Any] {
+                        s.offer.enabled = v["enabled"] as? Bool ?? true
+                        if let e = v["email"] as? String, !e.isEmpty { s.offer.email = e }
+                        if let t = v["text"] as? String, !t.isEmpty { s.offer.text = t }
+                    }
                 case "announcement":
                     let v = r["value"] as? [String: Any]
                     s.announcement = v?["text"] as? String ?? ""
@@ -185,6 +213,8 @@ final class AccountModel: NSObject, ObservableObject {
 
     /// Pro given from the admin console rather than bought.
     var isGrantedPro: Bool { entitlement.status == "granted" }
+    /// Pro from the free trial every new account starts with.
+    var isTrial: Bool { entitlement.status == "trial" }
 
     // MARK: - Google sign-in (Supabase Auth, PKCE, in a system browser sheet)
 

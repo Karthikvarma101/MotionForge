@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MotionForge — motion graphics for Apple silicon</title>
+  <meta name="description" content="MotionForge is a native motion-graphics and compositing app for Apple-silicon Macs: keyframes, text animators, effects, masks, audio and hardware export." />
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="top wrap">
+    <a class="logo" href="/"><img src="/assets/icon.png" alt="" />MotionForge</a>
+    <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="https://github.com/Karthikvarma101/MotionForge">GitHub</a></nav>
+  </header>
+
+  <main>
+    <div class="hero wrap">
+      <h1>Motion graphics,<br /><span>native to your Mac.</span></h1>
+      <p>MotionForge is a fast, native animation and compositing app for Apple silicon — keyframes, text animators,
+        effects, masks, audio and hardware-encoded export, built on Metal.</p>
+      <div class="cta">
+        <a class="button primary" href="https://github.com/Karthikvarma101/MotionForge/releases/latest">Download for Mac</a>
+        <a class="button secondary" href="https://github.com/Karthikvarma101/MotionForge">View the source</a>
+      </div>
+      <div class="fine">Apple-silicon Mac (M1 or later) · macOS 26 or later · free to edit, Pro to export</div>
+      <img class="shot" src="/assets/screenshot.jpg" width="1800" height="1085"
+           alt="The MotionForge editor: the viewer with an animated title, the layer timeline with keyframes, and the text animator inspector" />
+    </div>
+
+    <section id="features">
+      <div class="wrap">
+        <h2>Everything a motion piece needs</h2>
+        <p class="lead">Built from the ground up for the GPU in your Mac, so previews play in real time and exports use the hardware encoders.</p>
+        <div class="grid">
+          <div class="feature"><h3>Layers that move</h3><p>Shapes, images, text, pen-tool paths, nulls and parenting, precomps with time remapping.</p></div>
+          <div class="feature"><h3>Animation tools</h3><p>Keyframes with easing, bezier motion paths, a graph editor with speed handles and ready-made presets.</p></div>
+          <div class="feature"><h3>Text animators</h3><p>Animate characters, words or lines — typewriters, staggers and pop-ins with range selectors.</p></div>
+          <div class="feature"><h3>Effects and mattes</h3><p>GPU blur, glow, drop shadow and colour; masks, track mattes, blend modes and motion blur.</p></div>
+          <div class="feature"><h3>Audio</h3><p>Voice-overs and music on the timeline with waveforms and animatable levels, mixed into every export.</p></div>
+          <div class="feature"><h3>Export</h3><p>H.264, HEVC, ProRes 422 / 4444 with alpha or PNG sequences, rendered in the background while you keep working.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap split">
+        <div>
+          <h2>Precise when you need it</h2>
+          <p class="lead">Shape every move in the graph editor, scrub any value, and see exactly what the renderer is doing —
+            GPU time, frame cache and preview resolution are always on screen.</p>
+        </div>
+        <img src="/assets/graph-editor.jpg" width="1200" height="723" alt="The MotionForge graph editor with eased value curves" loading="lazy" />
+      </div>
+    </section>
+
+    <section id="pricing">
+      <div class="wrap">
+        <h2>Pricing</h2>
+        <p class="lead">Edit, preview and save for free. <strong id="trial-line">Every new account gets 1 week of Pro free</strong> — after that,
+          MotionForge Pro adds exporting. Payments by Razorpay (UPI autopay or card); cancel any time.</p>
+        <div class="plans" id="plans">
+          <div class="plan">
+            <h3>Free</h3>
+            <div class="price">₹0</div>
+            <ul><li>Every editing tool</li><li>Real-time preview</li><li>Save and open projects</li></ul>
+          </div>
+          <div class="plan pro" data-plan="pro_monthly">
+            <h3>Pro · Monthly</h3>
+            <div class="price"><span class="amount">—</span> <small>/ month</small></div>
+            <ul><li>Everything in Free</li><li>Export video and image sequences</li><li>Audio in exports</li></ul>
+          </div>
+          <div class="plan pro" data-plan="pro_yearly">
+            <h3>Pro · Yearly</h3>
+            <div class="price"><span class="amount">—</span> <small>/ year</small></div>
+            <ul><li>Everything in Pro Monthly</li><li class="saving">Billed once a year</li></ul>
+          </div>
+        </div>
+        <div class="offer" id="offer" hidden>
+          <div>
+            <h3>🎁 Free access for creators</h3>
+            <p id="offer-text"></p>
+          </div>
+          <a class="button secondary" id="offer-mail" href="mailto:karthikvarmaedu@gmail.com">Email us</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div><a href="/privacy">Privacy policy</a><a href="/terms">Terms of service</a><a href="mailto:karthikvarmaedu@gmail.com">Contact</a></div>
+      <div>© 2026 MotionForge</div>
+    </div>
+  </footer>
+
+  <script>
+    // Current prices, as set in the MotionForge admin console (read-only public data).
+    fetch("https://hknpofgdsqqsnztriguy.supabase.co/rest/v1/plans?select=id,amount_paise,period,active&active=eq.true", {
+      headers: { apikey: "sb_publishable_TJ1my7LWwC18zgnKHEXMZA_lKdBmSBC" },
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((plans) => {
+        const rupees = (p) => "₹" + (p / 100).toLocaleString("en-IN", { maximumFractionDigits: p % 100 ? 2 : 0 });
+        const monthly = plans.find((p) => p.period === "monthly");
+        for (const card of document.querySelectorAll("[data-plan]")) {
+          const plan = plans.find((p) => p.id === card.dataset.plan);
+          if (!plan) { card.remove(); continue; }
+          card.querySelector(".amount").textContent = rupees(plan.amount_paise);
+          if (plan.period === "yearly" && monthly) {
+            const saving = Math.round((1 - plan.amount_paise / (monthly.amount_paise * 12)) * 100);
+            if (saving >= 5) card.querySelector(".saving").textContent = `Save ${saving}% vs monthly`;
+          }
+        }
+      })
+      .catch(() => {});
+
+    // The free trial and the creator offer, as set in the admin console.
+    fetch("https://hknpofgdsqqsnztriguy.supabase.co/rest/v1/app_config?select=key,value&key=in.(trial_days,free_access_offer)", {
+      headers: { apikey: "sb_publishable_TJ1my7LWwC18zgnKHEXMZA_lKdBmSBC" },
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        const get = (k) => rows.find((r) => r.key === k)?.value;
+        const days = get("trial_days");
+        const line = document.getElementById("trial-line");
+        if (days === 0) line.remove();
+        else if (typeof days === "number") line.textContent = days === 7 ? "Every new account gets 1 week of Pro free" : `Every new account gets ${days} days of Pro free`;
+        const offer = get("free_access_offer");
+        if (offer?.enabled && offer.text) {
+          document.getElementById("offer-text").textContent = offer.text;
+          const mail = document.getElementById("offer-mail");
+          const subject = encodeURIComponent("MotionForge free access for creators");
+          const body = encodeURIComponent("Hi! I'd like free MotionForge Pro for a promotion reel.\n\nMy profile: \nFollowers: \nMotionForge account email: \n");
+          mail.href = `mailto:${offer.email}?subject=${subject}&body=${body}`;
+          mail.textContent = `Email ${offer.email}`;
+          document.getElementById("offer").hidden = false;
+        }
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>

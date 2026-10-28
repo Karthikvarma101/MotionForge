@@ -9,7 +9,7 @@ checks that on every action; the page itself holds no secrets.
 | **Overview** | Monthly recurring revenue, customers, Pro (paying / given), plan counts, 30-day sign-ups / subscriptions / cancellations, recent activity |
 | **Customers** | Search and filter (All / Pro / Free / Blocked). For one customer: give free Pro for 7 days to forever and revoke it; sync or cancel a subscription (at period end or right away); see Razorpay payments; block, unblock or delete the account |
 | **Plans & prices** | Change the monthly / yearly price, rename a plan, take it off sale. New checkouts use the new price; current subscribers keep theirs |
-| **App settings** | Make exporting free for everyone (or require Pro again); publish an announcement on the app's Home window |
+| **App settings** | Free-trial length for new accounts (7 days; 0 turns it off); the "Free access for creators" offer (on/off, contact email, text) shown in the app and on the website; make exporting free for everyone; publish an announcement on the app's Home window |
 | **Admins** | Add or remove admin Google accounts |
 | **Activity** | Every change made from the console: who, what, to whom |
 

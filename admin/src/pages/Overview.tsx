@@ -3,7 +3,7 @@ import { ago, api, explain, planName, rupees, type Overview as Data } from "../a
 import { DailyBars, Empty, ErrorNote, Section, StatTile } from "../components/ui";
 
 const EVENTS: Record<string, string> = {
-  signed_up: "signed up", subscribed: "subscribed", checkout_started: "started a checkout", pro_granted: "was given Pro",
+  signed_up: "signed up", subscribed: "subscribed", checkout_started: "started a checkout", pro_granted: "was given Pro", pro_trial: "started the free trial",
 };
 
 export function Overview({ go }: { go: (page: string) => void }) {
@@ -37,7 +37,7 @@ export function Overview({ go }: { go: (page: string) => void }) {
       </div>
       <div className="tiles">
         <StatTile label="Customers" value={data.customers.toLocaleString("en-IN")} detail={`${data.active_7d} signed in this week`} />
-        <StatTile label="Pro" value={data.pro} detail={`${data.pro_paid} paying · ${data.pro_granted} given`} />
+        <StatTile label="Pro" value={data.pro} detail={`${data.pro_paid} paying · ${data.pro_granted} given · ${data.on_trial ?? 0} on trial`} />
         <StatTile label="Monthly plans" value={data.by_plan.pro_monthly ?? 0} detail="renewing" />
         <StatTile label="Yearly plans" value={data.by_plan.pro_yearly ?? 0} detail="renewing" />
         <StatTile label="Blocked" value={data.blocked} detail="can't sign in" />

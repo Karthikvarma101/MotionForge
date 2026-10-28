@@ -108,6 +108,9 @@ export function explain(e: unknown): string {
     bad_amount: "Prices must be between ₹1 and ₹1,00,000.",
     bad_days: "Choose a length between 1 day and 100 years.",
     announcement_too_long: "Announcements can be at most 280 characters.",
+    bad_trial_days: "The trial can be 0 to 365 days.",
+    offer_too_long: "The offer text can be at most 500 characters.",
+    bad_email: "That email address doesn't look right.",
   };
   return known[code] ?? code;
 }
@@ -116,7 +119,7 @@ export function explain(e: unknown): string {
 
 export interface Customer {
   id: string; email: string; name: string; avatar_url: string | null; created_at: string; last_sign_in_at: string | null;
-  banned_until: string | null; providers: string[]; pro: boolean; source: "subscription" | "grant" | null; plan_id: string | null;
+  banned_until: string | null; providers: string[]; pro: boolean; source: "subscription" | "grant" | "trial" | null; plan_id: string | null;
   status: string | null; current_end: string | null; cancel_at_period_end: boolean; grant_until: string | null; subscriptions: number;
 }
 export interface Subscription {
@@ -129,7 +132,7 @@ export interface Invoice { id: string; subscription: string; amount_paise: numbe
 export interface Plan { id: string; name: string; amount_paise: number; period: "monthly" | "yearly"; razorpay_plan_id: string | null; razorpay_mode: string | null; active: boolean }
 export interface DayCount { day: string; count: number }
 export interface Overview {
-  customers: number; pro: number; pro_paid: number; pro_granted: number; blocked: number; active_7d: number;
+  customers: number; pro: number; pro_paid: number; pro_granted: number; on_trial: number; blocked: number; active_7d: number;
   by_plan: Record<string, number>; mrr_paise: number; signups: DayCount[]; subscriptions_started: DayCount[];
   cancellations: DayCount[]; recent: { at: string; kind: string; email: string; plan_id?: string; by?: string }[];
   payments_configured: boolean; config: Record<string, unknown>;

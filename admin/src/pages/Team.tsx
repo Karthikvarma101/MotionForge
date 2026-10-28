@@ -92,7 +92,8 @@ function describe(r: AuditEntry): string {
     case "update_plan": {
       const b = d.before ?? {}, a = d.after ?? {};
       const parts: string[] = [];
-      if (a.amount_paise != null && a.amount_paise !== b.amount_paise) parts.push(`${rupees(b.amount_paise)} → ${rupees(a.amount_paise)}`);
+      if (a.amount_paise != null && a.amount_paise !== b.amount_paise)
+        parts.push(b.amount_paise != null ? `${rupees(b.amount_paise)} → ${rupees(a.amount_paise)}` : `set to ${rupees(a.amount_paise)}`);
       if (a.active != null && a.active !== b.active) parts.push(a.active ? "put on sale" : "taken off sale");
       if (a.name && a.name !== b.name) parts.push(`renamed “${a.name}”`);
       return parts.join(", ") || "no change";
@@ -100,6 +101,8 @@ function describe(r: AuditEntry): string {
     case "set_config":
       if (r.target === "export_requires_pro") return d.value ? "Exporting needs Pro" : "Exporting free for everyone";
       if (r.target === "announcement") return d.value?.text ? `“${d.value.text}”` : "announcement cleared";
+      if (r.target === "trial_days") return d.value ? `free trial: ${d.value} days` : "free trial off";
+      if (r.target === "free_access_offer") return d.value?.enabled ? `creator offer on (${d.value.email})` : "creator offer off";
       return JSON.stringify(d.value);
     case "delete_user":
       return d.email ?? "";

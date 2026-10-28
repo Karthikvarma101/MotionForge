@@ -106,13 +106,15 @@ Deno.serve(async (req) => {
 
   // Complimentary Pro from the admin console counts too (a paid subscription is reported first).
   const nowIso = new Date().toISOString();
-  const { data: grants } = await admin.from("pro_grants").select("until,reason").eq("user_id", user.id).is("revoked_at", null)
+  const { data: grants } = await admin.from("pro_grants").select("until,reason,granted_by").eq("user_id", user.id).is("revoked_at", null)
     .or(`until.is.null,until.gt.${nowIso}`).order("until", { ascending: false, nullsFirst: true }).limit(1);
   const grant = grants?.[0];
   const best = rows.find(paid);
   if (!best && grant) {
+    // The sign-up trial is a grant too; the app shows it as a trial with its end date.
     return json({
-      pro: true, plan_id: "grant", status: "granted", current_end: grant.until ?? null, cancel_at_period_end: false,
+      pro: true, plan_id: "grant", status: grant.granted_by === "trial" ? "trial" : "granted", current_end: grant.until ?? null,
+      cancel_at_period_end: false,
       grant_reason: grant.reason ?? null, payments_configured: !!cfg,
     });
   }

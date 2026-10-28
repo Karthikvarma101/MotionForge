@@ -3,13 +3,17 @@ import { ago, api, date, explain, type Customer } from "../api";
 import { Avatar, Empty, ErrorNote, PlanBadge } from "../components/ui";
 import { CustomerPanel } from "./CustomerPanel";
 
-const FILTERS = [["all", "All"], ["pro", "Pro"], ["free", "Free"], ["blocked", "Blocked"]] as const;
+const FILTERS = [["all", "All"], ["pro", "Pro"], ["trial", "Trial"], ["free", "Free"], ["blocked", "Blocked"]] as const;
+type Filter = (typeof FILTERS)[number][0];
+const matches = (c: Customer, f: Filter) =>
+  f === "all" || (f === "pro" && c.pro && c.source !== "trial") || (f === "trial" && c.source === "trial") ||
+  (f === "free" && !c.pro) || (f === "blocked" && !!c.banned_until);
 
 export function Customers() {
   const [all, setAll] = useState<Customer[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<(typeof FILTERS)[number][0]>("all");
+  const [filter, setFilter] = useState<Filter>("all");
   const [open, setOpen] = useState<string | null>(null);
 
   const load = () => api<{ customers: Customer[] }>("customers").then((r) => setAll(r.customers), (e) => setError(explain(e)));
@@ -18,8 +22,7 @@ export function Customers() {
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
     return (all ?? []).filter((c) =>
-      (!q || c.email.toLowerCase().includes(q) || c.name.toLowerCase().includes(q) || c.id === q) &&
-      (filter === "all" || (filter === "pro" && c.pro) || (filter === "free" && !c.pro) || (filter === "blocked" && !!c.banned_until)));
+      (!q || c.email.toLowerCase().includes(q) || c.name.toLowerCase().includes(q) || c.id === q) && matches(c, filter));
   }, [all, search, filter]);
 
   return (
@@ -29,7 +32,7 @@ export function Customers() {
         <div className="segmented">
           {FILTERS.map(([k, label]) => (
             <button key={k} className={filter === k ? "on" : ""} onClick={() => setFilter(k)}>
-              {label}{all && <span className="count">{k === "all" ? all.length : all.filter((c) => (k === "pro" ? c.pro : k === "free" ? !c.pro : !!c.banned_until)).length}</span>}
+              {label}{all && <span className="count">{all.filter((c) => matches(c, k)).length}</span>}
             </button>
           ))}
         </div>
@@ -55,7 +58,7 @@ export function Customers() {
                     </div>
                   </td>
                   <td><PlanBadge c={c} /></td>
-                  <td>{c.source === "grant" ? (c.grant_until ? date(c.grant_until) : "no end") : c.pro ? `${c.cancel_at_period_end ? "ends" : "renews"} ${date(c.current_end)}` : "—"}</td>
+                  <td>{c.source === "grant" || c.source === "trial" ? (c.grant_until ? `${c.source === "trial" ? "trial ends" : "until"} ${date(c.grant_until)}` : "no end") : c.pro ? `${c.cancel_at_period_end ? "ends" : "renews"} ${date(c.current_end)}` : "—"}</td>
                   <td>{date(c.created_at)}</td>
                   <td>{ago(c.last_sign_in_at)}</td>
                 </tr>
