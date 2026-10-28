@@ -129,13 +129,29 @@ per layer. They are not a comparison with any other application — no such benc
 Measured during Phase 3:
 - **Effect-layer encode cost**: the first version allocated an instance buffer per offscreen pass.
   One sub-allocated buffer per frame cut CPU encode by 24–55% (100 blurred layers 2.32 → 1.78 ms;
-  50 mattes 1.92 → 0.86 ms).
-- **Mask-free pipelines**: adding the mask loop to every fragment shader cost plain shape scenes
-  8–20% on the GPU. Pipelines are now specialised with a Metal function constant, so unmasked
-  layers skip it: 1,000 shapes is back within 3% of Phase 1 (2.32 vs 2.24 ms). The 5,000-shape
-  case is still 13% slower than the Phase 1 run (12.7 vs 11.2 ms, reproducible). There was no
-  version control to A/B the two builds, so I can't yet say whether that comes from the shader
-  changes or from different machine conditions.
+  50 mattes 1.92 → 0.86 ms). These are CPU timings from consecutive runs, so they're less exposed to
+  the GPU clock drift described below.
+- **Mask-free pipelines**: pipelines are specialised with a Metal function constant so layers
+  without masks skip the mask code. An interleaved A/B (below) puts the unspecialised mask shader
+  at +3.5–4.0% GPU time for plain shapes; the specialised one is within ±1% of the Phase 1 shader.
+
+### Comparing performance between builds
+
+Absolute GPU times on this MacBook drift with recent load: the same 5,000-shape frames measured
+13.1, 13.9 and 15.1 ms in three back-to-back runs (no thermal warning recorded, AC power, Low Power
+Mode off), and 11.2 ms in the Phase 1 session. Numbers from different runs or sessions are
+therefore not comparable. Phase 3 first looked 13% slower than Phase 1 at 5,000 shapes; the A/B
+showed that was the machine, not the code. To compare builds, run them interleaved:
+
+```bash
+benchmarks/ab/run.sh --layers 5000 --frames 240
+```
+
+[benchmarks/ab/shader_ab.mm](benchmarks/ab/shader_ab.mm) renders identical frames through the Phase 1
+shader, the current shader and the unspecialised mask shader, rotating the order every frame.
+Result on the M5, 3 runs: current vs Phase 1 −0.8%, −0.7%, +0.1% (5,000 shapes) and −0.3%
+(1,000 shapes). With git in place, whole builds can now be compared the same way, by building two
+commits and alternating their benchmark runs.
 
 ## Project layout
 
@@ -173,7 +189,7 @@ MotionForge/
 │   ├── mftests/               test runner (core + GPU readback)
 │   ├── mfbench/               renderer benchmark
 │   └── mfcli/                 headless tool: info, render PNG, PNG sequence, demo, effects-demo
-├── benchmarks/                benchmark results
+├── benchmarks/                benchmark results; ab/ = interleaved shader A/B harness
 ├── Examples/demo/             position/scale/opacity demo renders + demo.mfproj
 ├── Examples/effects/          effects / mask / matte contact sheet
 └── docs/ARCHITECTURE.md       design notes (threading, memory, caching, colour, file format)
