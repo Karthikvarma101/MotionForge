@@ -1,0 +1,6 @@
+// Only the Objective-C bridge is exposed to Swift. The C++ renderer header next to it
+// (MFRender/MetalRenderer.hpp) stays on the include path for the Objective-C++ tools.
+module MFRender {
+    header "MFEngine.h"
+    export *
+}

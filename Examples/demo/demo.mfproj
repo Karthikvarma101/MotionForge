@@ -1,0 +1,73 @@
+{
+  "format": "motionforge.project",
+  "version": 2,
+  "generator": "MotionForge 0.1",
+  "nextId": 3,
+  "activeComposition": 1,
+  "assets": [],
+  "compositions": [
+    {
+      "id": 1,
+      "name": "Demo",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "duration": 5,
+      "background": [0.07, 0.075, 0.09, 1],
+      "layers": [
+        {
+          "id": 2,
+          "name": "Box",
+          "kind": "shape",
+          "shape": "rectangle",
+          "blend": "normal",
+          "visible": true,
+          "fillEnabled": true,
+          "strokeEnabled": false,
+          "in": 0,
+          "out": 5,
+          "parent": 0,
+          "asset": 0,
+          "properties": {
+            "anchorPoint": {
+              "value": [0, 0]
+            },
+            "position": {
+              "value": [1400, 300]
+            },
+            "scale": {
+              "value": [150, 150]
+            },
+            "rotation": {
+              "value": [0]
+            },
+            "opacity": {
+              "value": [40]
+            },
+            "size": {
+              "value": [400, 240]
+            },
+            "roundness": {
+              "value": [40]
+            },
+            "fillColor": {
+              "value": [0.33, 0.62, 1, 1]
+            },
+            "strokeColor": {
+              "value": [1, 1, 1, 1]
+            },
+            "strokeWidth": {
+              "value": [8]
+            },
+            "points": {
+              "value": [5]
+            },
+            "innerRatio": {
+              "value": [0.45]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

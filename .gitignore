@@ -1,0 +1,5 @@
+.build/
+build/
+.swiftpm/
+*.mfproj.tmp
+.DS_Store
