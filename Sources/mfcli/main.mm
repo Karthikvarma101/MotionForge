@@ -6,6 +6,7 @@
 //   mfcli demo   <out-dir>     builds a project, edits position / scale / opacity, renders each
 //                              state, measures the pixels and writes a side-by-side sheet
 //   mfcli effects-demo <out-dir>   one tile per effect, mask and track matte, as a contact sheet
+//   mfcli phase4-demo <out-dir>    text, text animators, bezier shapes, trim paths, bezier masks, presets
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreText/CoreText.h>
 #import <Foundation/Foundation.h>
@@ -18,7 +19,13 @@
 #include <string>
 #include <vector>
 
+#include <algorithm>
+#include <chrono>
+
 #include "MFEngine.h"
+#include "MFRender/MetalRenderer.hpp"
+#include "mf/Evaluator.hpp"
+#include "mf/ProjectIO.hpp"
 
 namespace {
 
@@ -26,10 +33,12 @@ int usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  mfcli info   <project.mfproj>\n"
-                 "  mfcli render <project.mfproj> <out.png> [--time S] [--scale F] [--transparent]\n"
-                 "  mfcli frames <project.mfproj> <out-dir> [--from S] [--to S] [--scale F]\n"
+                 "  mfcli render <project.mfproj> <out.png> [--time S] [--scale F] [--transparent] [--no-motion-blur]\n"
+                 "  mfcli frames <project.mfproj> <out-dir> [--from S] [--to S] [--scale F] [--no-motion-blur]\n"
+                 "  mfcli time   <project.mfproj> [--from S] [--to S] [--step S] [--scale F]   (CPU evaluate + GPU render per frame)\n"
                  "  mfcli demo   <out-dir>\n"
-                 "  mfcli effects-demo <out-dir>\n");
+                 "  mfcli effects-demo <out-dir>\n"
+                 "  mfcli phase4-demo <out-dir>\n");
     return 64;
 }
 
@@ -134,6 +143,7 @@ int cmdRender(int argc, const char* argv[]) {
     MFEngine* e = openProject(argv[2]);
     if (!e) return 1;
     NSError* error = nil;
+    e.renderMotionBlur = !argFlag(argc, argv, "--no-motion-blur");
     const double t = argDouble(argc, argv, "--time", 0), scale = argDouble(argc, argv, "--scale", 1);
     if (![e writePNGAtTime:t scale:scale transparent:argFlag(argc, argv, "--transparent") toPath:@(argv[3]) error:&error]) {
         std::fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
@@ -143,10 +153,83 @@ int cmdRender(int argc, const char* argv[]) {
     return 0;
 }
 
+// Per-frame cost of a real project, measured (not estimated): CPU evaluation of the timeline,
+// GPU time of the composite, with and without the composition's motion blur.
+int cmdTime(int argc, const char* argv[]) {
+    using clock = std::chrono::steady_clock;
+    mf::Project p;
+    std::string err;
+    const auto tl0 = clock::now();
+    if (!mf::loadProjectFile(argv[2], p, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    const double loadMs = std::chrono::duration<double, std::milli>(clock::now() - tl0).count();
+    const mf::Composition* c = p.activeComp();
+    if (!c) return 1;
+    auto r = mf::MetalRenderer::create(nil, err);
+    if (!r) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    for (const mf::Asset& a : p.assets)
+        if (!a.missing && !r->loadImageSync(a.id, a.generation, a.path, err)) std::fprintf(stderr, "media: %s\n", err.c_str());
+    size_t layers = 0;
+    for (const mf::Composition& k : p.compositions) layers += k.layers.size();
+    const double from = argDouble(argc, argv, "--from", 0), to = argDouble(argc, argv, "--to", c->duration);
+    const double step = argDouble(argc, argv, "--step", 1.0), scale = argDouble(argc, argv, "--scale", 1);
+    std::vector<double> eval, gpu, items, blurGpu;
+    const std::vector<double> offs = mf::motionBlurOffsets(p, *c);
+    std::vector<float> px;
+    for (double t = from; t < to; t += step) {
+        const auto t0 = clock::now();
+        const mf::FrameDesc f = mf::evaluateFrame(p, *c, t, scale);
+        eval.push_back(std::chrono::duration<double, std::milli>(clock::now() - t0).count());
+        size_t n = 0;
+        std::function<void(const mf::FrameDesc&)> count = [&](const mf::FrameDesc& d) {
+            for (const mf::DrawItem& it : d.items) {
+                ++n;
+                if (it.nested) count(*it.nested);
+            }
+        };
+        count(f);
+        items.push_back(double(n));
+        double g = 0;
+        if (!r->renderToRGBA(f, px, &g, err)) std::fprintf(stderr, "t=%.2f: %s\n", t, err.c_str());
+        gpu.push_back(g);
+        if (offs.size() > 1) {  // same rule as the exporter: identical subframes render once
+            std::vector<mf::FrameDesc> fs;
+            for (double o : offs) fs.push_back(mf::evaluateFrame(p, *c, t, scale, nullptr, o));
+            const bool still = std::all_of(fs.begin(), fs.end(), [&](const mf::FrameDesc& x) { return x.hash == fs[0].hash; });
+            double sum = 0;
+            for (size_t k = 0; k < (still ? 1 : fs.size()); ++k) {
+                double gb = 0;
+                r->renderToRGBA(fs[k], px, &gb, err);
+                sum += gb;
+            }
+            blurGpu.push_back(sum);
+        }
+    }
+    auto stat = [](std::vector<double> v, double q) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[std::min(v.size() - 1, size_t(q * double(v.size())))];
+    };
+    std::printf("%s: %zu compositions, %zu layers, loaded in %.0f ms; %zu frames sampled (%g s apart) at %.0f%%\n",
+                c->name.c_str(), p.compositions.size(), layers, loadMs, eval.size(), step, scale * 100);
+    std::printf("  draw items per frame   median %.0f   max %.0f\n", stat(items, 0.5), stat(items, 1.0));
+    std::printf("  CPU evaluate           median %.2f ms   p95 %.2f ms   max %.2f ms\n", stat(eval, 0.5), stat(eval, 0.95), stat(eval, 1.0));
+    std::printf("  GPU composite          median %.2f ms   p95 %.2f ms   max %.2f ms\n", stat(gpu, 0.5), stat(gpu, 0.95), stat(gpu, 1.0));
+    if (!blurGpu.empty())
+        std::printf("  GPU with motion blur   median %.2f ms   p95 %.2f ms   (%zu subframes)\n", stat(blurGpu, 0.5), stat(blurGpu, 0.95), offs.size());
+    return 0;
+}
+
 int cmdFrames(int argc, const char* argv[]) {
     MFEngine* e = openProject(argv[2]);
     if (!e) return 1;
     MFCompositionInfo* c = e.composition;
+    e.renderMotionBlur = !argFlag(argc, argv, "--no-motion-blur");
     const double from = argDouble(argc, argv, "--from", 0), to = argDouble(argc, argv, "--to", c.duration);
     const double scale = argDouble(argc, argv, "--scale", 1);
     [[NSFileManager defaultManager] createDirectoryAtPath:@(argv[3]) withIntermediateDirectories:YES attributes:nil error:nil];
@@ -351,6 +434,106 @@ int cmdEffectsDemo(const char* dir) {
     return 0;
 }
 
+MFPathVertex* V(double x, double y, double ix = 0, double iy = 0, double ox = 0, double oy = 0) {
+    return [[MFPathVertex alloc] initWithPoint:CGPointMake(x, y) inTangent:CGPointMake(ix, iy) outTangent:CGPointMake(ox, oy)];
+}
+
+int cmdPhase4Demo(const char* dir) {
+    MFEngine* e = makeEngine();
+    if (!e) return 1;
+    [[NSFileManager defaultManager] createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
+    auto preset = [](NSString* name) -> NSString* {
+        for (MFPresetInfo* p in [MFEngine builtInPresets])
+            if ([p.name isEqualToString:name]) return p.json;
+        return @"";
+    };
+    struct Tile {
+        const char* caption;
+        double time;
+        std::function<void(MFEngine*)> build;
+    };
+    auto text = [](MFEngine* en, NSString* s, double size) {
+        const uint64_t t = [en addTextLayer:s];
+        [en setLayer:t text:s font:@"AvenirNext-Heavy" align:MFTextAlignCenter];
+        [en setPropertyValue:MFValue{size, 0, 0, 0} prop:MFPropFontSize layer:t time:0];
+        [en setPropertyValue:MFValue{480, 300, 0, 0} prop:MFPropPosition layer:t time:0];
+        return t;
+    };
+    const std::vector<Tile> tiles = {
+        {"Text layer (Avenir Next Heavy, 110 px)", 0, [&](MFEngine* en) { text(en, @"MotionForge", 110); }},
+        {"Typewriter preset, 0.75 s into 1.5 s", 0.75, [&](MFEngine* en) {
+             const uint64_t t = text(en, @"Typewriter", 120);
+             [en applyPreset:preset(@"Typewriter") layers:@[ @(t) ] time:0 message:nil];
+         }},
+        {"Fade Up by Character, mid-way", 0.55, [&](MFEngine* en) {
+             const uint64_t t = text(en, @"Fade Up!", 140);
+             [en applyPreset:preset(@"Fade Up by Character") layers:@[ @(t) ] time:0 message:nil];
+         }},
+        {"Rotation animator, Smooth selector by word", 0, [&](MFEngine* en) {
+             const uint64_t t = text(en, @"one two three", 96);
+             const uint64_t a = [en addTextAnimator:MFAnimatorPresetRotation layer:t];
+             [en setTextAnimator:a layer:t enabled:YES shape:MFSelectorShapeSmooth unit:MFSelectorUnitWords];
+             [en setRefValue:MFValue{25, 0, 0, 0} ref:MFPropRef{MFPropOwnerTextAnimator, a, 6} layer:t time:0];
+         }},
+        {"Pen-drawn bezier shape (heart)", 0, [&](MFEngine* en) {
+             const uint64_t s = [en addPathLayerWithVertices:@[ V(480, 210, -60, -60, 60, -60), V(660, 260, 0, -80, 0, 90),
+                                                               V(480, 430, 70, -40, -70, -40), V(300, 260, 0, 90, 0, -80) ]
+                                                      closed:YES];
+             [en setPropertyValue:MFValue{0.93, 0.27, 0.42, 1} prop:MFPropFillColor layer:s time:0];
+         }},
+        {"Open path + Trim Paths (line drawing itself, 60%)", 0, [&](MFEngine* en) {
+             const uint64_t s = [en addPathLayerWithVertices:@[ V(160, 380, 0, 0, 120, -260), V(480, 300, -120, 0, 120, 0),
+                                                               V(800, 220, -120, 260, 0, 0) ]
+                                                      closed:NO];
+             [en setPropertyValue:MFValue{24, 0, 0, 0} prop:MFPropStrokeWidth layer:s time:0];
+             [en setPropertyValue:MFValue{0.98, 0.78, 0.2, 1} prop:MFPropStrokeColor layer:s time:0];
+             [en setPropertyValue:MFValue{60, 0, 0, 0} prop:MFPropTrimEnd layer:s time:0];
+         }},
+        {"Bezier mask (pen) cutting a rectangle", 0, [&](MFEngine* en) {
+             const uint64_t r = [en addShapeLayer:MFShapeTypeRectangle];
+             [en setPropertyValue:MFValue{700, 360, 0, 0} prop:MFPropSize layer:r time:0];
+             [en setPropertyValue:MFValue{0.33, 0.62, 1, 1} prop:MFPropFillColor layer:r time:0];
+             [en addPathMaskWithVertices:@[ V(-300, 150, 0, 0, 100, -250), V(0, -170, -150, 0, 150, 0), V(300, 150, -100, -250, 0, 0) ]
+                                   layer:r];
+         }},
+        {"Pop In preset at 0.25 s (overshoot)", 0.25, [&](MFEngine* en) {
+             const uint64_t s = [en addShapeLayer:MFShapeTypeStar];
+             [en setPropertyValue:MFValue{300, 300, 0, 0} prop:MFPropSize layer:s time:0];
+             [en setPropertyValue:MFValue{0.98, 0.78, 0.2, 1} prop:MFPropFillColor layer:s time:0];
+             [en applyPreset:preset(@"Pop In") layers:@[ @(s) ] time:0 message:nil];
+         }},
+        {"Masked text + glow", 0, [&](MFEngine* en) {
+             const uint64_t t = text(en, @"GLOW", 200);
+             const uint64_t m = [en addMask:MFMaskShapeEllipse layer:t];
+             [en setRefValue:MFValue{0, -70, 0, 0} ref:MFPropRef{MFPropOwnerMask, m, 0} layer:t time:0];
+             [en setRefValue:MFValue{560, 160, 0, 0} ref:MFPropRef{MFPropOwnerMask, m, 1} layer:t time:0];
+             [en addEffect:MFEffectTypeGlow layer:t];
+         }},
+    };
+    std::vector<CGImageRef> images;
+    std::vector<std::string> captions;
+    for (const Tile& t : tiles) {
+        [e newProjectWithWidth:960 height:540 fps:30 duration:2];
+        [e setCompositionWidth:960 height:540 fps:30 duration:2 background:MFValue{0.07, 0.075, 0.09, 1} name:@"Phase 4"];
+        t.build(e);
+        NSError* error = nil;
+        CGImageRef img = [e copyImageAtTime:t.time scale:0.5 transparent:NO error:&error];
+        if (!img) {
+            std::fprintf(stderr, "%s: %s\n", t.caption, error.localizedDescription.UTF8String);
+            return 1;
+        }
+        images.push_back(img);
+        captions.push_back(t.caption);
+    }
+    CGImageRef sheet = contactSheet(images, captions, 3);
+    const std::string out = std::string(dir) + "/phase4-sheet.png";
+    writePNG(sheet, out);
+    CGImageRelease(sheet);
+    for (CGImageRef i : images) CGImageRelease(i);
+    std::printf("wrote %s (%zu tiles)\n", out.c_str(), tiles.size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, const char* argv[]) {
@@ -359,9 +542,11 @@ int main(int argc, const char* argv[]) {
         const std::string cmd = argv[1];
         if (cmd == "info") return cmdInfo(argv[2]);
         if (cmd == "render" && argc >= 4) return cmdRender(argc, argv);
+        if (cmd == "time") return cmdTime(argc, argv);
         if (cmd == "frames" && argc >= 4) return cmdFrames(argc, argv);
         if (cmd == "demo") return cmdDemo(argv[2]);
         if (cmd == "effects-demo") return cmdEffectsDemo(argv[2]);
+        if (cmd == "phase4-demo") return cmdPhase4Demo(argv[2]);
         return usage();
     }
 }

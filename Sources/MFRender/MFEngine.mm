@@ -14,6 +14,7 @@
 #include "MFRender/MetalRenderer.hpp"
 #include "mf/Clipboard.hpp"
 #include "mf/Document.hpp"
+#include "mf/Presets.hpp"
 #include "mf/Evaluator.hpp"
 #include "mf/ProjectIO.hpp"
 
@@ -87,8 +88,49 @@ NSInteger MFPropDimensions(MFProp prop) { return propDef(static_cast<PropId>(pro
         _spatial = static_cast<MFSpatial>(k.spatial);
         _tangentIn = toMF(k.tangentIn);
         _tangentOut = toMF(k.tangentOut);
+        _easeIn = k.easeIn;
+        _easeOut = k.easeOut;
+        _inSlope = k.inSlope;
+        _outSlope = k.outSlope;
     }
     return self;
+}
+@end
+
+@implementation MFPathVertex
+- (instancetype)initWithPoint:(CGPoint)point inTangent:(CGPoint)inTangent outTangent:(CGPoint)outTangent {
+    if ((self = [super init])) {
+        _point = point;
+        _inTangent = inTangent;
+        _outTangent = outTangent;
+    }
+    return self;
+}
+@end
+
+namespace {
+BezierPath toPath(NSArray<MFPathVertex*>* vs, bool closed) {
+    BezierPath p;
+    p.closed = closed;
+    for (MFPathVertex* v in vs)
+        p.vertices.push_back({{v.point.x, v.point.y}, {v.inTangent.x, v.inTangent.y}, {v.outTangent.x, v.outTangent.y}});
+    return p;
+}
+}  // namespace
+
+@interface MFPresetInfo ()
+@property(nonatomic, readwrite, copy) NSString *name, *category, *summary, *json;
+@end
+@implementation MFPresetInfo
++ (MFPresetInfo*)presetWithJSON:(NSString*)json {
+    std::string name, category;
+    if (!presetHeader(json.UTF8String, name, category)) return nil;
+    MFPresetInfo* p = [MFPresetInfo new];
+    p.name = @(name.c_str());
+    p.category = @(category.c_str());
+    p.summary = @"";
+    p.json = json;
+    return p;
 }
 @end
 
@@ -212,6 +254,29 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 @end
 
+@interface MFAnimatorInfo ()
+- (instancetype)initWithAnimator:(const TextAnimator&)a;
+@end
+
+@implementation MFAnimatorInfo
+- (instancetype)initWithAnimator:(const TextAnimator&)a {
+    if ((self = [super init])) {
+        _animatorID = a.id;
+        _name = @(a.name.c_str());
+        _enabled = a.enabled;
+        _shape = static_cast<MFSelectorShape>(a.shape);
+        _unit = static_cast<MFSelectorUnit>(a.unit);
+        NSMutableArray* params = [NSMutableArray array];
+        for (int i = 0; i < kAnimParamCount; ++i) {
+            const auto p = static_cast<AnimParam>(i);
+            [params addObject:[[MFParamInfo alloc] initWithRef:PropRef::animator(a.id, p) def:animParamDef(p) property:a.param(p)]];
+        }
+        _params = params;
+    }
+    return self;
+}
+@end
+
 @interface MFEffectCatalogEntry ()
 @property(nonatomic, readwrite) MFEffectType type;
 @property(nonatomic, readwrite, copy) NSString *name, *category, *summary;
@@ -242,6 +307,31 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (uint64_t)parentID { return _layer.parent; }
 - (uint64_t)assetID { return _layer.asset; }
 - (BOOL)isAnimated:(MFProp)prop { return _layer.prop(static_cast<PropId>(prop)).animated(); }
+- (BOOL)isBakedRef:(MFPropRef)ref {
+    const Property* p = resolveProperty(_layer, toRef(ref));
+    return p && p->baked();
+}
+- (BOOL)hasBakedAnimation {
+    if (_layer.pathTrack) return YES;
+    for (const Property& p : _layer.props)
+        if (p.baked()) return YES;
+    for (const Mask& m : _layer.masks) {
+        if (m.pathTrack) return YES;
+        for (const Property& p : m.params)
+            if (p.baked()) return YES;
+    }
+    for (const Effect& e : _layer.effects)
+        for (const Property& p : e.params)
+            if (p.baked()) return YES;
+    for (const TextAnimator& a : _layer.animators)
+        for (const Property& p : a.params)
+            if (p.baked()) return YES;
+    return NO;
+}
+- (uint64_t)sourceCompID { return _layer.source; }
+- (double)startTime { return _layer.startTime; }
+- (BOOL)timeRemapEnabled { return _layer.timeRemap; }
+- (BOOL)collapse { return _layer.collapse; }
 - (NSArray<MFKeyframeInfo*>*)keyframesFor:(MFProp)prop {
     const auto& keys = _layer.prop(static_cast<PropId>(prop)).keyframes;
     NSMutableArray* out = [NSMutableArray arrayWithCapacity:keys.size()];
@@ -277,8 +367,27 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     for (MFEffectInfo* e in self.effects)
         for (MFParamInfo* p in e.params)
             if (p.animated) [out addObject:p];
+    for (MFAnimatorInfo* a in self.animators)
+        for (MFParamInfo* p in a.params)
+            if (p.animated) [out addObject:p];
     return out;
 }
+- (NSString*)text { return @(_layer.text.string.c_str()) ?: @""; }
+- (NSString*)fontName { return @(_layer.text.font.c_str()) ?: @""; }
+- (MFTextAlign)textAlign { return static_cast<MFTextAlign>(_layer.text.align); }
+- (NSArray<MFAnimatorInfo*>*)animators {
+    NSMutableArray* out = [NSMutableArray array];
+    for (const TextAnimator& a : _layer.animators) [out addObject:[[MFAnimatorInfo alloc] initWithAnimator:a]];
+    return out;
+}
+- (NSArray<MFPathVertex*>*)pathVertices {
+    NSMutableArray* out = [NSMutableArray array];
+    for (const PathVertex& v : _layer.path.vertices)
+        [out addObject:[[MFPathVertex alloc] initWithPoint:CGPointMake(v.p.x, v.p.y) inTangent:CGPointMake(v.in.x, v.in.y)
+                                                outTangent:CGPointMake(v.out.x, v.out.y)]];
+    return out;
+}
+- (BOOL)pathClosed { return _layer.path.closed; }
 - (uint64_t)matteLayerID { return _layer.matteLayer; }
 - (MFMatteMode)matteMode { return static_cast<MFMatteMode>(_layer.matteMode); }
 - (NSArray<NSNumber*>*)allKeyframeTimes {
@@ -290,6 +399,9 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
             for (const Keyframe& k : p.keyframes) times.insert(k.time);
     for (const Effect& e : _layer.effects)
         for (const Property& p : e.params)
+            for (const Keyframe& k : p.keyframes) times.insert(k.time);
+    for (const TextAnimator& a : _layer.animators)
+        for (const Property& p : a.params)
             for (const Keyframe& k : p.keyframes) times.insert(k.time);
     NSMutableArray* out = [NSMutableArray arrayWithCapacity:times.size()];
     for (double t : times) [out addObject:@(t)];
@@ -307,6 +419,8 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         _fps = c.fps;
         _duration = c.duration;
         _background = toMF(c.background);
+        _folder = @(c.folder.c_str());
+        _layerCount = NSInteger(c.layers.size());
     }
     return self;
 }
@@ -365,6 +479,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device error:(NSError**)error {
     if (!(self = [super init])) return nil;
+    _renderMotionBlur = YES;
     std::string err;
     _renderer = MetalRenderer::create(device, err);
     if (!_renderer) {
@@ -473,6 +588,29 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
                  background:(MFValue)background name:(NSString*)name {
     return _doc.setCompositionSettings([self compID], int(width), int(height), fps, duration, toValue(background),
                                        name.UTF8String);
+}
+
+- (NSArray<MFCompositionInfo*>*)compositions {
+    NSMutableArray* out = [NSMutableArray arrayWithCapacity:_doc.project().compositions.size()];
+    for (const Composition& c : _doc.project().compositions) [out addObject:[[MFCompositionInfo alloc] initWithComp:c]];
+    return out;
+}
+
+- (BOOL)openComposition:(uint64_t)compID {
+    return _doc.setActiveComposition(compID);
+}
+
+- (uint64_t)addCompositionNamed:(NSString*)name width:(NSInteger)width height:(NSInteger)height fps:(double)fps
+                       duration:(double)duration {
+    return _doc.addComposition(name.UTF8String, int(width), int(height), fps, duration);
+}
+
+- (uint64_t)addPrecompLayer:(uint64_t)sourceCompID {
+    return _doc.addPrecompLayer([self compID], sourceCompID);
+}
+
+- (BOOL)setPrecompLayer:(uint64_t)layerID collapse:(BOOL)collapse timeRemap:(BOOL)timeRemap startTime:(double)startTime {
+    return _doc.setPrecompOptions([self compID], layerID, collapse, timeRemap, startTime);
 }
 
 // ---- media ----
@@ -608,6 +746,95 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
                                      in:(MFInterp)inInterp out:(MFInterp)outInterp {
     return _doc.setKeyframeInterpolation([self compID], layerID, toRef(ref), int(index), static_cast<Interp>(inInterp),
                                          static_cast<Interp>(outInterp));
+}
+
+- (BOOL)setKeyframeEaseAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID outgoing:(BOOL)outgoing
+                     influence:(double)influence slope:(double)slope {
+    return _doc.setKeyframeEase([self compID], layerID, toRef(ref), int(index), outgoing, influence, slope);
+}
+
+// ---- text ----
+
+- (uint64_t)addTextLayer:(NSString*)text {
+    const ObjectId comp = [self compID];
+    _doc.beginGroup("New Text Layer");
+    const ObjectId l = _doc.addLayer(comp, LayerKind::Text);
+    if (l) {
+        TextData td = _doc.project().activeComp()->findLayer(l)->text;
+        td.string = text.UTF8String;
+        _doc.setLayerText(comp, l, td);
+    }
+    _doc.endGroup();
+    return l;
+}
+- (BOOL)setLayer:(uint64_t)layerID text:(NSString*)text font:(NSString*)font align:(MFTextAlign)align {
+    TextData td;
+    td.string = text.UTF8String;
+    td.font = font.length ? font.UTF8String : "Helvetica-Bold";
+    td.align = static_cast<TextAlign>(align);
+    return _doc.setLayerText([self compID], layerID, td);
+}
+- (uint64_t)addTextAnimator:(MFAnimatorPreset)preset layer:(uint64_t)layerID {
+    return _doc.addTextAnimator([self compID], layerID, static_cast<Document::AnimatorPreset>(preset));
+}
+- (BOOL)removeTextAnimator:(uint64_t)animatorID layer:(uint64_t)layerID {
+    return _doc.removeTextAnimator([self compID], layerID, animatorID);
+}
+- (BOOL)setTextAnimator:(uint64_t)animatorID layer:(uint64_t)layerID enabled:(BOOL)enabled shape:(MFSelectorShape)shape
+                   unit:(MFSelectorUnit)unit {
+    return _doc.setTextAnimatorOptions([self compID], layerID, animatorID, enabled, static_cast<SelectorShape>(shape),
+                                       static_cast<SelectorUnit>(unit));
+}
+
+// ---- paths ----
+
+- (uint64_t)addPathLayerWithVertices:(NSArray<MFPathVertex*>*)vertices closed:(BOOL)closed {
+    return _doc.addPathLayer([self compID], toPath(vertices, closed).vertices, closed);
+}
+- (BOOL)setLayer:(uint64_t)layerID pathVertices:(NSArray<MFPathVertex*>*)vertices closed:(BOOL)closed {
+    return _doc.setLayerPath([self compID], layerID, toPath(vertices, closed));
+}
+- (uint64_t)addPathMaskWithVertices:(NSArray<MFPathVertex*>*)vertices layer:(uint64_t)layerID {
+    return _doc.addPathMask([self compID], layerID, toPath(vertices, true));
+}
+- (CGPoint)compPoint:(CGPoint)p toLayer:(uint64_t)layerID time:(double)time {
+    const Composition* c = [self comp];
+    const Layer* l = c ? c->findLayer(layerID) : nullptr;
+    Affine inv;
+    if (!l || !layerWorldTransform(*c, *l, time).inverse(inv)) return p;
+    const Vec2 q = inv.apply({p.x, p.y});
+    return CGPointMake(q.x, q.y);
+}
+- (CGPoint)layerPoint:(CGPoint)p ofLayer:(uint64_t)layerID time:(double)time {
+    const Composition* c = [self comp];
+    const Layer* l = c ? c->findLayer(layerID) : nullptr;
+    if (!l) return p;
+    const Vec2 q = layerWorldTransform(*c, *l, time).apply({p.x, p.y});
+    return CGPointMake(q.x, q.y);
+}
+
+// ---- presets ----
+
++ (NSArray<MFPresetInfo*>*)builtInPresets {
+    NSMutableArray* out = [NSMutableArray array];
+    for (const PresetInfo& p : mf::builtInPresets()) {
+        MFPresetInfo* info = [MFPresetInfo new];
+        info.name = @(p.name.c_str());
+        info.category = @(p.category.c_str());
+        info.summary = @(p.summary.c_str());
+        info.json = @(p.json.c_str());
+        [out addObject:info];
+    }
+    return out;
+}
+- (NSString*)presetFromLayer:(uint64_t)layerID name:(NSString*)name category:(NSString*)category {
+    return @(makePreset(_doc.project(), [self compID], layerID, name.UTF8String, category.UTF8String).c_str());
+}
+- (NSInteger)applyPreset:(NSString*)json layers:(NSArray<NSNumber*>*)layerIDs time:(double)time message:(NSString**)message {
+    std::string err;
+    const int n = mf::applyPreset(_doc, [self compID], toIds(layerIDs), time, json.UTF8String, err);
+    if (message) *message = err.empty() ? nil : @(err.c_str());
+    return n;
 }
 
 - (BOOL)setKeyframeValueAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID value:(MFValue)value {
@@ -856,14 +1083,25 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         if (error) *error = makeError(5, "No composition");
         return nullptr;
     }
-    const FrameDesc f = evaluateFrame(_doc.project(), *c, time, scale);
-    std::vector<float> px;
+    const std::vector<double> offsets = _renderMotionBlur ? motionBlurOffsets(_doc.project(), *c) : std::vector<double>{0.0};
+    std::vector<FrameDesc> frames;
+    for (double o : offsets) frames.push_back(evaluateFrame(_doc.project(), *c, time, scale, nullptr, o));
+    // Nothing with motion blur on moves during the shutter: every subframe is the same picture.
+    if (std::all_of(frames.begin(), frames.end(), [&](const FrameDesc& f) { return f.hash == frames[0].hash; })) frames.resize(1);
+    std::vector<float> px, sub;
     std::string err;
-    if (!_renderer->renderToRGBA(f, px, nullptr, err)) {
-        if (error) *error = makeError(5, err);
-        return nullptr;
+    for (size_t k = 0; k < frames.size(); ++k) {
+        if (!_renderer->renderToRGBA(frames[k], k == 0 ? px : sub, nullptr, err)) {
+            if (error) *error = makeError(5, err);
+            return nullptr;
+        }
+        if (k > 0)
+            for (size_t i = 0; i < px.size(); ++i) px[i] += sub[i];
     }
-    const size_t w = size_t(f.width), h = size_t(f.height);
+    if (frames.size() > 1)
+        for (float& v : px) v /= float(frames.size());
+    const int w0 = frames[0].width, h0 = frames[0].height;
+    const size_t w = size_t(w0), h = size_t(h0);
     NSMutableData* data = [NSMutableData dataWithLength:w * h * 4];
     auto* out = static_cast<uint8_t*>(data.mutableBytes);
     const Value bg = c->background;

@@ -61,10 +61,55 @@ struct EffectsBrowser: View {
                 }
             }
             .listStyle(.sidebar)
-            Text(model.selectedLayer.map { "Applies to “\($0.name)”" } ?? "Select a layer to apply effects")
+            .frame(minHeight: 160)
+            Divider()
+            PresetsList(model: model, search: search)
+            Text(model.selectedLayer.map { "Applies to “\($0.name)”\(model.selectedLayers.count > 1 ? " + \(model.selectedLayers.count - 1) more" : "")" } ?? "Select a layer to apply effects or presets")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
                 .padding(8)
         }
+    }
+}
+
+/// Built-in animation presets by category, then the user's saved presets.
+struct PresetsList: View {
+    @ObservedObject var model: EditorModel
+    let search: String
+
+    var body: some View {
+        let all = MFEngine.builtInPresets() + model.userPresets
+        let shown = all.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.category.localizedCaseInsensitiveContains(search) }
+        let order = ["Entrances", "Exits", "Attention", "Styles", "Text", "My Presets"]
+        let cats = Array(Set(shown.map(\.category))).sorted { (order.firstIndex(of: $0) ?? 99, $0) < (order.firstIndex(of: $1) ?? 99, $1) }
+        List {
+            ForEach(cats, id: \.self) { cat in
+                Section("Presets · " + cat) {
+                    ForEach(shown.filter { $0.category == cat }, id: \.name) { p in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: cat == "Text" ? "character.cursor.ibeam" : cat == "My Presets" ? "person.crop.square" : "sparkles")
+                                .foregroundStyle(Theme.keyframe).frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(p.name)
+                                if !p.summary.isEmpty {
+                                    Text(p.summary).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer(minLength: 4)
+                            Button("Apply") { model.applyPreset(p) }
+                                .controlSize(.small)
+                                .disabled(model.selectedLayers.isEmpty)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { model.applyPreset(p) }
+                        .help("Applies at the playhead to the selected layer(s)")
+                    }
+                }
+            }
+            if model.userPresets.isEmpty && search.isEmpty {
+                Text("Save your own with Layer → Save Animation Preset…").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+        .listStyle(.sidebar)
     }
 }
 
@@ -75,6 +120,13 @@ struct ProjectPanel: View {
         VStack(spacing: 0) {
             List {
                 Section("Composition") {
+                    if let back = model.compHistory.last, let parent = model.compositions.first(where: { $0.compID == back }) {
+                        Button { model.goBackComposition() } label: {
+                            Label("Back to \(parent.name)", systemImage: "chevron.left").font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.accent)
+                    }
                     Button { model.showCompSettings = true } label: {
                         HStack {
                             Image(systemName: "film").foregroundStyle(Theme.accent)
@@ -87,6 +139,11 @@ struct ProjectPanel: View {
                     }
                     .buttonStyle(.plain)
                     .help("Composition settings (⌘K)")
+                }
+                if model.compositions.count > 1 {
+                    Section("Compositions") {
+                        CompositionTree(model: model, folder: "", depth: 0)
+                    }
                 }
                 Section("Media") {
                     if model.assets.isEmpty {
@@ -125,10 +182,53 @@ struct ProjectPanel: View {
             HStack {
                 Button { model.presentImportPanel() } label: { Label("Import…", systemImage: "square.and.arrow.down") }
                 Spacer()
+                Button { model.newComposition() } label: { Image(systemName: "plus.rectangle.on.rectangle") }
+                    .help("New composition")
             }
             .padding(8)
         }
         .background(Theme.panel)
+    }
+}
+
+/// Compositions grouped by folder (imported projects can have thousands: one per shape layer).
+struct CompositionTree: View {
+    @ObservedObject var model: EditorModel
+    let folder: String
+    let depth: Int
+
+    var body: some View {
+        let here = model.compositions.filter { $0.folder == folder }
+        let prefix = folder.isEmpty ? "" : folder + "/"
+        let subfolders = Set(model.compositions.compactMap { c -> String? in
+            guard c.folder.hasPrefix(prefix), c.folder != folder else { return nil }
+            let rest = c.folder.dropFirst(prefix.count)
+            return prefix + (rest.split(separator: "/").first.map(String.init) ?? "")
+        }).sorted()
+        ForEach(subfolders, id: \.self) { sub in
+            DisclosureGroup {
+                CompositionTree(model: model, folder: sub, depth: depth + 1)
+            } label: {
+                Label(String(sub.split(separator: "/").last ?? ""), systemImage: "folder").lineLimit(1)
+            }
+        }
+        ForEach(here, id: \.compID) { c in
+            let current = c.compID == model.comp.compID
+            HStack(spacing: 6) {
+                Image(systemName: "film").foregroundStyle(current ? Theme.accent : .secondary)
+                Text(c.name).lineLimit(1).fontWeight(current ? .semibold : .regular)
+                Spacer(minLength: 4)
+                Text("\(c.layerCount)").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { model.openComposition(c.compID) }
+            .contextMenu {
+                Button("Open") { model.openComposition(c.compID) }
+                Button("Add to \(model.comp.name)") { model.addPrecompLayer(source: c.compID) }
+                    .disabled(current)
+            }
+            .help("Double-click to open; right-click to add it as a layer")
+        }
     }
 }
 

@@ -187,6 +187,53 @@ enum UIDemo {
                 if let orange { model.edit { _ = $0.setLayer(orange, visible: true) } }
             }
 
+            // Phase 4: text + preset, pen tool, graph editor, node workspace.
+            do {
+                model.time.time = 0
+                model.addText()
+                if let t = model.selectedLayer {
+                    model.edit { _ = $0.setLayer(t.layerID, text: "MotionForge", font: "AvenirNext-Heavy", align: .center) }
+                    model.edit { _ = $0.setPropertyValue(MFValue(x: 960, y: 230, z: 0, w: 0), prop: .position, layer: t.layerID, time: 0) }
+                    if let tw = MFEngine.builtInPresets().first(where: { $0.name == "Typewriter" }) { model.applyPreset(tw) }
+                    model.time.time = 0.9
+                    let info = model.engine.layer(withID: t.layerID)!
+                    log.append(["step": "text-typewriter", "animators": info.animators.count,
+                                "startKeys": info.animators.first?.params.first?.keyframes.count ?? 0])
+                    await record("18-text-typewriter")
+                }
+                // Pen: two corner clicks, two dragged (smooth) points, then click the first point to close.
+                model.selection = nil
+                model.tool = .pen
+                let g = viewer.coordinator!.geometry
+                let pts = [CGPoint(x: 300, y: 300), CGPoint(x: 700, y: 260), CGPoint(x: 760, y: 720), CGPoint(x: 330, y: 760)]
+                let before = model.layers.count
+                click(viewer, at: g.toView(pts[0]))
+                click(viewer, at: g.toView(pts[1]))
+                drag(viewer, from: g.toView(pts[2]), to: g.toView(CGPoint(x: 860, y: 820)))
+                drag(viewer, from: g.toView(pts[3]), to: g.toView(CGPoint(x: 230, y: 700)))
+                click(viewer, at: g.toView(pts[0]))
+                let made = model.layers.count == before + 1 ? model.layers.first : nil
+                log.append(["step": "pen-shape", "layerAdded": made != nil, "isPath": made?.shape == .path,
+                            "vertices": made?.pathVertices.count ?? 0, "closed": made?.pathClosed ?? false,
+                            "smoothPoints": made?.pathVertices.filter { hypot($0.outTangent.x, $0.outTangent.y) > 1 }.count ?? 0])
+                model.tool = .select
+                if let made { model.selectLayer(made.layerID, mode: .replace) }
+                await record("19-pen-shape")
+
+                // Graph editor on the Card's position keys.
+                if let card = model.layers.first(where: { $0.name == "Card" }) {
+                    model.selectedKeyframes = Set(card.keyframes(for: .layer(.position)).map { KeyframeRef(layer: card.layerID, ref: .layer(.position), index: $0.index) })
+                    model.selection = card.layerID
+                    model.showGraphEditor = true
+                    await record("20-graph-editor")
+                    model.showGraphEditor = false
+                }
+                model.workspace = .nodes
+                await record("21-node-workspace")
+                model.workspace = .viewer
+                try? await Task.sleep(for: .seconds(0.5))
+            }
+
             // 8. Real-time playback for 4 s: measured presented fps and dropped frames.
             model.time.time = 0
             model.time.isPlaying = true

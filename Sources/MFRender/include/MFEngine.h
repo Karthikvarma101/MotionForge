@@ -7,8 +7,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef NS_ENUM(NSInteger, MFLayerKind) { MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull };
-typedef NS_ENUM(NSInteger, MFShapeType) { MFShapeTypeRectangle = 0, MFShapeTypeEllipse, MFShapeTypePolygon, MFShapeTypeStar };
+typedef NS_ENUM(NSInteger, MFLayerKind) { MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull, MFLayerKindText, MFLayerKindPrecomp };
+typedef NS_ENUM(NSInteger, MFShapeType) { MFShapeTypeRectangle = 0, MFShapeTypeEllipse, MFShapeTypePolygon, MFShapeTypeStar, MFShapeTypePath };
 typedef NS_ENUM(NSInteger, MFBlendMode) {
     MFBlendModeNormal = 0, MFBlendModeAdd, MFBlendModeMultiply, MFBlendModeScreen,
     MFBlendModeOverlay, MFBlendModeDarken, MFBlendModeLighten
@@ -19,20 +19,30 @@ typedef NS_ENUM(NSInteger, MFSpatial) { MFSpatialLinear = 0, MFSpatialAuto, MFSp
 typedef NS_ENUM(NSInteger, MFProp) {
     MFPropAnchorPoint = 0, MFPropPosition, MFPropScale, MFPropRotation, MFPropOpacity,
     MFPropSize, MFPropRoundness, MFPropFillColor, MFPropStrokeColor, MFPropStrokeWidth,
-    MFPropPoints, MFPropInnerRatio
+    MFPropPoints, MFPropInnerRatio, MFPropFontSize, MFPropTracking, MFPropLineHeight,
+    MFPropTrimStart, MFPropTrimEnd, MFPropTrimOffset, MFPropTimeRemap
 };
 typedef NS_ENUM(NSInteger, MFMemoryPressure) { MFMemoryPressureNormal = 0, MFMemoryPressureWarning, MFMemoryPressureCritical };
 typedef NS_ENUM(NSInteger, MFEffectType) {
     MFEffectTypeGaussianBlur = 0, MFEffectTypeDropShadow, MFEffectTypeGlow,
-    MFEffectTypeBrightnessContrast, MFEffectTypeHueSaturation, MFEffectTypeFill
+    MFEffectTypeBrightnessContrast, MFEffectTypeHueSaturation, MFEffectTypeFill, MFEffectTypeGradientRamp
 };
-typedef NS_ENUM(NSInteger, MFMaskShape) { MFMaskShapeRectangle = 0, MFMaskShapeEllipse };
+typedef NS_ENUM(NSInteger, MFMaskShape) { MFMaskShapeRectangle = 0, MFMaskShapeEllipse, MFMaskShapePath };
 typedef NS_ENUM(NSInteger, MFMaskMode) { MFMaskModeAdd = 0, MFMaskModeSubtract, MFMaskModeIntersect, MFMaskModeDifference };
 typedef NS_ENUM(NSInteger, MFMatteMode) {
     MFMatteModeNone = 0, MFMatteModeAlpha, MFMatteModeAlphaInverted, MFMatteModeLuma, MFMatteModeLumaInverted
 };
 typedef NS_ENUM(NSInteger, MFCachePolicy) { MFCachePolicySmart = 0, MFCachePolicyAll, MFCachePolicyOff };
-typedef NS_ENUM(NSInteger, MFPropOwner) { MFPropOwnerLayer = 0, MFPropOwnerMask, MFPropOwnerEffect };
+typedef NS_ENUM(NSInteger, MFPropOwner) { MFPropOwnerLayer = 0, MFPropOwnerMask, MFPropOwnerEffect, MFPropOwnerTextAnimator };
+typedef NS_ENUM(NSInteger, MFTextAlign) { MFTextAlignLeft = 0, MFTextAlignCenter, MFTextAlignRight };
+typedef NS_ENUM(NSInteger, MFSelectorShape) {
+    MFSelectorShapeSquare = 0, MFSelectorShapeRampUp, MFSelectorShapeRampDown, MFSelectorShapeTriangle,
+    MFSelectorShapeRound, MFSelectorShapeSmooth
+};
+typedef NS_ENUM(NSInteger, MFSelectorUnit) { MFSelectorUnitCharacters = 0, MFSelectorUnitWords, MFSelectorUnitLines };
+typedef NS_ENUM(NSInteger, MFAnimatorPreset) {
+    MFAnimatorPresetOpacity = 0, MFAnimatorPresetPosition, MFAnimatorPresetScale, MFAnimatorPresetRotation
+};
 
 // Address of any animatable property: a layer property, a mask parameter or an effect parameter.
 typedef struct {
@@ -58,6 +68,8 @@ FOUNDATION_EXPORT NSString* const MFErrorDomain;
 FOUNDATION_EXPORT NSString* MFPropLabel(MFProp prop);
 FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 
+@class MFParamInfo;
+
 // Immutable snapshots handed to the UI. Re-fetch after `revision` changes.
 @interface MFKeyframeInfo : NSObject
 @property(nonatomic, readonly) NSInteger index;
@@ -68,6 +80,35 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) MFSpatial spatial;
 @property(nonatomic, readonly) MFValue tangentIn;   // Bezier handles, relative to the value
 @property(nonatomic, readonly) MFValue tangentOut;
+@property(nonatomic, readonly) double easeIn;       // influence 0–1 (graph editor)
+@property(nonatomic, readonly) double easeOut;
+@property(nonatomic, readonly) double inSlope;      // speed as a timing-curve slope
+@property(nonatomic, readonly) double outSlope;
+@end
+
+// A bezier path vertex; tangents are offsets from the point.
+@interface MFPathVertex : NSObject
+- (instancetype)initWithPoint:(CGPoint)point inTangent:(CGPoint)inTangent outTangent:(CGPoint)outTangent;
+@property(nonatomic, readonly) CGPoint point;
+@property(nonatomic, readonly) CGPoint inTangent;
+@property(nonatomic, readonly) CGPoint outTangent;
+@end
+
+@interface MFAnimatorInfo : NSObject
+@property(nonatomic, readonly) uint64_t animatorID;
+@property(nonatomic, readonly, copy) NSString* name;
+@property(nonatomic, readonly) BOOL enabled;
+@property(nonatomic, readonly) MFSelectorShape shape;
+@property(nonatomic, readonly) MFSelectorUnit unit;
+@property(nonatomic, readonly) NSArray<MFParamInfo*>* params;
+@end
+
+@interface MFPresetInfo : NSObject
+@property(nonatomic, readonly, copy) NSString* name;
+@property(nonatomic, readonly, copy) NSString* category;
+@property(nonatomic, readonly, copy) NSString* summary;
+@property(nonatomic, readonly, copy) NSString* json;
++ (nullable MFPresetInfo*)presetWithJSON:(NSString*)json;  // reads name/category from a saved preset
 @end
 
 // A keyframe anywhere in the composition (for multi-selection operations).
@@ -151,12 +192,28 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 - (NSArray<MFKeyframeInfo*>*)keyframesFor:(MFProp)prop;
 - (BOOL)isAnimatedRef:(MFPropRef)ref;
 - (NSArray<MFKeyframeInfo*>*)keyframesForRef:(MFPropRef)ref;
+// Baked (per-frame) animation, e.g. from an After Effects import: editing shifts the whole track.
+- (BOOL)isBakedRef:(MFPropRef)ref;
+@property(nonatomic, readonly) BOOL hasBakedAnimation;  // any property, mask path or shape path
 @property(nonatomic, readonly) NSArray<NSNumber*>* allKeyframeTimes;  // union over every property, sorted
 @property(nonatomic, readonly) NSArray<MFEffectInfo*>* effects;
 @property(nonatomic, readonly) NSArray<MFMaskInfo*>* masks;
 @property(nonatomic, readonly) NSArray<MFParamInfo*>* animatedEffectAndMaskParams;  // for timeline rows
 @property(nonatomic, readonly) uint64_t matteLayerID;
 @property(nonatomic, readonly) MFMatteMode matteMode;
+// Text layers
+@property(nonatomic, readonly, copy) NSString* text;
+@property(nonatomic, readonly, copy) NSString* fontName;
+@property(nonatomic, readonly) MFTextAlign textAlign;
+@property(nonatomic, readonly) NSArray<MFAnimatorInfo*>* animators;
+// Bezier path shape layers (layer space)
+@property(nonatomic, readonly) NSArray<MFPathVertex*>* pathVertices;
+@property(nonatomic, readonly) BOOL pathClosed;
+// Precomp layers
+@property(nonatomic, readonly) uint64_t sourceCompID;
+@property(nonatomic, readonly) double startTime;
+@property(nonatomic, readonly) BOOL timeRemapEnabled;
+@property(nonatomic, readonly) BOOL collapse;
 @end
 
 @interface MFCompositionInfo : NSObject
@@ -167,6 +224,8 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) double fps;
 @property(nonatomic, readonly) double duration;
 @property(nonatomic, readonly) MFValue background;
+@property(nonatomic, readonly, copy) NSString* folder;  // "" = top level
+@property(nonatomic, readonly) NSInteger layerCount;
 @end
 
 @interface MFAssetInfo : NSObject
@@ -249,6 +308,15 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) MFCompositionInfo* composition;
 - (BOOL)setCompositionWidth:(NSInteger)width height:(NSInteger)height fps:(double)fps duration:(double)duration
                  background:(MFValue)background name:(NSString*)name;
+// Every composition in the project; `composition` is the one being edited.
+@property(nonatomic, readonly) NSArray<MFCompositionInfo*>* compositions;
+- (BOOL)openComposition:(uint64_t)compID NS_SWIFT_NAME(openComposition(_:));
+- (uint64_t)addCompositionNamed:(NSString*)name width:(NSInteger)width height:(NSInteger)height fps:(double)fps
+                       duration:(double)duration NS_SWIFT_NAME(addComposition(name:width:height:fps:duration:));
+// A layer showing another composition (0 if it would make a composition contain itself).
+- (uint64_t)addPrecompLayer:(uint64_t)sourceCompID NS_SWIFT_NAME(addPrecompLayer(source:));
+- (BOOL)setPrecompLayer:(uint64_t)layerID collapse:(BOOL)collapse timeRemap:(BOOL)timeRemap startTime:(double)startTime
+    NS_SWIFT_NAME(setPrecomp(_:collapse:timeRemap:startTime:));
 
 // ---- media ----
 - (NSArray<MFAssetInfo*>*)assets;
@@ -288,6 +356,35 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 // Uses `matteLayerID` as the layer's track matte (and hides the matte layer); 0 or None clears it.
 - (BOOL)setLayer:(uint64_t)layerID matte:(uint64_t)matteLayerID mode:(MFMatteMode)mode;
 
+// ---- text ----
+- (uint64_t)addTextLayer:(NSString*)text NS_SWIFT_NAME(addTextLayer(_:));
+- (BOOL)setLayer:(uint64_t)layerID text:(NSString*)text font:(NSString*)font align:(MFTextAlign)align
+    NS_SWIFT_NAME(setLayer(_:text:font:align:));
+- (uint64_t)addTextAnimator:(MFAnimatorPreset)preset layer:(uint64_t)layerID NS_SWIFT_NAME(addTextAnimator(_:layer:));
+- (BOOL)removeTextAnimator:(uint64_t)animatorID layer:(uint64_t)layerID NS_SWIFT_NAME(removeTextAnimator(_:layer:));
+- (BOOL)setTextAnimator:(uint64_t)animatorID layer:(uint64_t)layerID enabled:(BOOL)enabled shape:(MFSelectorShape)shape
+                   unit:(MFSelectorUnit)unit NS_SWIFT_NAME(setTextAnimator(_:layer:enabled:shape:unit:));
+
+// ---- bezier paths (pen tool) ----
+// Vertices in composition space; the new layer sits at the path's centre.
+- (uint64_t)addPathLayerWithVertices:(NSArray<MFPathVertex*>*)vertices closed:(BOOL)closed
+    NS_SWIFT_NAME(addPathLayer(vertices:closed:));
+// Vertices in the layer's own space.
+- (BOOL)setLayer:(uint64_t)layerID pathVertices:(NSArray<MFPathVertex*>*)vertices closed:(BOOL)closed
+    NS_SWIFT_NAME(setLayer(_:pathVertices:closed:));
+- (uint64_t)addPathMaskWithVertices:(NSArray<MFPathVertex*>*)vertices layer:(uint64_t)layerID
+    NS_SWIFT_NAME(addPathMask(vertices:layer:));
+// Composition space <-> a layer's own space at `time` (inverse of its full parent chain).
+- (CGPoint)compPoint:(CGPoint)p toLayer:(uint64_t)layerID time:(double)time NS_SWIFT_NAME(compToLayer(_:layer:time:));
+- (CGPoint)layerPoint:(CGPoint)p ofLayer:(uint64_t)layerID time:(double)time NS_SWIFT_NAME(layerToComp(_:layer:time:));
+
+// ---- presets ----
++ (NSArray<MFPresetInfo*>*)builtInPresets;
+- (NSString*)presetFromLayer:(uint64_t)layerID name:(NSString*)name category:(NSString*)category
+    NS_SWIFT_NAME(preset(fromLayer:name:category:));
+- (NSInteger)applyPreset:(NSString*)json layers:(NSArray<NSNumber*>*)layerIDs time:(double)time
+                 message:(NSString* _Nullable* _Nullable)message NS_SWIFT_NAME(applyPreset(_:layers:time:message:));
+
 // ---- properties & keyframes (any property, by reference) ----
 - (MFValue)valueOfRef:(MFPropRef)ref layer:(uint64_t)layerID time:(double)time;
 - (BOOL)setRefValue:(MFValue)value ref:(MFPropRef)ref layer:(uint64_t)layerID time:(double)time;
@@ -297,6 +394,10 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 - (NSInteger)moveKeyframeAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID toTime:(double)time;
 - (BOOL)setKeyframeInterpolationAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID
                                      in:(MFInterp)inInterp out:(MFInterp)outInterp;
+// Graph editor: one side of a key becomes Bezier with this influence (0–1) and speed (slope).
+- (BOOL)setKeyframeEaseAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID outgoing:(BOOL)outgoing
+                     influence:(double)influence slope:(double)slope
+    NS_SWIFT_NAME(setKeyframeEase(at:ref:layer:outgoing:influence:slope:));
 - (BOOL)setKeyframeValueAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID value:(MFValue)value
     NS_SWIFT_NAME(setKeyframeValue(at:ref:layer:value:));
 - (BOOL)setKeyframeSpatialAtIndex:(NSInteger)index ref:(MFPropRef)ref layer:(uint64_t)layerID
@@ -360,6 +461,8 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
                     checkerboard:(BOOL)checkerboard;
 
 // ---- offscreen rendering ----
+// Rendered stills / exports use the composition's motion blur (subframes averaged) unless this is NO.
+@property(nonatomic) BOOL renderMotionBlur;
 - (nullable CGImageRef)copyImageAtTime:(double)time scale:(double)scale
                             transparent:(BOOL)transparent error:(NSError**)error CF_RETURNS_RETAINED;
 - (BOOL)writePNGAtTime:(double)time scale:(double)scale transparent:(BOOL)transparent

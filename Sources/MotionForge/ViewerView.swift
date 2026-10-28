@@ -110,7 +110,33 @@ struct SelectionOverlay: View {
                                             height: geometry.compSize.height * geometry.scale))
             ctx.stroke(Path(frame), with: .color(.white.opacity(0.12)), lineWidth: 1)
 
+            // Pen tool: the path being drawn.
+            let draft = model.penDraft
+            if !draft.isEmpty {
+                ctx.stroke(bezier(draft.map { (geometry.toView($0.point), $0.inTangent, $0.outTangent) }, closed: false),
+                           with: .color(Theme.keyframe), lineWidth: 1.5)
+                for (i, v) in draft.enumerated() {
+                    let c = geometry.toView(v.point)
+                    drawHandles(ctx, c, v.inTangent, v.outTangent)
+                    let r = CGRect(x: c.x - (i == 0 ? 5 : 4), y: c.y - (i == 0 ? 5 : 4), width: i == 0 ? 10 : 8, height: i == 0 ? 10 : 8)
+                    ctx.fill(Path(r), with: .color(i == 0 ? Theme.keyframe : .white))
+                }
+            }
+
             guard let sel = model.selection else { return }
+            // Points and handles of the selected bezier-path layer.
+            if model.tool == .select, let pl = model.selectedLayer, pl.kind == .shape, pl.shape == .path {
+                for v in pl.pathVertices {
+                    let c = geometry.toView(model.engine.layerToComp(v.point, layer: sel, time: time.time))
+                    let i = geometry.toView(model.engine.layerToComp(CGPoint(x: v.point.x + v.inTangent.x, y: v.point.y + v.inTangent.y), layer: sel, time: time.time))
+                    let o = geometry.toView(model.engine.layerToComp(CGPoint(x: v.point.x + v.outTangent.x, y: v.point.y + v.outTangent.y), layer: sel, time: time.time))
+                    drawHandles(ctx, c, CGPoint(x: (i.x - c.x) / geometry.scale, y: (i.y - c.y) / geometry.scale),
+                                CGPoint(x: (o.x - c.x) / geometry.scale, y: (o.y - c.y) / geometry.scale))
+                    let r = CGRect(x: c.x - 4, y: c.y - 4, width: 8, height: 8)
+                    ctx.fill(Path(r), with: .color(.white))
+                    ctx.stroke(Path(r), with: .color(Theme.accent), lineWidth: 1)
+                }
+            }
             // Every selected layer gets an outline; the primary one also gets corner handles.
             for id in model.selectedLayers where id != sel {
                 let q = model.engine.quad(forLayer: id, time: time.time)
@@ -169,6 +195,32 @@ struct SelectionOverlay: View {
             }
         }
         .id(model.revision)
+    }
+
+    /// A cubic path through view-space points with composition-space handle offsets.
+    private func bezier(_ pts: [(CGPoint, CGPoint, CGPoint)], closed: Bool) -> Path {
+        var p = Path()
+        guard let first = pts.first else { return p }
+        p.move(to: first.0)
+        let k = geometry.scale
+        for i in 1..<max(1, pts.count) {
+            let a = pts[i - 1], b = pts[i]
+            p.addCurve(to: b.0, control1: CGPoint(x: a.0.x + a.2.x * k, y: a.0.y + a.2.y * k),
+                       control2: CGPoint(x: b.0.x + b.1.x * k, y: b.0.y + b.1.y * k))
+        }
+        if closed { p.closeSubpath() }
+        return p
+    }
+
+    private func drawHandles(_ ctx: GraphicsContext, _ c: CGPoint, _ tin: CGPoint, _ tout: CGPoint) {
+        for t in [tin, tout] where hypot(t.x, t.y) * geometry.scale > 1 {
+            let h = CGPoint(x: c.x + t.x * geometry.scale, y: c.y + t.y * geometry.scale)
+            var stem = Path()
+            stem.move(to: c)
+            stem.addLine(to: h)
+            ctx.stroke(stem, with: .color(Theme.keyframe.opacity(0.9)), lineWidth: 1)
+            ctx.fill(Path(ellipseIn: CGRect(x: h.x - 3.5, y: h.y - 3.5, width: 7, height: 7)), with: .color(Theme.keyframe))
+        }
     }
 }
 
@@ -257,6 +309,8 @@ final class ViewerMTKView: MTKView {
     override func mouseUp(with e: NSEvent) { coordinator?.mouseUp(point(e), event: e) }
     override func scrollWheel(with e: NSEvent) { coordinator?.scroll(point(e), event: e) }
     override func magnify(with e: NSEvent) { coordinator?.magnify(point(e), event: e) }
+    var penCursor = false { didSet { if penCursor != oldValue { window?.invalidateCursorRects(for: self) } } }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: penCursor ? .crosshair : .arrow) }
 }
 
 struct MetalViewer: NSViewRepresentable {
@@ -283,6 +337,7 @@ struct MetalViewer: NSViewRepresentable {
 
     func updateNSView(_ v: ViewerMTKView, context: Context) {
         context.coordinator.geometry = geometry
+        v.penCursor = model.tool == .pen
         let playing = time.isPlaying
         if v.isPaused == playing {  // switch between on-demand and display-linked drawing
             v.isPaused = !playing
@@ -311,6 +366,8 @@ struct MetalViewer: NSViewRepresentable {
             case layers(start: CGPoint, positions: [UInt64: MFValue])
             case pathKey(layer: UInt64, index: Int, start: CGPoint, value: MFValue)
             case pathHandle(layer: UInt64, index: Int, isOut: Bool, start: CGPoint, tangentIn: MFValue, tangentOut: MFValue)
+            case pen(index: Int)
+            case shapePoint(layer: UInt64, index: Int, part: Int, start: CGPoint, original: [MFPathVertex], closed: Bool)  // part: 0 point, 1 in, 2 out
         }
         private var drag: Drag?
         private var panStartView: CGPoint?
@@ -460,7 +517,23 @@ struct MetalViewer: NSViewRepresentable {
             let t = model.time.time
             let cp = geometry.toComp(p)
             let flags = event.modifierFlags
-            // 1. Motion-path handles and key points of the primary layer take precedence.
+            // 0. Pen tool: click adds a corner point, drag pulls out smooth handles, clicking the
+            //    first point closes the shape.
+            if model.tool == .pen {
+                if model.penDraft.count >= 3, let first = model.penDraft.first {
+                    let f = geometry.toView(first.point)
+                    if hypot(f.x - p.x, f.y - p.y) <= 8 {
+                        model.commitPen(closed: true)
+                        return
+                    }
+                }
+                model.penDraft.append(MFPathVertex(point: cp, inTangent: .zero, outTangent: .zero))
+                drag = .pen(index: model.penDraft.count - 1)
+                return
+            }
+            // 1. Points and handles of a selected bezier-path layer.
+            if let sel = model.selectedLayer, sel.kind == .shape, sel.shape == .path, beginShapePointDrag(sel, p, t) { return }
+            // 2. Motion-path handles and key points of the primary layer take precedence.
             if let sel = model.selection, let mp = model.engine.motionPath(layer: sel, time: t), beginPathDrag(mp, sel, p, cp, t) {
                 return
             }
@@ -487,6 +560,28 @@ struct MetalViewer: NSViewRepresentable {
                 panStartView = p
                 panStart = model.pan
             }
+        }
+
+        private func beginShapePointDrag(_ layer: MFLayerInfo, _ p: CGPoint, _ t: Double) -> Bool {
+            let verts = layer.pathVertices
+            func view(_ q: CGPoint) -> CGPoint { geometry.toView(model.engine.layerToComp(q, layer: layer.layerID, time: t)) }
+            for (i, v) in verts.enumerated() {
+                let candidates: [(CGPoint, Int)] = [(CGPoint(x: v.point.x + v.outTangent.x, y: v.point.y + v.outTangent.y), 2),
+                                                    (CGPoint(x: v.point.x + v.inTangent.x, y: v.point.y + v.inTangent.y), 1),
+                                                    (v.point, 0)]
+                for (q, part) in candidates {
+                    if part != 0 && hypot(q.x - v.point.x, q.y - v.point.y) < 0.5 { continue }  // no handle there
+                    let vq = view(q)
+                    if hypot(vq.x - p.x, vq.y - p.y) <= 6 {
+                        drag = .shapePoint(layer: layer.layerID, index: i, part: part,
+                                           start: model.engine.compToLayer(geometry.toComp(p), layer: layer.layerID, time: t),
+                                           original: verts, closed: layer.pathClosed)
+                        model.engine.beginUndoGroup("Edit Path")
+                        return true
+                    }
+                }
+            }
+            return false
         }
 
         /// Starts dragging a bezier handle or a key point if `p` is within reach of one.
@@ -544,6 +639,29 @@ struct MetalViewer: NSViewRepresentable {
                 }
                 model.edit { _ = $0.setKeyframeSpatial(at: index, ref: .layer(.position), layer: layer, mode: .bezier,
                                                         tangentIn: isOut ? other : moved, tangentOut: isOut ? moved : other) }
+            case .pen(let index):
+                guard index < model.penDraft.count else { break }
+                let v = model.penDraft[index]
+                let out = CGPoint(x: cp.x - v.point.x, y: cp.y - v.point.y)
+                model.penDraft[index] = MFPathVertex(point: v.point, inTangent: CGPoint(x: -out.x, y: -out.y), outTangent: out)
+            case .shapePoint(let layer, let index, let part, let start, let original, let closed):
+                let lp = model.engine.compToLayer(cp, layer: layer, time: t)
+                let d = CGPoint(x: lp.x - start.x, y: lp.y - start.y)
+                var verts = original
+                let v = original[index]
+                switch part {
+                case 0:
+                    verts[index] = MFPathVertex(point: CGPoint(x: v.point.x + d.x, y: v.point.y + d.y), inTangent: v.inTangent, outTangent: v.outTangent)
+                default:
+                    let moved = part == 2 ? CGPoint(x: v.outTangent.x + d.x, y: v.outTangent.y + d.y) : CGPoint(x: v.inTangent.x + d.x, y: v.inTangent.y + d.y)
+                    var other = part == 2 ? v.inTangent : v.outTangent
+                    if !event.modifierFlags.contains(.option) {  // keep the point smooth: mirror the direction
+                        let len = hypot(other.x, other.y), m = hypot(moved.x, moved.y)
+                        if m > 1e-6 { other = CGPoint(x: -moved.x / m * len, y: -moved.y / m * len) }
+                    }
+                    verts[index] = MFPathVertex(point: v.point, inTangent: part == 1 ? moved : other, outTangent: part == 2 ? moved : other)
+                }
+                model.edit { _ = $0.setLayer(layer, pathVertices: verts, closed: closed) }
             case nil:
                 if let start = panStartView {
                     if model.zoom == nil { model.zoom = geometry.scale }
@@ -553,6 +671,10 @@ struct MetalViewer: NSViewRepresentable {
         }
 
         func mouseUp(_ p: CGPoint, event: NSEvent) {
+            if case .pen = drag {
+                drag = nil
+                return
+            }
             if drag != nil {
                 model.engine.endUndoGroup()
                 model.refresh()

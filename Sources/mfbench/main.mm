@@ -1,6 +1,6 @@
 // MotionForge renderer benchmark.
 //
-//   swift run -c release mfbench [--frames N] [--out DIR] [--quick]
+//   swift run -c release mfbench [--frames N] [--out DIR] [--quick] [--snapshots DIR]
 //
 // Every scenario animates every layer, so each frame is unique and the frame cache is bypassed:
 // the numbers are raw evaluate + encode + GPU cost, not cache hits. Measurements:
@@ -76,12 +76,31 @@ const char* thermal() {
     return "?";
 }
 
+// Smooth closed blob (pen-like: every point has handles) or an open wavy line, in layer space.
+BezierPath benchPath(std::mt19937& rng, double radius, int points, bool closed) {
+    auto U = [&](double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); };
+    BezierPath p;
+    p.closed = closed;
+    for (int k = 0; k < points; ++k) {
+        if (closed) {
+            const double a = 2 * M_PI * k / points, r = radius * U(0.6, 1.0);
+            const Vec2 pt{std::cos(a) * r, std::sin(a) * r};
+            const Vec2 t{-std::sin(a) * r * 0.3, std::cos(a) * r * 0.3};  // tangent handles keep it smooth
+            p.vertices.push_back({pt, t * -1.0, t});
+        } else {
+            const double x = -radius + 2 * radius * k / (points - 1), y = U(-radius, radius) * 0.5;
+            p.vertices.push_back({{x, y}, {-radius / points, 0}, {radius / points, 0}});
+        }
+    }
+    return p;
+}
+
 // Per-layer decoration (effects, masks, mattes) applied after the layer is created.
 using Decorate = std::function<void(Document&, ObjectId comp, ObjectId layer, int index)>;
 
 // Composition with `n` animated layers. Mixed shape types, ~20% stroked, ~20% non-normal blend.
 Project makeScene(int w, int h, int n, int imageLayers, ObjectId* imageAsset, const std::string& imagePath,
-                  const Decorate& decorate = {}) {
+                  const Decorate& decorate = {}, LayerKind kind = LayerKind::Shape) {
     Document d(makeDefaultProject(w, h, 30, 10));
     const ObjectId comp = d.project().activeComposition;
     std::mt19937 rng(1234);
@@ -93,7 +112,7 @@ Project makeScene(int w, int h, int n, int imageLayers, ObjectId* imageAsset, co
         const bool image = i < imageLayers;
         const ShapeType st = static_cast<ShapeType>(i % 4);
         const ObjectId l = image ? d.addLayer(comp, LayerKind::Image, ShapeType::Rectangle, asset)
-                                 : d.addLayer(comp, LayerKind::Shape, st);
+                                 : d.addLayer(comp, kind, st);
         if (!image) {
             const double s = U(40, 300);
             d.setPropertyValue(comp, l, PropId::ShapeSize, 0, {s, s * U(0.5, 1.5), 0, 0});
@@ -119,6 +138,22 @@ Project makeScene(int w, int h, int n, int imageLayers, ObjectId* imageAsset, co
     return d.project();
 }
 
+// Premultiplied RGBA8 -> PNG.
+void writePNG(const std::string& path, std::vector<uint8_t>& px, int w, int h) {
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(px.data(), w, h, 8, size_t(w) * 4, cs,
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedLast | (CGBitmapInfo)kCGBitmapByteOrder32Big);
+    CGImageRef img = CGBitmapContextCreateImage(ctx);
+    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)[NSURL fileURLWithPath:@(path.c_str())], (__bridge CFStringRef)UTTypePNG.identifier, 1, nullptr);
+    CGImageDestinationAddImage(dst, img, nullptr);
+    CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+    CGImageRelease(img);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+}
+
 void writeNoisePNG(const std::string& path, int size) {
     std::vector<uint8_t> px(size_t(size) * size * 4);
     std::mt19937 rng(7);
@@ -130,18 +165,7 @@ void writeNoisePNG(const std::string& path, int size) {
             p[2] = uint8_t(rng() & 255);
             p[3] = 255;
         }
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef ctx = CGBitmapContextCreate(px.data(), size, size, 8, size_t(size) * 4, cs,
-                                             (CGBitmapInfo)kCGImageAlphaPremultipliedLast | (CGBitmapInfo)kCGBitmapByteOrder32Big);
-    CGImageRef img = CGBitmapContextCreateImage(ctx);
-    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
-        (__bridge CFURLRef)[NSURL fileURLWithPath:@(path.c_str())], (__bridge CFStringRef)UTTypePNG.identifier, 1, nullptr);
-    CGImageDestinationAddImage(dst, img, nullptr);
-    CGImageDestinationFinalize(dst);
-    CFRelease(dst);
-    CGImageRelease(img);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(cs);
+    writePNG(path, px, size, size);
 }
 
 struct Result {
@@ -223,12 +247,13 @@ int main(int argc, const char* argv[]) {
     @autoreleasepool {
         int frames = 240;
         bool quick = false;
-        std::string outDir;
+        std::string outDir, snapshotDir;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--frames" && i + 1 < argc) frames = std::max(10, std::atoi(argv[++i]));
             else if (a == "--out" && i + 1 < argc) outDir = argv[++i];
             else if (a == "--quick") quick = true;
+            else if (a == "--snapshots" && i + 1 < argc) snapshotDir = argv[++i];  // one PNG per scenario, to check what is measured
         }
         if (quick) frames = std::min(frames, 60);
 
@@ -265,6 +290,7 @@ int main(int argc, const char* argv[]) {
             const char* name;
             int w, h, shapes, images;
             Decorate decorate = {};
+            LayerKind kind = LayerKind::Shape;
         };
         auto fx = [](EffectType t, std::vector<std::pair<int, Value>> params) {
             return [t, params](Document& d, ObjectId comp, ObjectId l, int) {
@@ -302,6 +328,45 @@ int main(int argc, const char* argv[]) {
                 d.setLayerMatte(comp, l, layers[1].id, MatteMode::Alpha);  // layers[0] is `l` (new layers go on top)
             }
         };
+        // Phase 4: text (30 characters per layer) and pen-style bezier paths.
+        auto text30 = [](bool animator) {
+            return [animator](Document& d, ObjectId comp, ObjectId l, int i) {
+                TextData td;
+                td.string = "Motion graphics on Apple M5 " + std::to_string(10 + i % 90);  // 30 characters
+                td.font = "AvenirNext-Heavy";
+                d.setLayerText(comp, l, td);
+                d.setPropertyValue(comp, l, PropId::FontSize, 0, {64, 0, 0, 0});
+                if (!animator) return;
+                // A wave of characters rising and fading in: the selector offset sweeps across
+                // the text over the whole comp, so every frame is different.
+                const ObjectId a = d.addTextAnimator(comp, l, Document::AnimatorPreset::Opacity);
+                d.setPropertyValue(comp, l, PropRef::animator(a, AnimParam::Position), 0, {0, 40, 0, 0});
+                d.setPropertyValue(comp, l, PropRef::animator(a, AnimParam::End), 0, {30, 0, 0, 0});
+                d.setTextAnimatorOptions(comp, l, a, true, SelectorShape::RampUp, SelectorUnit::Characters);
+                d.setPropertyAnimated(comp, l, PropRef::animator(a, AnimParam::Offset), true, 0);
+                d.setPropertyValue(comp, l, PropRef::animator(a, AnimParam::Offset), 0, {-30, 0, 0, 0});
+                d.setPropertyValue(comp, l, PropRef::animator(a, AnimParam::Offset), 10, {100, 0, 0, 0});
+            };
+        };
+        auto blobs = [](Document& d, ObjectId comp, ObjectId l, int i) {
+            std::mt19937 rng(uint32_t(100 + i));
+            d.setLayerPath(comp, l, benchPath(rng, 120, 8, true));
+            d.setLayerFillStroke(comp, l, true, true);
+            d.setPropertyValue(comp, l, PropId::StrokeWidth, 0, {4, 0, 0, 0});
+        };
+        auto trimmedLines = [](Document& d, ObjectId comp, ObjectId l, int i) {
+            std::mt19937 rng(uint32_t(200 + i));
+            d.setLayerPath(comp, l, benchPath(rng, 150, 6, false));
+            d.setLayerFillStroke(comp, l, false, true);
+            d.setPropertyValue(comp, l, PropId::StrokeWidth, 0, {8, 0, 0, 0});
+            d.setPropertyAnimated(comp, l, PropId::TrimEnd, true, 0);
+            d.setPropertyValue(comp, l, PropId::TrimEnd, 0, {0, 0, 0, 0});
+            d.setPropertyValue(comp, l, PropId::TrimEnd, 10, {100, 0, 0, 0});
+        };
+        auto bezierMask = [](Document& d, ObjectId comp, ObjectId l, int i) {
+            std::mt19937 rng(uint32_t(300 + i));
+            d.addPathMask(comp, l, benchPath(rng, 90, 6, true));
+        };
         std::vector<Spec> specs = {
             {"1080p, 10 shapes", 1920, 1080, 10, 0},
             {"1080p, 100 shapes", 1920, 1080, 100, 0},
@@ -327,13 +392,19 @@ int main(int argc, const char* argv[]) {
             {"4K UHD, full-frame layer, Gaussian Blur 50-100 px", 3840, 2160, 1, 0, fullFrameBlur(100)},
             {"1080p, 500 shapes with 2 masks each (1 feathered)", 1920, 1080, 500, 0, twoMasks},
             {"1080p, 100 shapes, 50 track mattes", 1920, 1080, 100, 0, matteEveryOther},
+            // Phase 4: text and bezier paths
+            {"1080p, 100 text layers x 30 chars (3,000 glyphs)", 1920, 1080, 100, 0, text30(false), LayerKind::Text},
+            {"1080p, 20 text layers x 30 chars, range animator", 1920, 1080, 20, 0, text30(true), LayerKind::Text},
+            {"1080p, 200 bezier paths (8 smooth pts, fill+stroke)", 1920, 1080, 200, 0, blobs},
+            {"1080p, 200 open paths, Trim Paths animated, 8 px", 1920, 1080, 200, 0, trimmedLines},
+            {"1080p, 200 shapes with a bezier mask each", 1920, 1080, 200, 0, bezierMask},
         };
         if (quick) specs.resize(4);
 
         std::vector<Result> results;
         for (const Spec& s : specs) {
             ObjectId asset = 0;
-            const Project p = makeScene(s.w, s.h, s.shapes, s.images, &asset, png, s.decorate);
+            const Project p = makeScene(s.w, s.h, s.shapes, s.images, &asset, png, s.decorate, s.kind);
             if (asset) {
                 if (!r.loadImageSync(asset, 0, png, err)) {
                     std::fprintf(stderr, "image load failed: %s\n", err.c_str());
@@ -341,7 +412,18 @@ int main(int argc, const char* argv[]) {
                 }
             }
             Result res = runScenario(r, s.name, p, frames);
-            std::printf("  %-50s eval %7.3f ms  encode %6.3f ms  gpu %7.3f ms (p95 %7.3f)  %7.0f fps  latency %6.2f ms  offscreen %llu\n",
+            if (!snapshotDir.empty()) {
+                const Composition& c = *p.activeComp();
+                std::vector<float> rgba;
+                std::string e;
+                if (r.renderToRGBA(evaluateFrame(p, c, 5.0), rgba, nullptr, e)) {
+                    std::vector<uint8_t> px(rgba.size());
+                    for (size_t k = 0; k < rgba.size(); ++k) px[k] = uint8_t(std::clamp(rgba[k], 0.0f, 1.0f) * 255 + 0.5f);
+                    std::filesystem::create_directories(snapshotDir);
+                    writePNG(snapshotDir + "/" + std::to_string(&s - specs.data() + 1) + ".png", px, c.width, c.height);
+                }
+            }
+            std::printf("  %-52s eval %7.3f ms  encode %6.3f ms  gpu %7.3f ms (p95 %7.3f)  %7.0f fps  latency %6.2f ms  offscreen %llu\n",
                         res.name.c_str(), res.eval.median, res.encode.median, res.gpu.median, res.gpu.p95, res.fps,
                         res.latency.median, (unsigned long long)res.offscreen);
             results.push_back(res);

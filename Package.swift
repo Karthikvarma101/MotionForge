@@ -28,6 +28,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Metal"), .linkedFramework("MetalKit"), .linkedFramework("QuartzCore"),
                 .linkedFramework("CoreGraphics"), .linkedFramework("ImageIO"), .linkedFramework("MetalPerformanceShaders"),
+                .linkedFramework("CoreText"),
                 .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),

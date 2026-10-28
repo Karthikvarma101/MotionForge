@@ -23,6 +23,9 @@ enum PreviewQuality: Int, CaseIterable, Identifiable {
     }
 }
 
+enum EditorTool { case select, pen }
+enum Workspace { case viewer, nodes }
+
 struct KeyframeRef: Hashable {
     var layer: UInt64
     var ref: MFPropRef
@@ -79,6 +82,9 @@ final class EditorModel: ObservableObject {
     @Published private(set) var layers: [MFLayerInfo] = []
     @Published private(set) var comp: MFCompositionInfo
     @Published private(set) var assets: [MFAssetInfo] = []
+    @Published private(set) var compositions: [MFCompositionInfo] = []
+    /// Compositions opened from precomp layers, so "Back" returns to where you came from.
+    @Published private(set) var compHistory: [UInt64] = []
     /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
     @Published var selection: UInt64? {
         didSet {
@@ -109,6 +115,14 @@ final class EditorModel: ObservableObject {
             UserDefaults.standard.set(cacheBudgetMB, forKey: "cacheBudgetMB")
         }
     }
+
+    // Tools
+    @Published var tool: EditorTool = .select { didSet { if tool != .pen { penDraft = [] } } }
+    @Published var penDraft: [MFPathVertex] = []   // composition space, while drawing
+    @Published var penDrawsMask = false             // pen draws a mask on the selected layer
+    @Published var workspace: Workspace = .viewer
+    @Published var showGraphEditor = false
+    @Published private(set) var userPresets: [MFPresetInfo] = []
 
     // Viewer
     @Published var quality: PreviewQuality = .auto
@@ -146,6 +160,7 @@ final class EditorModel: ObservableObject {
             self.refresh()
         }
         seedStarterContent()
+        reloadUserPresets()
         engine.markCleanForNewDocument()
         refresh()
         startAutosave()
@@ -160,6 +175,7 @@ final class EditorModel: ObservableObject {
         layers = engine.layers()
         comp = engine.composition
         assets = engine.assets()
+        compositions = engine.compositions
         let ids = Set(layers.map(\.layerID))
         if !selectedLayers.isSubset(of: ids) { selectedLayers.formIntersection(ids) }
         if let s = selection, !ids.contains(s) { selection = selectedLayers.first }
@@ -259,6 +275,34 @@ final class EditorModel: ObservableObject {
         var id: UInt64 = 0
         edit { id = $0.addNullLayer() }
         if id != 0 { selection = id }
+    }
+
+    /// Switches the viewer, timeline and inspector to another composition.
+    func openComposition(_ id: UInt64, pushHistory: Bool = true) {
+        guard id != comp.compID, compositions.contains(where: { $0.compID == id }) else { return }
+        closeCoalescedEdit()
+        if pushHistory { compHistory.append(comp.compID) }
+        clearSelection()
+        selectedLayers = []
+        _ = engine.openComposition(id)
+        refresh()
+    }
+
+    func goBackComposition() {
+        guard let id = compHistory.popLast() else { return }
+        openComposition(id, pushHistory: false)
+    }
+
+    func addPrecompLayer(source: UInt64) {
+        var id: UInt64 = 0
+        edit { id = $0.addPrecompLayer(source: source) }
+        if id != 0 { selection = id } else { alertMessage = "A composition can't contain itself." }
+    }
+
+    func newComposition() {
+        var id: UInt64 = 0
+        edit { id = $0.addComposition(name: "", width: comp.width, height: comp.height, fps: comp.fps, duration: comp.duration) }
+        if id != 0 { openComposition(id) }
     }
 
     func addImageLayer(asset: UInt64) {
@@ -370,6 +414,90 @@ final class EditorModel: ObservableObject {
                 p.y += v.y
                 _ = e.setPropertyValue(p, prop: .position, layer: s, time: t)
             }
+        }
+    }
+
+    // MARK: - Text, pen, presets
+
+    func addText() {
+        closeCoalescedEdit()
+        var id: UInt64 = 0
+        edit { id = $0.addTextLayer("Text") }
+        if id != 0 { selectLayer(id, mode: .replace) }
+    }
+
+    /// Finishes the pen path: a new shape layer, or a mask on the selected layer.
+    func commitPen(closed: Bool) {
+        let draft = penDraft
+        penDraft = []
+        guard draft.count >= 2 else { return }
+        if penDrawsMask, let target = selectedLayer, target.kind != .null {
+            let t = time.time
+            // Points and handles from composition space into the layer's own space.
+            let local = draft.map { v -> MFPathVertex in
+                let p = engine.compToLayer(v.point, layer: target.layerID, time: t)
+                let i = engine.compToLayer(CGPoint(x: v.point.x + v.inTangent.x, y: v.point.y + v.inTangent.y), layer: target.layerID, time: t)
+                let o = engine.compToLayer(CGPoint(x: v.point.x + v.outTangent.x, y: v.point.y + v.outTangent.y), layer: target.layerID, time: t)
+                return MFPathVertex(point: p, inTangent: CGPoint(x: i.x - p.x, y: i.y - p.y), outTangent: CGPoint(x: o.x - p.x, y: o.y - p.y))
+            }
+            edit { _ = $0.addPathMask(vertices: local, layer: target.layerID) }
+        } else {
+            var id: UInt64 = 0
+            edit { id = $0.addPathLayer(vertices: draft, closed: closed) }
+            if id != 0 { selectLayer(id, mode: .replace) }
+        }
+    }
+
+    static var presetsDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MotionForge/Presets", isDirectory: true)
+    }
+
+    func reloadUserPresets() {
+        let dir = Self.presetsDirectory
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        userPresets = files.filter { $0.pathExtension == "mfpreset" }
+            .compactMap { (try? String(contentsOf: $0, encoding: .utf8)).flatMap { MFPresetInfo.preset(withJSON: $0) } }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func applyPreset(_ preset: MFPresetInfo) {
+        let targets = selectedLayerIDs
+        guard !targets.isEmpty else {
+            alertMessage = "Select the layer(s) to apply “\(preset.name)” to."
+            return
+        }
+        closeCoalescedEdit()
+        var message: NSString?
+        var count = 0
+        edit { count = $0.applyPreset(preset.json, layers: targets.map { NSNumber(value: $0) }, time: time.time, message: &message) }
+        if count == 0 || message != nil {
+            alertMessage = (count == 0 ? "Nothing was applied. " : "") + ((message as String?) ?? "")
+        }
+    }
+
+    /// Saves the primary layer's effects, text animators and keyframes as a reusable preset.
+    func saveSelectionAsPreset() {
+        guard let layer = selectedLayer else { return }
+        let alert = NSAlert()
+        alert.messageText = "Save Animation Preset"
+        alert.informativeText = "Saves the effects, text animators and keyframes of “\(layer.name)”."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = layer.name + " Animation"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        let json = engine.preset(fromLayer: layer.layerID, name: name, category: "My Presets")
+        do {
+            try FileManager.default.createDirectory(at: Self.presetsDirectory, withIntermediateDirectories: true)
+            let safe = name.replacingOccurrences(of: "/", with: "-")
+            try json.write(to: Self.presetsDirectory.appendingPathComponent(safe + ".mfpreset"), atomically: true, encoding: .utf8)
+            reloadUserPresets()
+        } catch {
+            alertMessage = "Could not save the preset: \(error.localizedDescription)"
         }
     }
 
@@ -651,7 +779,14 @@ final class EditorModel: ObservableObject {
         case 121: stepFrames(1); return true                                     // page down
         case 115: goToStart(); return true                                       // home
         case 119: goToEnd(); return true                                         // end
-        case 53: clearSelection(); return true                                   // escape
+        case 53:                                                                 // escape
+            if !penDraft.isEmpty { penDraft = [] } else if tool == .pen { tool = .select } else { clearSelection() }
+            return true
+        case 36, 76:                                                             // return / enter
+            if tool == .pen && penDraft.count >= 2 { commitPen(closed: false); return true }
+            return false
+        case 35: tool = .pen; return true                                         // P
+        case 9: tool = .select; return true                                       // V
         default: return false
         }
     }

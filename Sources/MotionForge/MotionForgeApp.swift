@@ -81,8 +81,14 @@ struct ContentView: View {
                 LeftPanel(model: model)
                     .frame(minWidth: 210, idealWidth: 250, maxWidth: 380)
                 VSplitView {
-                    ViewerView(model: model, time: model.time, perf: model.perf)
-                        .frame(minHeight: 260, idealHeight: 560)
+                    Group {
+                        if model.workspace == .viewer {
+                            ViewerView(model: model, time: model.time, perf: model.perf)
+                        } else {
+                            NodeGraphView(model: model)
+                        }
+                    }
+                    .frame(minHeight: 260, idealHeight: 560)
                     TimelineView(model: model, time: model.time)
                         .frame(minHeight: 170, idealHeight: 300)
                 }
@@ -118,8 +124,30 @@ struct EditorToolbar: ToolbarContent {
                 .help("New star layer")
             Button { model.addNull() } label: { Label("Null", systemImage: "square.dashed") }
                 .help("New null (controller) layer for parenting")
+            Button { model.addText() } label: { Label("Text", systemImage: "textformat") }
+                .help("New text layer")
+            Toggle(isOn: Binding(get: { model.tool == .pen }, set: { model.tool = $0 ? .pen : .select })) {
+                Label("Pen", systemImage: "pencil.and.outline")
+            }
+            .help("Pen tool (P): click for corners, drag for curves, click the first point to close, Return for an open line. V returns to selection.")
+            if model.tool == .pen {
+                Picker("", selection: $model.penDrawsMask) {
+                    Text("New Shape").tag(false)
+                    Text("Mask on Layer").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .help("Draw a new shape layer, or a bezier mask on the selected layer")
+            }
             Button { model.presentImportPanel() } label: { Label("Import", systemImage: "photo.badge.plus") }
                 .help("Import images as layers")
+        }
+        ToolbarItem(placement: .principal) {
+            Picker("", selection: $model.workspace) {
+                Label("Viewer", systemImage: "play.rectangle").tag(Workspace.viewer)
+                Label("Nodes", systemImage: "point.3.connected.trianglepath.dotted").tag(Workspace.nodes)
+            }
+            .pickerStyle(.segmented)
+            .help("Viewer or node workspace")
         }
         ToolbarItemGroup(placement: .primaryAction) {
             Button { model.undo() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
@@ -163,6 +191,8 @@ struct AppCommands: Commands {
             Button("New Polygon") { model.addShape(.polygon) }
             Button("New Star") { model.addShape(.star) }
             Button("New Null") { model.addNull() }.keyboardShortcut("y", modifiers: [.command, .option, .shift])
+            Button("New Text") { model.addText() }.keyboardShortcut("t", modifiers: [.command, .option, .shift])
+            Button("Pen Tool (P)") { model.tool = .pen }
             Divider()
             Button("Duplicate") { model.duplicateSelection() }.keyboardShortcut("d").disabled(model.selection == nil)
             Button("Delete") { model.deleteSelection() }.disabled(model.selection == nil && model.selectedKeyframes.isEmpty)
@@ -176,6 +206,8 @@ struct AppCommands: Commands {
             Divider()
             Button("New Rectangle Mask") { model.addMask(.rectangle) }.disabled(model.selection == nil)
             Button("New Ellipse Mask") { model.addMask(.ellipse) }.disabled(model.selection == nil)
+            Divider()
+            Button("Save Animation Preset…") { model.saveSelectionAsPreset() }.disabled(model.selection == nil)
         }
         CommandMenu("Effect") {
             ForEach(MFEngine.effectCatalog(), id: \.type.rawValue) { e in

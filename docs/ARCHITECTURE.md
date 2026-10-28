@@ -1,4 +1,4 @@
-# MotionForge architecture (Phases 1–3)
+# MotionForge architecture (Phases 1–4)
 
 ## Layers of the system
 
@@ -7,10 +7,11 @@
           │  Objective-C bridge            MFEngine.h — the only header Swift sees
           ▼
  MFRender (Objective-C++)                  MetalRenderer: pipelines, pools, frame cache, media
+                                           TextEngine: CoreText layout cache, glyph sheets
           │
           ▼
  MFCore (C++20, platform-free)             Document (edits/undo) → Evaluator (draw list + hash)
-                                           ProjectIO (.mfproj), Json, LruCache, Math
+                                           ProjectIO (.mfproj), Presets, Json, LruCache, Math
 ```
 
 MFCore has no Apple dependencies, so the model, keyframe maths, evaluation, undo and the file
@@ -29,21 +30,28 @@ tools (`mftests`, `mfbench`, `mfcli`) can also include `MFRender/MetalRenderer.h
    key, so cache invalidation is dependency-exact by construction: an edit invalidates exactly
    the frames whose evaluated result changed — no dependency graph to maintain or get wrong.
 3. **Composite (GPU)** — one render pass into an `RGBA16Float`, premultiplied, private-storage
-   target. Each item is packed into a 112-byte instance in a shared-storage buffer (unified
-   memory: the CPU writes, the GPU reads, no copy). Consecutive shapes are one instanced
-   draw call; images batch per texture. Shapes are signed-distance functions (rounded box,
-   ellipse, regular polygon, star) with analytic anti-aliasing from the screen-space gradient, so
-   there is no MSAA memory cost. Fill and centred stroke are evaluated in the same fragment.
+   target. Each item is packed into a 128-byte instance (8 × float4; 112 bytes before Phase 4
+   added the path edge ranges) in a shared-storage buffer (unified memory: the CPU writes, the
+   GPU reads, no copy). Consecutive shapes are one instanced draw call; images batch per texture;
+   a text layer is one draw call of glyph quads. Shapes are signed-distance functions (rounded
+   box, ellipse, regular polygon, star, bezier path) with analytic anti-aliasing from the
+   screen-space gradient, so there is no MSAA memory cost. Fill and centred stroke are evaluated
+   in the same fragment.
 4. **Blend** — on Apple GPUs the fragment shader reads the destination pixel (programmable
    blending / framebuffer fetch, which tile memory makes free). Normal, Add, Multiply, Screen,
    Overlay, Darken and Lighten all use the premultiplied separable formula in a single pass, with
    no ping-pong copies. Overlapping instances inside one draw call blend in submission order (the
    `render_stacking_and_blend_modes` test checks this). Non-Apple GPUs fall back to fixed-function
    premultiplied "normal".
-5. **Masks** — evaluated analytically in the same fragment shader as the layer (rounded-box or
-   ellipse SDF per mask, minus expansion, smoothstep over the feather, inverted, × opacity),
-   combined in order as add (union), subtract, intersect or difference. Layers without masks use
-   pipelines specialised with a Metal function constant, so they don't run the mask code at all.
+5. **Masks** — evaluated analytically in the same fragment shader as the layer (rounded-box,
+   ellipse or bezier-path SDF per mask, minus expansion, smoothstep over the feather, inverted,
+   × opacity), combined in order as add (union), subtract, intersect or difference. Pipelines
+   are specialised with two Metal function constants, `kHasMasks` (0) and `kHasPaths` (1), so
+   plain layers run neither the mask loop nor the path-edge code (with the path branches compiled
+   in, plain shapes measured 7.7% slower in the interleaved A/B; specialised, within ~1% of
+   Phase 1). Text is drawn as many glyph quads, so a masked text layer goes offscreen and its
+   masks are applied once to the assembled layer (`mask_apply_fragment`, fixed-function blend
+   destination × source alpha).
 6. **Effects and track mattes** — a layer with effects or a matte is rendered first into an
    offscreen RGBA16F region: its transformed bounds plus the reach of its effects (blur radius,
    shadow distance + softness, glow radius), limited to the frame grown by that reach, rounded
@@ -58,11 +66,13 @@ tools (`mftests`, `mfbench`, `mfcli`) can also include `MFRender/MetalRenderer.h
      un-premultiplied colour.
    Spatial parameters are multiplied by `sqrt(|det(layer → target)|)`, so effects follow the
    layer's scale and look identical at full, half and quarter preview resolution (tested).
+   Text layers size this region from their *animated* glyph boxes, so characters an animator
+   moves stay inside it.
    A track matte renders its source layer (masks, effects and opacity included) into the same
    region and multiplies the layer by its alpha or luminance (optionally inverted).
    Scratch textures are recycled within the frame, since Metal orders passes on the same
-   resources, so a chain of N effects needs about three textures. All instances and masks of a
-   frame live in one sub-allocated shared buffer.
+   resources, so a chain of N effects needs about three textures. All instances, masks and path
+   edges of a frame live in one sub-allocated shared buffer.
 7. **Composite** — the main pass draws plain layers directly and offscreen results as textured
    quads, all bottom-to-top with their blend modes and opacity, in a single render pass.
 8. **Present** — a full-screen triangle maps the frame into the `MTKView` drawable with the viewer
@@ -113,8 +123,8 @@ The GPU shares RAM with macOS and every other app, so budgets are deliberately s
   *critical* drops every recreatable resource. Imported media is kept (it would only be decoded again).
 - Media textures are private-storage RGBA8 with mipmaps; frame targets are private-storage
   RGBA16F, which on Apple GPUs also enables lossless framebuffer compression.
-
-Known gap: cached frames at full RGBA16F are large (16.6 MB at 1080p). See the README.
+- **Glyph sheets**: R8 coverage textures within a 96 MB budget, oldest evicted first; frames in
+  flight keep the sheets they use alive (see *Text*).
 
 ## Colour
 
@@ -133,6 +143,93 @@ keys store explicit handles as offsets. A segment is a cubic bezier between the 
 handles. The temporal easing gives a fraction of the segment's *arc length* (48-sample table), so
 linear timing moves at constant speed around curves. Segments whose handles lie on the chord take
 the plain linear path. The viewer draws the path with the parent's transform at the current time.
+
+## Text
+
+- **Model**: a text layer stores the string, a font's PostScript name and alignment; Font Size,
+  Tracking (1/1000 em), Line Height and Fill Colour are ordinary animatable properties. Lines
+  are split on newlines (point text).
+- **Layout** (`TextEngine.mm`): CoreText lays out each line once per style (string, font, size,
+  tracking, line height, alignment) and the result is cached process-wide by a style key. The
+  layout is in layer units, independent of zoom or preview resolution.
+- **Bounds in the core**: MFCore is platform-free, so it can't call CoreText. It exposes a
+  `setTextMeasurer` hook; `MetalRenderer::init` installs the CoreText measurer once
+  (`std::call_once`), so evaluation, hit-testing and selection outlines use the real metrics.
+  Without a renderer (pure core tests) a width estimate is used.
+- **Glyph sheets**: every glyph of a layout is rasterised once into an 8-bit coverage sheet
+  (shelf-packed, padded) at the layer's on-screen scale rounded *up* to a 2^(1/8) step. Glyphs
+  are therefore always drawn at or below their raster size (never blurry), and animating scale or
+  zoom re-rasterises only every ~9% of change. Sheets are keyed by style + scale step.
+- **Drawing**: one instance per glyph, sampling the sheet, all in one draw call per layer. Each
+  glyph gets its own transform and opacity from the layer's text animators.
+- **Animators**: each has a range selector (Start, End, Offset in percent of the units; Amount)
+  over characters, words or lines, with a shape — Square, Ramp Up, Ramp Down, Triangle, Round,
+  Smooth — that turns a unit's position in the range into a weight 0–1 (`selectorWeight`). A
+  unit's Position / Scale / Rotation / Opacity are blended by that weight, scaling and rotating
+  about the character's baseline centre; several animators stack (offsets add, scales multiply). A typewriter is Start 0 → 100 with a Square shape.
+
+## Bezier paths, bezier masks and Trim Paths
+
+- **Model**: `BezierPath` = vertices (point, in-handle, out-handle, handles relative to the
+  point) + closed flag, in layer space. Path shape layers and path masks share it. The pen tool
+  puts the layer's position at the centre of what was drawn.
+- **Flattening** (`flattenPath`, MFCore): adaptive cubic subdivision to a quarter of a *target*
+  pixel (tolerance divided by the layer's on-screen scale), every frame at encode time. Edges go
+  into the frame's shared buffer as float4 (x0, y0, x1, y1); an instance stores its fill edge
+  range and stroke edge range in its last float4.
+- **Shading**: the fragment computes the distance to every edge of its path and the winding
+  number (non-zero rule) in the same loop, giving a signed distance and the same analytic AA as
+  the built-in shapes. Strokes use the unsigned distance to the (possibly trimmed) stroke edges,
+  so they have round caps and joins. Cost is covered pixels × edges, which is why many large
+  paths are the slowest primitive in the benchmark; caching path coverage or binning edges per
+  tile are the obvious next steps.
+- **Trim Paths** (`trimmedEdges`): the flattened polyline is measured by arc length and only the
+  edges between Start and End (+ Offset) are emitted for the stroke. Closed paths wrap around
+  their start; open paths clamp. The fill always uses the whole closed outline.
+- **Bezier masks**: the same signed distance, offset by the mask position, then the usual
+  expansion / feather / mode / opacity of rectangle and ellipse masks.
+
+## Graph editor easing
+
+Temporal easing stays the cubic-bezier timing curve per segment (x = normalised time, y =
+normalised progress). Each Bezier side of a key has an influence (`easeIn` / `easeOut`, the
+handle's x reach) and, since Phase 4, a speed (`inSlope` / `outSlope`, the slope of the timing
+curve at that key):
+
+```
+outgoing side:  x1 = easeOut,       y1 = easeOut × outSlope
+incoming side:  x2 = 1 − easeIn,    y2 = 1 − easeIn × inSlope
+```
+
+Slope 0 is the old ease-to-a-stop, 1 is linear speed, >1 overshoots, <0 anticipates (clamped to
+±20). Linear sides keep the diagonal (1/3, 2/3), so linear segments are exactly linear and every
+pre-v4 key evaluates as before. The graph editor draws value over time by sampling the property
+(curves can overshoot between keys); dragging a handle sets influence from its horizontal reach
+and speed from its height (`Document::setKeyframeEase`, one undo step per drag). A key has one
+ease for all components, so on a 2-D property the component that changes most carries the handles.
+
+## Presets
+
+A preset is JSON (`"format": "motionforge.preset"`, version 1): name, category, `tracks`,
+`effects` and `animators`. `makePreset` captures a layer's animated properties with key times
+relative to its earliest key. Position, anchor point and rotation tracks are *relative*: stored as
+offsets from the layer's last key (category "Entrances", so the animation ends where the layer is)
+or first key (everything else, so it starts there). `applyPreset` adds those offsets to each target
+layer's current value, places the start at the playhead, re-creates effects and text animators
+with their keys, and reports what didn't apply (a text preset on a shape layer is refused, not
+half-applied). All targets change in one undo group. The 13 built-ins are built with the same
+document calls as the app; user presets are `.mfpreset` files in
+`~/Library/Application Support/MotionForge/Presets`.
+
+## Node workspace
+
+The node view is a projection of the layer stack, not a second compositor: each layer is a row
+Source → Masks → Effects → output, and all outputs feed one Composite node whose slots are the
+stacking order. Matte and parent links are drawn as wires into each layer's matte and parent
+sockets. Dropping an output on a socket calls the same document edits as the inspector
+(`setLayer(matte:)`, `setLayer(parent:)`), dropping it on a Composite slot calls `moveLayer`, so
+the graph can never describe something the renderer doesn't do, and every change undoes like the
+inspector's. Positions are computed from the stack each time, so nothing extra is saved.
 
 ## Selection and clipboard
 
@@ -158,7 +255,28 @@ snapshot is a few KB). This makes every operation undoable by construction, incl
 later. `beginGroup`/`endGroup` make an interactive drag or a scrub one step; no-op edits record
 nothing. History is capped at 500 steps.
 
-## Project file (`.mfproj`, version 3)
+## Project file (`.mfproj`, version 4)
+
+Version 4 adds text layers (`"kind": "text"` with a `text` object and optional `animators`), path
+shape layers and path masks (`"shape": "path"` with a `path` object: `closed` plus one
+`[x, y, inX, inY, outX, outY]` array per vertex, handles relative to the point) and the graph
+editor's `inSlope` / `outSlope` on keyframes (written only when non-zero). Older files have none
+of these and load unchanged (abridged: every animator parameter is written):
+
+```json
+{"id": 21, "name": "Title", "kind": "text", "blend": "normal", "visible": true, "in": 0, "out": 10,
+ "text": {"string": "MotionForge", "font": "AvenirNext-Heavy", "align": "center"},
+ "animators": [{"id": 22, "name": "Opacity", "enabled": true, "shape": "square", "unit": "characters",
+                "params": {"start": {"value": [0], "keyframes": [
+                             {"t": 0, "v": [0], "in": "linear", "out": "linear"},
+                             {"t": 1, "v": [100], "in": "linear", "out": "linear"}]},
+                           "opacity": {"value": [0]}}}],
+ "properties": {"fontSize": {"value": [120]}, "tracking": {"value": [0]}}}
+
+{"id": 30, "name": "Shape 1", "kind": "shape", "shape": "path",
+ "path": {"closed": true, "vertices": [[-100, 50, 0, 0, 0, 0], [100, 50, 0, 0, 0, 0], [0, -60, -40, 0, 40, 0]]},
+ "properties": {"trimEnd": {"value": [60]}}}
+```
 
 Version 3 stores each spatial keyframe's `spatial` mode (`linear`, `auto`, `bezier`) and, for
 Bezier keys, its handles `ti` / `to`; keys without it (versions 1–2) load as straight paths.
@@ -181,7 +299,7 @@ Main structure:
 ```json
 {
   "format": "motionforge.project",
-  "version": 3,
+  "version": 4,
   "nextId": 9,
   "activeComposition": 1,
   "assets": [{"id": 2, "kind": "image", "name": "photo.png",

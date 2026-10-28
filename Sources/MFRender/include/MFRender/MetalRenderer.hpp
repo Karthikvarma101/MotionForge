@@ -32,6 +32,8 @@
 
 namespace mf {
 
+class GlyphSheetCache;
+
 struct PresentParams {
     double originX = 0, originY = 0;  // composition top-left, drawable pixels
     double scale = 1;                 // drawable pixels per composition pixel
@@ -115,9 +117,12 @@ private:
     enum class PoolKind : uint64_t { Target = 0, Scratch = 1, Cache8 = 2 };
     struct Arena;  // per-frame scratch textures + one sub-allocated instance buffer
     struct PassItem {
+        enum class Role : uint8_t { Normal, Glyph, MaskApply };
         DrawItem d;
-        id<MTLTexture> tex = nil;  // overrides the image asset (offscreen results)
+        id<MTLTexture> tex = nil;  // image override (offscreen result) or glyph sheet
         bool masks = true;
+        Role role = Role::Normal;
+        Value glyphStroke{};  // glyphs: stroke colour (straight RGBA), drawn from the sheet's G channel
     };
     struct Prepared {
         id<MTLTexture> tex = nil;
@@ -137,12 +142,22 @@ private:
     bool admitLocked(const FrameDesc& f) const;
 
     void encodeComposite(const FrameDesc& f, id<MTLCommandBuffer> cb, id<MTLTexture> target, bool* complete);
+    // Every item of `f` into `target`, whose top-left is at `origin` in f's target pixels (nested
+    // precomps render into a region of the frame).
+    void encodeLayers(const FrameDesc& f, id<MTLCommandBuffer> cb, id<MTLTexture> target, int originX, int originY,
+                      Arena& arena, bool* complete, uint64_t* draws, uint64_t* offscreen);
+    // Multiplies `tex` (covering region r) by masks in the layer space of `d`.
+    void applyMasks(id<MTLCommandBuffer> cb, id<MTLTexture> tex, const FrameDesc& f, const DrawItem& d, const int* r,
+                    Arena& arena, bool* complete);
     void encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> target, const FrameDesc& f,
-                         const std::vector<PassItem>& items, Arena& arena, bool* complete, uint64_t* draws);
+                         const std::vector<PassItem>& items, Arena& arena, bool* complete, uint64_t* draws,
+                         bool clear = true);
+    // Text layers become one instance per visible glyph, with the animators applied.
+    void appendGlyphs(const FrameDesc& f, const DrawItem& d, std::vector<PassItem>& out);
     Prepared renderOffscreen(id<MTLCommandBuffer> cb, const FrameDesc& f, const DrawItem& d, bool keepOpacity,
                              const int* region, Arena& arena, bool* complete);
     id<MTLTexture> applyEffect(id<MTLCommandBuffer> cb, id<MTLTexture> src, const EffectEval& e, double scale,
-                               Arena& arena);
+                               const Affine& layerToRegion, Arena& arena);
     id<MTLTexture> blur(id<MTLCommandBuffer> cb, id<MTLTexture> src, double sigma, Arena& arena);
     void runKernel(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pso, const std::vector<id<MTLTexture>>& textures,
                    const void* params, size_t length);
@@ -151,8 +166,12 @@ private:
     id<MTLCommandQueue> queue_ = nil;
     id<MTLRenderPipelineState> shapePSO_ = nil, imagePSO_ = nil;              // no masks
     id<MTLRenderPipelineState> shapeMaskPSO_ = nil, imageMaskPSO_ = nil;      // with masks
+    id<MTLRenderPipelineState> shapePathPSO_ = nil, shapePathMaskPSO_ = nil;  // bezier paths (+ masks)
+    id<MTLRenderPipelineState> imagePathMaskPSO_ = nil;                       // images with path masks
+    id<MTLRenderPipelineState> glyphPSO_ = nil, maskApplyPSO_ = nil;
+    std::unique_ptr<GlyphSheetCache> glyphs_;
     id<MTLComputePipelineState> fxShadow_ = nil, fxOver_ = nil, fxBright_ = nil, fxGlow_ = nil, fxColor_ = nil,
-                                fxMatte_ = nil, toRGBA8_ = nil;
+                                fxMatte_ = nil, fxRamp_ = nil, toRGBA8_ = nil;
     id<MTLFunction> presentVS_ = nil, presentFS_ = nil;
     std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> presentPSOs_;  // by drawable pixel format
     id<MTLSamplerState> linearMip_ = nil, linear_ = nil, nearest_ = nil;

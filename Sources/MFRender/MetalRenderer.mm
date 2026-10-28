@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 
 #include "Shaders.hpp"
+#include "TextEngine.hpp"
 
 namespace mf {
 
@@ -24,8 +26,13 @@ struct ItemGPU {
     float stroke[4];
     float p0[4];
     float p1[4];
+    float p2[4];  // bezier paths: fill edge start/count, stroke edge start/count
 };
-static_assert(sizeof(ItemGPU) == 112, "ItemGPU must match the MSL layout");
+static_assert(sizeof(ItemGPU) == 128, "ItemGPU must match the MSL layout");
+
+struct EdgeGPU {
+    float x0, y0, x1, y1;
+};
 
 // Mirrors `struct Mask` in Shaders.hpp.
 struct MaskGPU {
@@ -88,6 +95,99 @@ void packItem(const DrawItem& d, ItemGPU& g) {
     g.p1[1] = float(static_cast<int>(d.blend));
     g.p1[2] = 0;  // mask start / count are filled in by the pass
     g.p1[3] = 0;
+    g.p2[0] = g.p2[1] = g.p2[2] = g.p2[3] = 0;
+}
+
+void appendEdges(const std::vector<Vec2>& pts, bool close, std::vector<EdgeGPU>& out) {
+    for (size_t i = 0; i + 1 < pts.size(); ++i)
+        out.push_back({float(pts[i].x), float(pts[i].y), float(pts[i + 1].x), float(pts[i + 1].y)});
+    if (close && pts.size() > 2 && (pts.front().x != pts.back().x || pts.front().y != pts.back().y))
+        out.push_back({float(pts.back().x), float(pts.back().y), float(pts.front().x), float(pts.front().y)});
+}
+
+// Stroke edges of a polyline trimmed to [start, end] (+ offset) as fractions of its length.
+// Closed paths wrap around; open paths clamp.
+void trimmedEdges(const std::vector<Vec2>& pts, bool closed, double s, double e, double o, std::vector<EdgeGPU>& out) {
+    if (pts.size() < 2) return;
+    std::vector<double> len(pts.size(), 0);
+    for (size_t i = 1; i < pts.size(); ++i) len[i] = len[i - 1] + std::hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    const double T = len.back();
+    if (T <= 0) return;
+    if (e < s) std::swap(s, e);
+    if (e - s >= 1 - 1e-9) {
+        appendEdges(pts, false, out);
+        return;
+    }
+    auto range = [&](double A, double B) {
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            const double l0 = len[i], l1 = len[i + 1];
+            const double a = std::max(A, l0), b = std::min(B, l1);
+            if (b <= a || l1 <= l0) continue;
+            auto at = [&](double d) {
+                const double t = (d - l0) / (l1 - l0);
+                return Vec2{pts[i].x + (pts[i + 1].x - pts[i].x) * t, pts[i].y + (pts[i + 1].y - pts[i].y) * t};
+            };
+            const Vec2 p = at(a), q = at(b);
+            out.push_back({float(p.x), float(p.y), float(q.x), float(q.y)});
+        }
+    };
+    double a = s + o, b = e + o;
+    if (closed) {
+        const double k = std::floor(a);
+        a -= k;
+        b -= k;
+        if (b > 1) {
+            range(a * T, T);
+            range(0, (b - 1) * T);
+        } else {
+            range(a * T, b * T);
+        }
+    } else {
+        a = std::clamp(a, 0.0, 1.0);
+        b = std::clamp(b, 0.0, 1.0);
+        if (b > a) range(a * T, b * T);
+    }
+}
+
+// Per-glyph transform (layer space) and opacity from the text animators.
+Affine glyphTransform(const FrameDesc& f, const DrawItem& d, const TextLayout& lay, const GlyphInfo& g, double* opacity) {
+    Vec2 off{0, 0};
+    double s = 1, rot = 0, op = 1;
+    for (uint32_t i = 0; i < d.animatorCount; ++i) {
+        const AnimatorEval& a = f.animators[d.animatorStart + i];
+        const int n = a.unit == SelectorUnit::Characters ? lay.characters : a.unit == SelectorUnit::Words ? lay.words : lay.lines;
+        const int idx = a.unit == SelectorUnit::Characters ? g.character : a.unit == SelectorUnit::Words ? g.word : g.line;
+        const double w = selectorWeight(a.shape, a.start + a.offset, a.end + a.offset, idx, n) * a.amountOf(idx);
+        if (w == 0) continue;
+        off = off + a.position * w;
+        s *= 1 + (a.scale - 1) * w;
+        rot += a.rotation * w;
+        op *= 1 + (a.opacity - 1) * w;
+    }
+    *opacity = std::clamp(op, 0.0, 1.0);
+    // Characters scale and rotate about their baseline centre.
+    const Vec2 anchor{g.origin.x + (g.rect.origin.x + g.rect.size.width * 0.5), g.origin.y};
+    return Affine::translate(anchor.x + off.x, anchor.y + off.y) * Affine::rotateDegrees(rot) * Affine::scale(s, s) *
+           Affine::translate(-anchor.x, -anchor.y);
+}
+
+// Layer-space box around every animated glyph (offscreen regions must contain moved characters).
+void textGlyphBounds(const FrameDesc& f, const DrawItem& d, Vec2& mn, Vec2& mx) {
+    auto lay = layoutText(d.text);
+    mn = d.boundsMin;
+    mx = d.boundsMax;
+    if (d.animatorCount == 0) return;
+    for (const GlyphInfo& g : lay->glyphs) {
+        double op;
+        const Affine t = glyphTransform(f, d, *lay, g, &op);
+        const CGRect r = g.rect;
+        for (Vec2 c : {Vec2{r.origin.x, -r.origin.y}, Vec2{r.origin.x + r.size.width, -r.origin.y},
+                       Vec2{r.origin.x, -(r.origin.y + r.size.height)}, Vec2{r.origin.x + r.size.width, -(r.origin.y + r.size.height)}}) {
+            const Vec2 q = t.apply(g.origin + c);
+            mn = {std::min(mn.x, q.x), std::min(mn.y, q.y)};
+            mx = {std::max(mx.x, q.x), std::max(mx.y, q.y)};
+        }
+    }
 }
 
 void packMask(const MaskEval& m, MaskGPU& g) {
@@ -123,10 +223,9 @@ bool offscreenRegion(const FrameDesc& f, const DrawItem& d, int out[4]) {
     const Affine& m = d.toTarget;
     const double px = 1.0 / std::sqrt(std::max(std::abs(m.determinant()), 1e-12));
     const double pad = d.strokeWidth * 0.5 + 2 * px;
-    const Vec2 corners[4] = {{d.boundsMin.x - pad, d.boundsMin.y - pad},
-                             {d.boundsMax.x + pad, d.boundsMin.y - pad},
-                             {d.boundsMax.x + pad, d.boundsMax.y + pad},
-                             {d.boundsMin.x - pad, d.boundsMax.y + pad}};
+    Vec2 bmn = d.boundsMin, bmx = d.boundsMax;
+    if (d.kind == LayerKind::Text) textGlyphBounds(f, d, bmn, bmx);
+    const Vec2 corners[4] = {{bmn.x - pad, bmn.y - pad}, {bmx.x + pad, bmn.y - pad}, {bmx.x + pad, bmx.y + pad}, {bmn.x - pad, bmx.y + pad}};
     double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
     for (const Vec2& c : corners) {
         const Vec2 p = m.apply(c);
@@ -197,12 +296,13 @@ bool MetalRenderer::init(id<MTLDevice> device, std::string& error) {
         return false;
     }
 
-    auto makeItemPSO = [&](NSString* fragment, NSString* label, bool masks) -> id<MTLRenderPipelineState> {
+    auto makeItemPSO = [&](NSString* fragment, NSString* label, bool masks, bool paths = false) -> id<MTLRenderPipelineState> {
         MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
         d.label = label;
         MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
-        bool m = masks;
+        bool m = masks, p = paths;
         [fc setConstantValue:&m type:MTLDataTypeBool atIndex:0];
+        [fc setConstantValue:&p type:MTLDataTypeBool atIndex:1];
         NSError* fe = nil;
         d.vertexFunction = [lib newFunctionWithName:@"item_vertex" constantValues:fc error:&fe];
         d.fragmentFunction = [lib newFunctionWithName:fragment constantValues:fc error:&fe];
@@ -233,16 +333,49 @@ bool MetalRenderer::init(id<MTLDevice> device, std::string& error) {
     imagePSO_ = makeItemPSO(@"image_fragment", @"images", false);
     shapeMaskPSO_ = makeItemPSO(@"shape_fragment", @"masked shapes", true);
     imageMaskPSO_ = makeItemPSO(@"image_fragment", @"masked images", true);
+    glyphPSO_ = makeItemPSO(@"glyph_fragment", @"glyphs", false);
+    shapePathPSO_ = makeItemPSO(@"shape_fragment", @"paths", false, true);
+    shapePathMaskPSO_ = makeItemPSO(@"shape_fragment", @"masked paths", true, true);
+    imagePathMaskPSO_ = makeItemPSO(@"image_fragment", @"images with path masks", true, true);
+    {
+        // Masks on assembled text: destination x mask, via fixed-function blending.
+        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+        d.label = @"mask apply";
+        MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+        bool m = true;
+        [fc setConstantValue:&m type:MTLDataTypeBool atIndex:0];
+        [fc setConstantValue:&m type:MTLDataTypeBool atIndex:1];
+        NSError* e = nil;
+        d.vertexFunction = [lib newFunctionWithName:@"item_vertex" constantValues:fc error:&e];
+        d.fragmentFunction = [lib newFunctionWithName:@"mask_apply_fragment" constantValues:fc error:&e];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        auto* ca = d.colorAttachments[0];
+        ca.blendingEnabled = YES;
+        ca.sourceRGBBlendFactor = ca.sourceAlphaBlendFactor = MTLBlendFactorZero;
+        ca.destinationRGBBlendFactor = ca.destinationAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+        maskApplyPSO_ = [device_ newRenderPipelineStateWithDescriptor:d error:&e];
+    }
+    glyphs_ = std::make_unique<GlyphSheetCache>(device_);
+    static std::once_flag measurerOnce;
+    std::call_once(measurerOnce, [] {
+        setTextMeasurer([](const TextStyle& st, Vec2& mn, Vec2& mx) {
+            auto lay = layoutText(st);
+            mn = lay->mn;
+            mx = lay->mx;
+        });
+    });
     fxShadow_ = makeKernel(@"fx_shadow");
     fxOver_ = makeKernel(@"fx_over");
     fxBright_ = makeKernel(@"fx_bright");
     fxGlow_ = makeKernel(@"fx_glow");
     fxColor_ = makeKernel(@"fx_color");
     fxMatte_ = makeKernel(@"fx_matte");
+    fxRamp_ = makeKernel(@"fx_ramp");
     toRGBA8_ = makeKernel(@"to_rgba8");
     presentVS_ = [lib newFunctionWithName:@"present_vertex"];
     presentFS_ = [lib newFunctionWithName:@"present_fragment"];
-    if (!shapePSO_ || !imagePSO_ || !shapeMaskPSO_ || !imageMaskPSO_ || !fxShadow_ || !fxOver_ || !fxBright_ || !fxGlow_ || !fxColor_ || !fxMatte_ ||
+    if (!shapePSO_ || !imagePSO_ || !shapeMaskPSO_ || !imageMaskPSO_ || !glyphPSO_ || !maskApplyPSO_ || !shapePathPSO_ ||
+        !shapePathMaskPSO_ || !imagePathMaskPSO_ || !fxShadow_ || !fxOver_ || !fxBright_ || !fxGlow_ || !fxColor_ || !fxMatte_ || !fxRamp_ ||
         !toRGBA8_ || !presentVS_ || !presentFS_) {
         if (error.empty()) error = "Missing shader functions";
         return false;
@@ -583,7 +716,7 @@ id<MTLTexture> MetalRenderer::blur(id<MTLCommandBuffer> cb, id<MTLTexture> src, 
 }
 
 id<MTLTexture> MetalRenderer::applyEffect(id<MTLCommandBuffer> cb, id<MTLTexture> src, const EffectEval& e,
-                                          double scale, Arena& arena) {
+                                          double scale, const Affine& layerToRegion, Arena& arena) {
     auto take = [&](id<MTLTexture> like) {
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it)
             if ((*it).width == like.width && (*it).height == like.height) {
@@ -656,16 +789,65 @@ id<MTLTexture> MetalRenderer::applyEffect(id<MTLCommandBuffer> cb, id<MTLTexture
             release(src);
             return out;
         }
+        case EffectType::GradientRamp: {
+            const Vec2 a = layerToRegion.apply({v[0], v[1]}), b = layerToRegion.apply({v[6], v[7]});
+            p.a[0] = float(a.x);
+            p.a[1] = float(a.y);
+            p.a[2] = float(b.x);
+            p.a[3] = float(b.y);
+            for (int i = 0; i < 4; ++i) {
+                p.b[i] = float(v[size_t(2 + i)]);
+                p.c[i] = float(v[size_t(8 + i)]);
+            }
+            p.d[0] = float(v[12]);
+            p.d[1] = float(v[13] / 100.0);
+            id<MTLTexture> out = take(src);
+            runKernel(cb, fxRamp_, {src, out}, &p, sizeof p);
+            release(src);
+            return out;
+        }
         case EffectType::Count: break;
     }
     return src;
 }
 
+void MetalRenderer::appendGlyphs(const FrameDesc& f, const DrawItem& d, std::vector<PassItem>& out) {
+    auto lay = layoutText(d.text);
+    if (lay->glyphs.empty()) return;
+    auto sheet = glyphs_->sheet(d.text, *lay, effectScale(d), d.strokeOn ? d.strokeWidth : 0);
+    if (!sheet || !sheet->texture) return;
+    for (size_t i = 0; i < lay->glyphs.size(); ++i) {
+        const SheetRect& r = sheet->rects[i];
+        if (r.empty) continue;
+        const GlyphInfo& g = lay->glyphs[i];
+        double op = 1;
+        const Affine t = glyphTransform(f, d, *lay, g, &op);
+        if (op <= 0 || std::abs(t.determinant()) < 1e-12) continue;
+        PassItem pi;
+        pi.role = PassItem::Role::Glyph;
+        pi.masks = false;
+        pi.tex = sheet->texture;
+        pi.d.layerId = d.layerId;
+        pi.d.kind = LayerKind::Text;
+        pi.d.blend = d.blend;
+        pi.d.toTarget = d.toTarget * t;
+        pi.d.opacity = d.opacity * op;
+        pi.d.fill = d.fillOn ? d.fill : Value{};
+        pi.d.stroke = {r.u0, r.v0, r.u1, r.v1};
+        pi.d.strokeOverFill = d.strokeOverFill;
+        if (d.strokeOn) pi.glyphStroke = d.stroke;
+        pi.d.boundsMin = g.origin + r.qmin;
+        pi.d.boundsMax = g.origin + r.qmax;
+        out.push_back(pi);
+    }
+}
+
 void MetalRenderer::encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> target, const FrameDesc& f,
-                                    const std::vector<PassItem>& items, Arena& arena, bool* complete, uint64_t* draws) {
+                                    const std::vector<PassItem>& items, Arena& arena, bool* complete, uint64_t* draws,
+                                    bool clear) {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = target;
-    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
@@ -675,69 +857,113 @@ void MetalRenderer::encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> targ
         [enc endEncoding];
         return;
     }
-    size_t maskCount = 0;
-    for (const PassItem& it : items) maskCount += it.masks ? it.d.maskCount : 0;
-    // Sub-allocate this pass's instances and masks from the frame's buffer (256-byte aligned).
-    const size_t itemBytes = n * sizeof(ItemGPU);
-    const size_t maskBytes = std::max<size_t>(1, maskCount) * sizeof(MaskGPU);
-    const size_t offset = (arena.used + 255) & ~size_t(255);
-    const size_t maskOffset = (offset + itemBytes + 255) & ~size_t(255);
-    if (!arena.buffer || maskOffset + maskBytes > arena.buffer.length) {
-        // Rare: the up-front estimate was too small. Retire the old buffer with the frame.
-        id<MTLBuffer> old = arena.buffer;
-        if (old) [cb addCompletedHandler:^(id<MTLCommandBuffer>) { recycleBuffer(old); }];
-        arena.buffer = acquireBuffer(std::max<size_t>(itemBytes + maskBytes + 512, 256 * 1024));
-        arena.used = 0;
-        encodeItemsPass(cb, target, f, items, arena, complete, draws);  // retry into the new buffer
-        [enc endEncoding];
-        return;
-    }
-    arena.used = maskOffset + maskBytes;
-    auto* g = reinterpret_cast<ItemGPU*>(static_cast<uint8_t*>(arena.buffer.contents) + offset);
-    auto* mg = reinterpret_cast<MaskGPU*>(static_cast<uint8_t*>(arena.buffer.contents) + maskOffset);
-    size_t mi = 0;
+    // Instances, masks and flattened path edges for this pass.
+    std::vector<ItemGPU> gi(n);
+    std::vector<MaskGPU> gm;
+    std::vector<EdgeGPU> ge;
     for (size_t i = 0; i < n; ++i) {
         const PassItem& it = items[i];
-        packItem(it.d, g[i]);
+        packItem(it.d, gi[i]);
+        if (it.role == PassItem::Role::Glyph) {
+            for (int k = 0; k < 4; ++k) gi[i].p2[k] = float(it.glyphStroke[size_t(k)]);
+            gi[i].p0[0] = 0;  // the quad already covers the stroke
+            gi[i].p0[2] = it.d.strokeOverFill ? 1.f : 0.f;
+        }
+        const double tol = 0.25 / std::max(effectScale(it.d), 1e-6);  // a quarter of a target pixel
+        if (it.role == PassItem::Role::Normal && it.d.kind == LayerKind::Shape && it.d.shape == ShapeType::Path) {
+            const auto pts = flattenPath(it.d.path, tol);
+            gi[i].p2[0] = float(ge.size());
+            appendEdges(pts, true, ge);
+            gi[i].p2[1] = float(ge.size()) - gi[i].p2[0];
+            gi[i].p2[2] = float(ge.size());
+            if (it.d.strokeWidth > 0) trimmedEdges(pts, it.d.path.closed, it.d.trimStart, it.d.trimEnd, it.d.trimOffset, ge);
+            gi[i].p2[3] = float(ge.size()) - gi[i].p2[2];
+        }
         if (it.masks && it.d.maskCount) {
-            g[i].p1[2] = float(mi);
-            g[i].p1[3] = float(it.d.maskCount);
-            for (uint32_t k = 0; k < it.d.maskCount; ++k) packMask(f.masks[it.d.maskStart + k], mg[mi++]);
+            gi[i].p1[2] = float(gm.size());
+            gi[i].p1[3] = float(it.d.maskCount);
+            for (uint32_t k = 0; k < it.d.maskCount; ++k) {
+                const MaskEval& m = f.masks[it.d.maskStart + k];
+                MaskGPU g;
+                packMask(m, g);
+                if (m.shape == MaskShape::Path) {
+                    g.a[2] = float(ge.size());
+                    appendEdges(flattenPath(m.path, tol), true, ge);
+                    g.a[3] = float(ge.size()) - g.a[2];
+                }
+                gm.push_back(g);
+            }
         }
     }
+    // Sub-allocate from the frame's buffer (256-byte aligned sections).
+    auto align = [](size_t v) { return (v + 255) & ~size_t(255); };
+    const size_t itemBytes = n * sizeof(ItemGPU);
+    const size_t maskBytes = std::max<size_t>(1, gm.size()) * sizeof(MaskGPU);
+    const size_t edgeBytes = std::max<size_t>(1, ge.size()) * sizeof(EdgeGPU);
+    const size_t offset = align(arena.used);
+    const size_t maskOffset = align(offset + itemBytes);
+    const size_t edgeOffset = align(maskOffset + maskBytes);
+    if (!arena.buffer || edgeOffset + edgeBytes > arena.buffer.length) {
+        // The up-front estimate was too small (many glyphs or path edges). Retire the old buffer
+        // with the frame and continue in a bigger one.
+        [enc endEncoding];
+        id<MTLBuffer> old = arena.buffer;
+        if (old) [cb addCompletedHandler:^(id<MTLCommandBuffer>) { recycleBuffer(old); }];
+        arena.buffer = acquireBuffer(std::max<size_t>(itemBytes + maskBytes + edgeBytes + 1024, 256 * 1024) * 2);
+        arena.used = 0;
+        encodeItemsPass(cb, target, f, items, arena, complete, draws, clear);
+        return;
+    }
+    arena.used = edgeOffset + edgeBytes;
+    uint8_t* base = static_cast<uint8_t*>(arena.buffer.contents);
+    std::memcpy(base + offset, gi.data(), itemBytes);
+    if (!gm.empty()) std::memcpy(base + maskOffset, gm.data(), gm.size() * sizeof(MaskGPU));
+    if (!ge.empty()) std::memcpy(base + edgeOffset, ge.data(), ge.size() * sizeof(EdgeGPU));
+
     const FrameUniformsGPU fu{{float(target.width), float(target.height)}, {0, 0}};
     [enc setVertexBytes:&fu length:sizeof fu atIndex:0];
     [enc setVertexBuffer:arena.buffer offset:offset atIndex:1];
     [enc setFragmentBuffer:arena.buffer offset:offset atIndex:1];
     [enc setFragmentBuffer:arena.buffer offset:maskOffset atIndex:2];
+    [enc setFragmentBuffer:arena.buffer offset:edgeOffset atIndex:3];
     [enc setFragmentSamplerState:linearMip_ atIndex:0];
 
-    id<MTLRenderPipelineState> bound = nil;
-    auto textureFor = [&](const PassItem& it) -> id<MTLTexture> {
-        return it.tex ? it.tex : imageTexture(it.d.asset, it.d.assetGeneration);
+    // Consecutive items sharing a pipeline and texture are one instanced draw.
+    auto drawState = [&](const PassItem& it, id<MTLTexture>* tex) -> id<MTLRenderPipelineState> {
+        const bool m = it.masks && it.d.maskCount > 0;
+        bool pathMask = false;
+        for (uint32_t k = 0; m && k < it.d.maskCount; ++k) pathMask = pathMask || f.masks[it.d.maskStart + k].shape == MaskShape::Path;
+        *tex = nil;
+        switch (it.role) {
+            case PassItem::Role::MaskApply: return maskApplyPSO_;
+            case PassItem::Role::Glyph: *tex = it.tex; return glyphPSO_;
+            case PassItem::Role::Normal: break;
+        }
+        if (it.d.kind == LayerKind::Image) {
+            *tex = it.tex ? it.tex : imageTexture(it.d.asset, it.d.assetGeneration);
+            return pathMask ? imagePathMaskPSO_ : m ? imageMaskPSO_ : imagePSO_;
+        }
+        if (it.d.shape == ShapeType::Path || pathMask) return m ? shapePathMaskPSO_ : shapePathPSO_;
+        return m ? shapeMaskPSO_ : shapePSO_;
     };
-    auto masked = [](const PassItem& it) { return it.masks && it.d.maskCount > 0; };
+    id<MTLRenderPipelineState> bound = nil;
     size_t i = 0;
     while (i < n) {
-        const PassItem& it = items[i];
-        const bool m = masked(it);
+        id<MTLTexture> tex = nil;
+        id<MTLRenderPipelineState> pso = drawState(items[i], &tex);
         size_t j = i + 1;
-        if (it.d.kind == LayerKind::Image) {
-            id<MTLTexture> tex = textureFor(it);
-            while (j < n && items[j].d.kind == LayerKind::Image && masked(items[j]) == m && textureFor(items[j]) == tex) ++j;
-            if (!tex) {  // still decoding: draw the rest, mark the frame incomplete
-                *complete = false;
-                i = j;
-                continue;
-            }
-            id<MTLRenderPipelineState> pso = m ? imageMaskPSO_ : imagePSO_;
-            if (bound != pso) [enc setRenderPipelineState:(bound = pso)];
-            [enc setFragmentTexture:tex atIndex:0];
-        } else {
-            while (j < n && items[j].d.kind != LayerKind::Image && masked(items[j]) == m) ++j;
-            id<MTLRenderPipelineState> pso = m ? shapeMaskPSO_ : shapePSO_;
-            if (bound != pso) [enc setRenderPipelineState:(bound = pso)];
+        for (; j < n; ++j) {
+            id<MTLTexture> t2 = nil;
+            if (drawState(items[j], &t2) != pso || t2 != tex) break;
         }
+        const bool needsTexture = pso == imagePSO_ || pso == imageMaskPSO_ || pso == imagePathMaskPSO_ || pso == glyphPSO_;
+        if (needsTexture && !tex) {  // media still decoding: draw the rest, mark the frame incomplete
+            *complete = false;
+            i = j;
+            continue;
+        }
+        if (bound != pso) [enc setRenderPipelineState:(bound = pso)];
+        if (tex) [enc setFragmentTexture:tex atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:j - i baseInstance:i];
         ++*draws;
         i = j;
@@ -772,10 +998,45 @@ MetalRenderer::Prepared MetalRenderer::renderOffscreen(id<MTLCommandBuffer> cb, 
     pi.d.blend = BlendMode::Normal;
     if (!keepOpacity) pi.d.opacity = 1;
     uint64_t draws = 0;
-    encodeItemsPass(cb, layer, f, {pi}, arena, complete, &draws);
+    if (d.nested) {
+        // A precomp: its own layers (with their effects, mattes and blend modes) as one group.
+        uint64_t nestedOffscreen = 0;
+        encodeLayers(*d.nested, cb, layer, r[0], r[1], arena, complete, &draws, &nestedOffscreen);
+        if (d.clipSize.x > 0 && d.clipSize.y > 0) {  // not collapsed: clipped to the source's frame
+            FrameDesc clip;
+            MaskEval m;
+            m.center = d.clipSize * 0.5;
+            m.halfSize = d.clipSize * 0.5;
+            clip.masks.push_back(m);
+            DrawItem c = d;
+            c.maskStart = 0;
+            c.maskCount = 1;
+            applyMasks(cb, layer, clip, c, r, arena, complete);
+        }
+        if (d.maskCount > 0) applyMasks(cb, layer, f, d, r, arena, complete);
+        if (keepOpacity && d.opacity < 1) {
+            FxParams p;
+            p.a[0] = p.a[1] = p.a[2] = p.a[3] = 1;
+            p.b[0] = float(d.opacity);
+            p.d[0] = 3;  // scale
+            id<MTLTexture> out = acquire(r[2], r[3], PoolKind::Scratch);
+            arena.all.push_back(out);
+            runKernel(cb, fxColor_, {layer, out}, &p, sizeof p);
+            arena.free.push_back(layer);
+            layer = out;
+        }
+    } else {
+        std::vector<PassItem> pass;
+        if (d.kind == LayerKind::Text) appendGlyphs(f, pi.d, pass);
+        else pass.push_back(pi);
+        encodeItemsPass(cb, layer, f, pass, arena, complete, &draws);
+        // Text is drawn glyph by glyph: multiply the assembled text by its masks.
+        if (d.kind == LayerKind::Text && d.maskCount > 0) applyMasks(cb, layer, f, d, r, arena, complete);
+    }
 
     const double scale = effectScale(d);
-    for (uint32_t i = 0; i < d.effectCount; ++i) layer = applyEffect(cb, layer, f.effects[d.effectStart + i], scale, arena);
+    for (uint32_t i = 0; i < d.effectCount; ++i)
+        layer = applyEffect(cb, layer, f.effects[d.effectStart + i], scale, pi.d.toTarget, arena);
 
     if (d.matte >= 0) {
         const Prepared m = renderOffscreen(cb, f, f.mattes[size_t(d.matte)], true, r, arena, complete);
@@ -803,6 +1064,68 @@ MetalRenderer::Prepared MetalRenderer::renderOffscreen(id<MTLCommandBuffer> cb, 
     return out;
 }
 
+void MetalRenderer::applyMasks(id<MTLCommandBuffer> cb, id<MTLTexture> tex, const FrameDesc& f, const DrawItem& d,
+                               const int* r, Arena& arena, bool* complete) {
+    // One quad over the whole region, in the layer's space, multiplying by the masks.
+    PassItem m;
+    m.role = PassItem::Role::MaskApply;
+    m.d = d;
+    m.d.toTarget = Affine::translate(-r[0], -r[1]) * d.toTarget;
+    m.d.strokeWidth = 0;
+    m.d.nested = nullptr;
+    Affine inv;
+    if (!m.d.toTarget.inverse(inv)) return;
+    Vec2 mn{1e300, 1e300}, mx{-1e300, -1e300};
+    for (Vec2 c : {Vec2{0, 0}, Vec2{double(r[2]), 0}, Vec2{double(r[2]), double(r[3])}, Vec2{0, double(r[3])}}) {
+        const Vec2 q = inv.apply(c);
+        mn = {std::min(mn.x, q.x), std::min(mn.y, q.y)};
+        mx = {std::max(mx.x, q.x), std::max(mx.y, q.y)};
+    }
+    m.d.boundsMin = mn;
+    m.d.boundsMax = mx;
+    uint64_t draws = 0;
+    encodeItemsPass(cb, tex, f, {m}, arena, complete, &draws, false);
+}
+
+void MetalRenderer::encodeLayers(const FrameDesc& f, id<MTLCommandBuffer> cb, id<MTLTexture> target, int ox, int oy,
+                                 Arena& arena, bool* complete, uint64_t* draws, uint64_t* offscreen) {
+    const Affine shift = Affine::translate(-ox, -oy);
+    // 1. Layers with effects / mattes, and precomps, rendered on their own first.
+    std::vector<PassItem> items;
+    items.reserve(f.items.size());
+    for (const DrawItem& d : f.items) {
+        PassItem pi;
+        pi.d = d;
+        pi.d.nested = nullptr;  // the pass never needs it; don't copy the reference around
+        pi.d.toTarget = shift * d.toTarget;
+        if (d.kind == LayerKind::Text && !d.needsOffscreen()) {
+            appendGlyphs(f, pi.d, items);
+            continue;
+        }
+        if (d.needsOffscreen()) {
+            ++*offscreen;
+            const Prepared p = renderOffscreen(cb, f, d, false, nullptr, arena, complete);
+            if (!p.tex) continue;
+            // Keep the result out of the free list: the composite pass below still reads it.
+            arena.free.erase(std::remove(arena.free.begin(), arena.free.end(), p.tex), arena.free.end());
+            DrawItem q;
+            q.layerId = d.layerId;
+            q.kind = LayerKind::Image;
+            q.blend = d.blend;
+            q.opacity = d.opacity;
+            q.toTarget = Affine::translate(p.x - ox, p.y - oy);
+            q.boundsMin = {0, 0};
+            q.boundsMax = {double(p.tex.width), double(p.tex.height)};
+            pi.d = q;
+            pi.tex = p.tex;
+            pi.masks = false;  // masks were applied offscreen
+        }
+        items.push_back(pi);
+    }
+    // 2. The layers themselves, bottom to top, in one pass.
+    encodeItemsPass(cb, target, f, items, arena, complete, draws);
+}
+
 void MetalRenderer::encodeComposite(const FrameDesc& f, id<MTLCommandBuffer> cb, id<MTLTexture> target,
                                     bool* complete) {
     const double t0 = nowMs();
@@ -812,42 +1135,15 @@ void MetalRenderer::encodeComposite(const FrameDesc& f, id<MTLCommandBuffer> cb,
         // One instance buffer for the whole frame: every layer may be drawn twice (offscreen + final),
         // plus its masks (and a matte source's), with per-pass alignment slack.
         const size_t passes = 1 + size_t(f.offscreenItems()) * 2;
-        const size_t bytes = (f.items.size() * 2 + f.mattes.size()) * sizeof(ItemGPU) +
+        size_t glyphs = 0;
+        for (const DrawItem& d : f.items) glyphs += d.kind == LayerKind::Text ? d.text.text.size() * 2 : 0;
+        const size_t bytes = (f.items.size() * 2 + f.mattes.size() + glyphs) * sizeof(ItemGPU) +
                              f.masks.size() * 2 * sizeof(MaskGPU) + passes * 512 + sizeof(MaskGPU);
         arena->buffer = acquireBuffer(bytes);
     }
 
-    // 1. Layers with effects / mattes, rendered on their own first.
-    std::vector<PassItem> items;
-    items.reserve(f.items.size());
-    uint64_t offscreen = 0;
-    for (const DrawItem& d : f.items) {
-        PassItem pi;
-        pi.d = d;
-        if (d.needsOffscreen()) {
-            ++offscreen;
-            const Prepared p = renderOffscreen(cb, f, d, false, nullptr, *arena, complete);
-            if (!p.tex) continue;
-            // Keep the result out of the free list: the composite pass below still reads it.
-            arena->free.erase(std::remove(arena->free.begin(), arena->free.end(), p.tex), arena->free.end());
-            DrawItem q;
-            q.layerId = d.layerId;
-            q.kind = LayerKind::Image;
-            q.blend = d.blend;
-            q.opacity = d.opacity;
-            q.toTarget = Affine::translate(p.x, p.y);
-            q.boundsMin = {0, 0};
-            q.boundsMax = {double(p.tex.width), double(p.tex.height)};
-            pi.d = q;
-            pi.tex = p.tex;
-            pi.masks = false;  // masks were applied offscreen
-        }
-        items.push_back(pi);
-    }
-
-    // 2. The composition itself, bottom to top, in one pass.
-    uint64_t draws = 0;
-    encodeItemsPass(cb, target, f, items, *arena, complete, &draws);
+    uint64_t draws = 0, offscreen = 0;
+    encodeLayers(f, cb, target, 0, 0, *arena, complete, &draws, &offscreen);
 
     const double encodeMs = nowMs() - t0;
     const uint64_t key = costKey(f);

@@ -25,6 +25,7 @@ sample:
 	swift build -c release --product mfcli
 	.build/release/mfcli demo Examples/demo
 	.build/release/mfcli effects-demo Examples/effects
+	.build/release/mfcli phase4-demo Examples/phase4
 
 clean:
 	rm -rf .build build

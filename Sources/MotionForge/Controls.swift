@@ -89,14 +89,16 @@ struct ScrubField: View {
 
 struct StopwatchButton: View {
     let animated: Bool
+    var baked = false
     let action: () -> Void
     var body: some View {
         Button(action: action) {
-            Image(systemName: animated ? "stopwatch.fill" : "stopwatch")
-                .foregroundStyle(animated ? Theme.keyframe : .secondary)
+            Image(systemName: baked ? "waveform.path" : animated ? "stopwatch.fill" : "stopwatch")
+                .foregroundStyle(baked ? Theme.accent : animated ? Theme.keyframe : .secondary)
         }
         .buttonStyle(.plain)
-        .help(animated ? "Remove all keyframes" : "Animate this property (adds a keyframe at the playhead)")
+        .help(baked ? "Baked animation (one value per frame, e.g. imported from After Effects). Editing the value shifts the whole animation; click to replace it with a keyframe at the playhead."
+              : animated ? "Remove all keyframes" : "Animate this property (adds a keyframe at the playhead)")
     }
 }
 
@@ -153,12 +155,15 @@ extension MFLayerInfo {
     var icon: String {
         switch kind {
         case .image: return "photo"
+        case .text: return "textformat"
         case .null: return "square.dashed"
+        case .precomp: return "square.stack.3d.up"
         default:
             switch shape {
             case .ellipse: return "circle"
             case .polygon: return "hexagon"
             case .star: return "star"
+            case .path: return "scribble"
             default: return "rectangle"
             }
         }
@@ -167,6 +172,9 @@ extension MFLayerInfo {
     /// Properties shown for this layer, in display order.
     var editableProps: [MFProp] {
         var p: [MFProp] = [.anchorPoint, .position, .scale, .rotation, .opacity]
+        if kind == .text { return p + [.fontSize, .tracking, .lineHeight, .fillColor, .strokeColor, .strokeWidth] }
+        if kind == .precomp { return timeRemapEnabled ? p + [.timeRemap] : p }
+        if kind == .shape && shape == .path { return p + [.fillColor, .strokeColor, .strokeWidth, .trimStart, .trimEnd, .trimOffset] }
         if kind == .shape {
             p += [.size]
             if shape != .ellipse { p += [.roundness] }
@@ -182,7 +190,8 @@ extension MFProp {
     var isColor: Bool { self == .fillColor || self == .strokeColor }
     var step: Double {
         switch self {
-        case .scale, .opacity: return 0.5
+        case .scale, .opacity, .trimStart, .trimEnd, .trimOffset, .fontSize: return 0.5
+        case .lineHeight: return 0.01
         case .rotation: return 0.5
         case .points: return 0.1
         case .innerRatio: return 0.005
@@ -192,13 +201,13 @@ extension MFProp {
     var precision: Int {
         switch self {
         case .points: return 0
-        case .innerRatio: return 2
+        case .innerRatio, .lineHeight: return 2
         default: return 1
         }
     }
     var suffix: String {
         switch self {
-        case .scale, .opacity: return "%"
+        case .scale, .opacity, .trimStart, .trimEnd, .trimOffset: return "%"
         case .rotation: return "°"
         default: return ""
         }
@@ -275,6 +284,7 @@ extension MFEffectType {
         case .brightnessContrast: return "circle.lefthalf.filled"
         case .hueSaturation: return "paintpalette"
         case .fill: return "paintbrush"
+        case .gradientRamp: return "square.lefthalf.filled"
         @unknown default: return "wand.and.stars"
         }
     }

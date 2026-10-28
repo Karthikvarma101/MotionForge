@@ -18,7 +18,9 @@
 
 #include "MFEngine.h"
 #include "MFRender/MetalRenderer.hpp"
+#include "../MFRender/TextEngine.hpp"
 #include "mf/Clipboard.hpp"
+#include "mf/Presets.hpp"
 #include "mf/Document.hpp"
 #include "mf/Evaluator.hpp"
 #include "mf/Json.hpp"
@@ -946,7 +948,7 @@ TEST(project_file_v2_effects_masks_mattes) {
     d.setPropertyValue(comp, a, PropRef::mask(m, MaskParam::Feather), 0, {12, 0, 0, 0});
     d.setLayerMatte(comp, a, b, MatteMode::LumaInverted);
     const std::string text = serializeProject(d.project(), "");
-    CHECK(text.find("\"version\": 3") != std::string::npos);
+    CHECK(text.find("\"version\": " + std::to_string(Project::kFormatVersion)) != std::string::npos);
     Project back;
     std::string err;
     CHECK(deserializeProject(text, "", back, err));
@@ -1211,6 +1213,562 @@ TEST(clipboard_keyframes_relative_and_mapped) {
     // The paste was one undo step.
     d.undo();
     CHECK(d.project().activeComp()->findLayer(b)->findEffect(bGlow)->params[1].keyframes.empty());
+}
+
+// =============================================================================================
+// Phase 4: text, bezier paths, trim paths, graph easing, presets
+// =============================================================================================
+
+static Document textDoc(ObjectId* layerOut, const std::string& text, TextAlign align = TextAlign::Center) {
+    Document d(makeDefaultProject(1280, 360, 30, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Text);
+    TextData td;
+    td.string = text;
+    td.font = "Helvetica-Bold";
+    td.align = align;
+    d.setLayerText(comp, l, td);
+    d.setPropertyValue(comp, l, PropId::FontSize, 0, {100, 0, 0, 0});
+    d.setPropertyValue(comp, l, PropId::Position, 0, {640, 220, 0, 0});
+    *layerOut = l;
+    return d;
+}
+
+TEST(text_renders_with_coretext_metrics) {
+    ObjectId l;
+    Document d = textDoc(&l, "MOTION");
+    gpu();  // installs the CoreText measurer
+    const Composition& c = *d.project().activeComp();
+    Vec2 mn, mx;
+    layerLocalBounds(d.project(), *c.findLayer(l), 0, mn, mx);
+    CHECK(mx.x - mn.x > 250 && mx.x - mn.x < 500);  // real metrics, not the estimate
+    CHECK_NEAR((mn.x + mx.x) / 2, 0, 1);            // centred on the anchor
+    const Coverage cov = coverage(render(d.project()));
+    CHECK(cov.area > 5000);
+    CHECK_NEAR(cov.cx, 640, (mx.x - mn.x) * 0.08);   // ink centred around the position
+    CHECK(cov.minY >= 220 - 80 && cov.maxY <= 222);  // caps sit on the baseline at y = 220
+    // Changing the text changes the frame; same text, same hash.
+    const uint64_t h = evaluateFrame(d.project(), c, 0).hash;
+    CHECK(evaluateFrame(d.project(), *d.project().activeComp(), 0).hash == h);
+    TextData td = c.findLayer(l)->text;
+    td.string = "MOTIOM";
+    d.setLayerText(d.project().activeComposition, l, td);
+    CHECK(evaluateFrame(d.project(), *d.project().activeComp(), 0).hash != h);
+}
+
+TEST(text_alignment_and_tracking) {
+    gpu();
+    auto inkBox = [](const Document& d) { return coverage(render(d.project())); };
+    ObjectId a, b, c2;
+    Document left = textDoc(&a, "HELLO", TextAlign::Left);
+    Document right = textDoc(&b, "HELLO", TextAlign::Right);
+    const Coverage cl = inkBox(left), cr = inkBox(right);
+    CHECK(cl.minX >= 638 && cl.minX <= 650);  // left-aligned text starts at the anchor
+    CHECK(cr.maxX >= 630 && cr.maxX <= 642);  // right-aligned text ends there
+    Document tracked = textDoc(&c2, "HELLO", TextAlign::Left);
+    tracked.setPropertyValue(tracked.project().activeComposition, c2, PropId::Tracking, 0, {200, 0, 0, 0});
+    const Coverage ct = inkBox(tracked);
+    // 4 gaps x 200/1000 em x 100 px = 80 px wider.
+    CHECK_NEAR((ct.maxX - ct.minX) - (cl.maxX - cl.minX), 80, 3);
+}
+
+TEST(text_animator_range_selector) {
+    gpu();
+    ObjectId l;
+    Document d = textDoc(&l, "AAAAAAAAAA", TextAlign::Left);
+    const ObjectId comp = d.project().activeComposition;
+    d.setPropertyValue(comp, l, PropId::Position, 0, {100, 220, 0, 0});  // all ten characters on screen
+    const double full = coverage(render(d.project())).area;
+    const ObjectId an = d.addTextAnimator(comp, l, Document::AnimatorPreset::Opacity);  // opacity 0 on the selection
+    d.setPropertyValue(comp, l, PropRef::animator(an, AnimParam::End), 0, {50, 0, 0, 0});
+    const Coverage half = coverage(render(d.project()));
+    CHECK_NEAR(half.area, full / 2, full * 0.03);  // first 5 of 10 characters hidden
+    CHECK(half.minX > 100 + 300);                  // what remains is the right half
+    // Typewriter: animate Start 0 -> 100 over 1 s; at 0.3 s three characters show.
+    d.setPropertyValue(comp, l, PropRef::animator(an, AnimParam::End), 0, {100, 0, 0, 0});
+    d.setPropertyAnimated(comp, l, PropRef::animator(an, AnimParam::Start), true, 0);
+    d.setPropertyValue(comp, l, PropRef::animator(an, AnimParam::Start), 1, {100, 0, 0, 0});
+    CHECK_NEAR(coverage(render(d.project(), 0.3)).area, full * 0.3, full * 0.03);
+    // Position animator moves the selected characters (offscreen regions follow them).
+    const ObjectId mv = d.addTextAnimator(comp, l, Document::AnimatorPreset::Position);  // (0, 80)
+    d.setPropertyValue(comp, l, PropRef::animator(mv, AnimParam::Position), 0, {0, -100, 0, 0});
+    d.setTextAnimatorOptions(comp, l, an, false, SelectorShape::Square, SelectorUnit::Characters);
+    ObjectId ref;
+    Document still = textDoc(&ref, "AAAAAAAAAA", TextAlign::Left);
+    still.setPropertyValue(still.project().activeComposition, ref, PropId::Position, 0, {100, 220, 0, 0});
+    CHECK_NEAR(coverage(render(d.project())).cy, coverage(render(still.project())).cy - 100, 1.5);
+    CHECK(std::abs(selectorWeight(SelectorShape::Triangle, 0, 1, 2, 5) - 1) < 1e-9);  // centre unit fully selected
+    CHECK(std::abs(selectorWeight(SelectorShape::RampUp, 0, 0.5, 9, 10) - 1) < 1e-9);  // after the range: selected
+    CHECK(std::abs(selectorWeight(SelectorShape::RampDown, 0.5, 1, 0, 10) - 1) < 1e-9);
+}
+
+TEST(text_masks_and_effects) {
+    gpu();
+    ObjectId l;
+    Document d = textDoc(&l, "WWWWWW", TextAlign::Center);
+    const ObjectId comp = d.project().activeComposition;
+    const Coverage full = coverage(render(d.project()));
+    const ObjectId m = d.addMask(comp, l, MaskShape::Rectangle);
+    d.setPropertyValue(comp, l, PropRef::mask(m, MaskParam::Position), 0, {-500, -40, 0, 0});
+    d.setPropertyValue(comp, l, PropRef::mask(m, MaskParam::Size), 0, {1000, 400, 0, 0});  // left half only
+    const Coverage masked = coverage(render(d.project()));
+    CHECK_NEAR(masked.area, full.area / 2, full.area * 0.04);
+    CHECK(masked.maxX <= 641);
+    d.removeMask(comp, l, m);
+    const ObjectId fx = d.addEffect(comp, l, EffectType::GaussianBlur);
+    d.setPropertyValue(comp, l, PropRef::effect(fx, 0), 0, {15, 0, 0, 0});
+    CHECK_NEAR(coverage(render(d.project())).area, full.area, full.area * 0.02);  // blur keeps the ink
+}
+
+static BezierPath polygonPath(std::initializer_list<Vec2> pts, bool closed = true) {
+    BezierPath p;
+    for (Vec2 v : pts) p.vertices.push_back({v, {0, 0}, {0, 0}});
+    p.closed = closed;
+    return p;
+}
+
+TEST(path_fill_stroke_and_trim) {
+    Document d(makeDefaultProject(640, 360, 30, 2));
+    const ObjectId comp = d.project().activeComposition;
+    // Pen-drawn triangle in comp space: the layer sits at its centre.
+    const ObjectId l = d.addPathLayer(comp, {{{220, 280}, {}, {}}, {{420, 280}, {}, {}}, {{320, 80}, {}, {}}}, true);
+    const Layer& L = *d.project().activeComp()->findLayer(l);
+    CHECK(L.shape == ShapeType::Path && L.fillEnabled && !L.strokeEnabled);
+    CHECK_NEAR(L.prop(PropId::Position).value[0], 320, 1e-9);
+    CHECK_NEAR(L.prop(PropId::Position).value[1], 180, 1e-9);
+    d.setPropertyValue(comp, l, PropId::FillColor, 0, {1, 1, 1, 1});
+    CHECK_NEAR(coverage(render(d.project())).area, 0.5 * 200 * 200, 200);
+
+    // Bezier circle (4 vertices, kappa handles) of radius 100.
+    const double k = 0.5522847498 * 100;
+    BezierPath circle;
+    circle.vertices = {{{0, -100}, {-k, 0}, {k, 0}}, {{100, 0}, {0, -k}, {0, k}}, {{0, 100}, {k, 0}, {-k, 0}}, {{-100, 0}, {0, k}, {0, -k}}};
+    d.setLayerPath(comp, l, circle);
+    CHECK_NEAR(coverage(render(d.project())).area, M_PI * 100 * 100, M_PI * 100 * 100 * 0.01);
+
+    // Open polyline 200 px long, stroked 10 px: rectangle plus two round caps.
+    d.setLayerPath(comp, l, polygonPath({{-100, 0}, {100, 0}}, false));
+    d.setLayerFillStroke(comp, l, false, true);
+    d.setPropertyValue(comp, l, PropId::StrokeWidth, 0, {10, 0, 0, 0});
+    const double line = 200 * 10 + M_PI * 25;
+    CHECK_NEAR(coverage(render(d.project())).area, line, line * 0.02);
+    // Trim Paths: the first half of the line.
+    d.setPropertyValue(comp, l, PropId::TrimEnd, 0, {50, 0, 0, 0});
+    const Coverage trimmed = coverage(render(d.project()));
+    CHECK_NEAR(trimmed.area, 100 * 10 + M_PI * 25, (100 * 10 + M_PI * 25) * 0.03);
+    CHECK(trimmed.cx < 320);
+    // Closed square outline trimmed to half its perimeter, with the offset wrapping round.
+    d.setLayerPath(comp, l, polygonPath({{-50, -50}, {50, -50}, {50, 50}, {-50, 50}}));
+    d.setPropertyValue(comp, l, PropId::TrimOffset, 0, {75, 0, 0, 0});
+    const double halfSquare = 200 * 10 + M_PI * 25;
+    CHECK_NEAR(coverage(render(d.project())).area, halfSquare, halfSquare * 0.06);
+}
+
+TEST(bezier_mask_on_layer) {
+    ObjectId l;
+    Document d = rectDoc(&l);  // 200x100 white
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId m = d.addPathMask(comp, l, polygonPath({{-100, 50}, {100, 50}, {0, -50}}));  // triangle in layer space
+    CHECK(m != 0);
+    CHECK_NEAR(coverage(render(d.project())).area, 0.5 * 200 * 100, 150);
+    d.setMaskMode(comp, l, m, MaskMode::Subtract, false);
+    CHECK_NEAR(coverage(render(d.project())).area, 20000 - 10000, 150);
+}
+
+TEST(graph_editor_speed_and_overshoot) {
+    Property p;
+    Keyframe a, b;
+    a.time = 0;
+    a.value = {0, 0, 0, 0};
+    a.outInterp = Interp::Bezier;
+    b.time = 1;
+    b.value = {100, 0, 0, 0};
+    b.inInterp = Interp::Bezier;
+    p.keyframes = {a, b};
+    const PropDef& def = propDef(PropId::Rotation);  // unclamped
+    const double eased = evaluateProperty(p, def, 0.25)[0];
+    p.keyframes[0].outSlope = 1;  // leave at linear speed instead of from rest
+    CHECK(evaluateProperty(p, def, 0.25)[0] > eased + 5);
+    p.keyframes[0].outSlope = 0;
+    p.keyframes[1].inSlope = -3;  // arrive "from above": overshoot before settling
+    double peak = 0;
+    for (int i = 0; i <= 100; ++i) peak = std::max(peak, evaluateProperty(p, def, i / 100.0)[0]);
+    CHECK(peak > 103);
+    CHECK_NEAR(evaluateProperty(p, def, 1.0)[0], 100, 1e-9);
+
+    ObjectId l;
+    Document d = rectDoc(&l);
+    const ObjectId comp = d.project().activeComposition;
+    d.setPropertyAnimated(comp, l, PropId::Rotation, true, 0);
+    d.setPropertyValue(comp, l, PropId::Rotation, 1, {90, 0, 0, 0});
+    CHECK(d.setKeyframeEase(comp, l, PropRef::layer(PropId::Rotation), 0, true, 0.6, 0.5));
+    const Keyframe& k0 = d.project().activeComp()->findLayer(l)->prop(PropId::Rotation).keyframes[0];
+    CHECK(k0.outInterp == Interp::Bezier && std::abs(k0.easeOut - 0.6) < 1e-12 && std::abs(k0.outSlope - 0.5) < 1e-12);
+    Json kj;
+    std::string err;
+    CHECK(Json::parse(keyframeToJson(k0, propDef(PropId::Rotation)).dump(), kj, err));
+    CHECK(keyframeFromJson(kj, {}) == k0);
+}
+
+TEST(presets_builtin_and_round_trip) {
+    CHECK(builtInPresets().size() >= 12);
+    const PresetInfo* fade = nullptr;
+    const PresetInfo* slide = nullptr;
+    const PresetInfo* typewriter = nullptr;
+    for (const PresetInfo& p : builtInPresets()) {
+        if (p.name == "Fade In") fade = &p;
+        if (p.name == "Slide Up") slide = &p;
+        if (p.name == "Typewriter") typewriter = &p;
+    }
+    CHECK(fade && slide && typewriter);
+    if (!fade || !slide || !typewriter) return;
+    ObjectId l;
+    Document d = rectDoc(&l);
+    const ObjectId comp = d.project().activeComposition;
+    d.setPropertyValue(comp, l, PropId::Position, 0, {300, 200, 0, 0});
+    std::string err;
+    CHECK(applyPreset(d, comp, {l}, 2.0, fade->json, err) == 2);
+    const auto& op = d.project().activeComp()->findLayer(l)->prop(PropId::Opacity).keyframes;
+    CHECK(op.size() == 2 && std::abs(op[0].time - 2.0) < 1e-9 && std::abs(op[1].time - 2.5) < 1e-9);
+    CHECK(op.size() == 2 && op[0].value[0] == 0 && op[1].value[0] == 100);
+    // Slide Up ends where the layer already is (offsets, not absolute positions).
+    applyPreset(d, comp, {l}, 0.0, slide->json, err);
+    const auto& pos = d.project().activeComp()->findLayer(l)->prop(PropId::Position).keyframes;
+    CHECK(pos.size() == 2);
+    if (pos.size() == 2) {
+        CHECK_NEAR(pos[0].value[1], 320, 1e-6);
+        CHECK_NEAR(pos[1].value[1], 200, 1e-6);
+        CHECK_NEAR(pos[1].value[0], 300, 1e-6);
+    }
+    // Text presets need a text layer; on a shape they're reported, not half-applied.
+    err.clear();
+    applyPreset(d, comp, {l}, 0.0, typewriter->json, err);
+    CHECK(err.find("text") != std::string::npos);
+    ObjectId t;
+    Document td = textDoc(&t, "HELLO");
+    err.clear();
+    CHECK(applyPreset(td, td.project().activeComposition, {t}, 1.0, typewriter->json, err) > 0);
+    const Layer& T = *td.project().activeComp()->findLayer(t);
+    CHECK(T.animators.size() == 1 && T.animators[0].param(AnimParam::Start).keyframes.size() == 2);
+    // A user preset made from a layer with a glow re-creates the effect and its keys elsewhere.
+    const ObjectId glow = d.addEffect(comp, l, EffectType::Glow);
+    d.setPropertyAnimated(comp, l, PropRef::effect(glow, 2), true, 1);
+    d.setPropertyValue(comp, l, PropRef::effect(glow, 2), 2, {200, 0, 0, 0});
+    const std::string mine = makePreset(d.project(), comp, l, "Mine", "My Presets");
+    std::string name, cat;
+    CHECK(presetHeader(mine, name, cat) && name == "Mine" && cat == "My Presets");
+    const ObjectId other = d.addLayer(comp, LayerKind::Shape, ShapeType::Ellipse);
+    CHECK(applyPreset(d, comp, {other}, 5.0, mine, err) > 0);
+    const Layer& O = *d.project().activeComp()->findLayer(other);
+    CHECK(O.effects.size() == 1 && O.effects[0].type == EffectType::Glow);
+    CHECK(!O.effects.empty() && O.effects[0].params[2].keyframes.size() == 2);
+}
+
+TEST(project_file_v4_text_paths) {
+    Document d(makeDefaultProject(1920, 1080, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId t = d.addLayer(comp, LayerKind::Text);
+    TextData td;
+    td.string = "Line one\nLine \"two\" ✓";
+    td.font = "Georgia-Bold";
+    td.align = TextAlign::Right;
+    d.setLayerText(comp, t, td);
+    const ObjectId an = d.addTextAnimator(comp, t, Document::AnimatorPreset::Rotation);
+    d.setTextAnimatorOptions(comp, t, an, true, SelectorShape::Smooth, SelectorUnit::Words);
+    d.setPropertyAnimated(comp, t, PropRef::animator(an, AnimParam::Offset), true, 0);
+    d.setPropertyValue(comp, t, PropRef::animator(an, AnimParam::Offset), 1, {50, 0, 0, 0});
+    const ObjectId p = d.addPathLayer(comp, {{{0, 0}, {}, {30, 0}}, {{100, 50}, {-20, 0}, {}}}, false);
+    d.addPathMask(comp, t, polygonPath({{0, 0}, {10, 0}, {0, 10}}));
+    d.setPropertyAnimated(comp, p, PropId::TrimEnd, true, 0);
+    d.setPropertyValue(comp, p, PropId::TrimEnd, 1, {40, 0, 0, 0});
+    d.setKeyframeEase(comp, p, PropRef::layer(PropId::TrimEnd), 0, true, 0.7, 1.5);
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", back, err));
+    CHECK(back == d.project());
+}
+
+// ---- Phase 5 prerequisites: precomps, baked tracks (imported projects) ------------------------
+
+// A 400x200 child comp with one opaque rectangle covering [x0, x1] x [y0, y1] (child pixels).
+static ObjectId childCompWithRect(Document& d, double x0, double y0, double x1, double y1, Value color) {
+    const ObjectId child = d.addComposition("Child", 400, 200, 30, 5);
+    const ObjectId r = d.addLayer(child, LayerKind::Shape, ShapeType::Rectangle);
+    d.setPropertyValue(child, r, PropId::ShapeSize, 0, {x1 - x0, y1 - y0, 0, 0});
+    d.setPropertyValue(child, r, PropId::Position, 0, {(x0 + x1) * 0.5, (y0 + y1) * 0.5, 0, 0});
+    d.setPropertyValue(child, r, PropId::FillColor, 0, color);
+    return child;
+}
+
+TEST(precomp_layer_transforms_and_clips) {
+    Document d(makeDefaultProject(800, 400, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    // The rectangle sticks out of the child's frame on the right (x 300..500 of a 400 wide comp).
+    const ObjectId child = childCompWithRect(d, 300, 50, 500, 150, {1, 0, 0, 1});
+    const ObjectId pl = d.addPrecompLayer(comp, child);
+    CHECK(pl != 0);
+    CHECK(d.addPrecompLayer(child, comp) == 0);   // would contain itself
+    CHECK(d.addPrecompLayer(child, child) == 0);
+    // Child top-left at (100, 100) of the parent: anchor (200, 100) at position (300, 200).
+    d.setPropertyValue(comp, pl, PropId::Position, 0, {300, 200, 0, 0});
+    Image img = render(d.project());
+    CHECK(img.at(450, 150)[0] > 0.99);   // child (350, 50) inside the rect
+    CHECK(img.a(520, 150) < 0.01);       // child (420, 50): outside the child's frame -> clipped
+    CHECK(img.a(380, 150) < 0.01);       // child (280, 50): left of the rect
+    // Collapsed: drawn straight into the parent, so nothing is clipped.
+    d.setPrecompOptions(comp, pl, true, false, 0);
+    img = render(d.project());
+    CHECK(img.at(520, 150)[0] > 0.99);
+    // Scaled 50% about the anchor: child (350, 100) -> parent (300 + 150*0.5, 200).
+    d.setPropertyValue(comp, pl, PropId::Scale, 0, {50, 50, 0, 0});
+    img = render(d.project());
+    CHECK(img.at(376, 200)[0] > 0.99);
+    CHECK(img.a(340, 200) < 0.01);  // child x 280
+    // Hit-testing and bounds use the child's frame.
+    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {300, 200}) == pl);
+}
+
+TEST(precomp_group_opacity_and_time) {
+    Document d(makeDefaultProject(800, 400, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId child = childCompWithRect(d, 0, 0, 200, 200, {0, 0, 1, 1});
+    // A second, overlapping rectangle: the group at 50% must not show the overlap darker.
+    const ObjectId r2 = d.addLayer(child, LayerKind::Shape, ShapeType::Rectangle);
+    d.setPropertyValue(child, r2, PropId::ShapeSize, 0, {200, 200, 0, 0});
+    d.setPropertyValue(child, r2, PropId::Position, 0, {200, 100, 0, 0});
+    d.setPropertyValue(child, r2, PropId::FillColor, 0, {0, 0, 1, 1});
+    const ObjectId pl = d.addPrecompLayer(comp, child);
+    d.setPropertyValue(comp, pl, PropId::Position, 0, {200, 100, 0, 0});  // child top-left at (0, 0)
+    d.setPropertyValue(comp, pl, PropId::Opacity, 0, {50, 0, 0, 0});
+    Image img = render(d.project());
+    CHECK_NEAR(img.a(50, 100), 0.5, 0.01);   // one rectangle
+    CHECK_NEAR(img.a(150, 100), 0.5, 0.01);  // overlap: still one group at 50%
+    // Source time: the child's rectangle moves; the layer starts 1 s late, then is remapped.
+    d.setPropertyAnimated(child, r2, PropId::Position, true, 0);
+    d.setPropertyValue(child, r2, PropId::Position, 1, {200, 300, 0, 0});  // gone below by child t=1
+    d.setPrecompOptions(comp, pl, false, false, 1.0);
+    const Composition& c = *d.project().activeComp();
+    FrameDesc f = evaluateFrame(d.project(), c, 1.0);  // child time 0
+    CHECK(f.items.size() == 1 && f.items[0].nested && f.items[0].nested->time == 0);
+    CHECK(f.items[0].nested->items.size() == 2);
+    d.setPrecompOptions(comp, pl, false, true, 1.0);   // remap: identity over the layer -> in - start
+    f = evaluateFrame(d.project(), c, 2.0);
+    CHECK_NEAR(f.items[0].nested->time, 1.0, 1e-9);
+    // Hashes follow the child: an edit inside it changes the parent frame's hash.
+    const uint64_t h0 = evaluateFrame(d.project(), c, 2.0).hash;
+    d.setPropertyValue(child, r2, PropId::FillColor, 0, {0, 1, 0, 1});
+    CHECK(evaluateFrame(d.project(), c, 2.0).hash != h0);
+}
+
+TEST(baked_tracks_evaluate_edit_and_save) {
+    Document d(makeDefaultProject(800, 400, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Shape, ShapeType::Ellipse);
+    SampledTrack t;
+    t.t0 = 1;
+    t.rate = 10;
+    t.dims = 2;
+    t.data = {0, 0, 10, 20, 30, 40};  // t = 1.0, 1.1, 1.2
+    Project p = d.project();
+    p.activeComp()->findLayer(l)->prop(PropId::Position).samples = Shared<SampledTrack>(t);
+    d.replaceProject(p);
+    const Layer& L = *d.project().activeComp()->findLayer(l);
+    auto pos = [&](double tt) { return evaluateProperty(d.project().activeComp()->findLayer(l)->prop(PropId::Position), PropId::Position, tt); };
+    CHECK_NEAR(pos(0)[0], 0, 1e-9);        // holds before
+    CHECK_NEAR(pos(1.05)[1], 10, 1e-5);    // interpolates
+    CHECK_NEAR(pos(1.2)[0], 30, 1e-5);
+    CHECK_NEAR(pos(9)[1], 40, 1e-5);       // holds after
+    CHECK(L.prop(PropId::Position).baked());
+    // Editing shifts the whole track; undo restores it.
+    CHECK(d.setPropertyValue(comp, l, PropId::Position, 1.1, {110, 120, 0, 0}));
+    CHECK_NEAR(pos(1.2)[0], 130, 1e-4);
+    CHECK(d.undo());
+    CHECK_NEAR(pos(1.2)[0], 30, 1e-5);
+    // Save / load keeps the samples exactly (float32).
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", back, err));
+    CHECK(back == d.project());
+    // Turning the stopwatch on replaces the bake with a key at the current value.
+    CHECK(d.setPropertyAnimated(comp, l, PropId::Position, true, 1.1));
+    CHECK(!d.project().activeComp()->findLayer(l)->prop(PropId::Position).baked());
+    CHECK_NEAR(pos(3)[1], 20, 1e-4);
+    // Snapshots share baked data, so a big bake costs undo almost nothing.
+    CHECK(approxSnapshotBytes(d.project()) < 64 * 1024);
+}
+
+TEST(path_tracks_and_compound_text) {
+    BezierPath a = polygonPath({{0, 0}, {100, 0}, {100, 100}});
+    BezierPath b = polygonPath({{0, 0}, {200, 0}, {200, 200}});
+    PathTrack tr;
+    tr.t0 = 0;
+    tr.rate = 1;
+    tr.frames = {a, b, polygonPath({{0, 0}, {5, 5}})};  // topology change at frame 2
+    CHECK_NEAR(tr.at(0.5).vertices[1].p.x, 150, 1e-9);
+    CHECK_NEAR(tr.at(1.5).vertices[2].p.y, 200, 1e-9);  // different vertex count: holds frame 1
+    CHECK(tr.at(5).vertices.size() == 2);
+    Document d(makeDefaultProject(400, 400, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addPathLayer(comp, {{{0, 0}, {}, {}}, {{50, 0}, {}, {}}, {{50, 50}, {}, {}}}, true);
+    Project p = d.project();
+    Layer& L = *p.activeComp()->findLayer(l);
+    L.pathTrack = Shared<PathTrack>(tr);
+    const ObjectId m = d.addMask(comp, l, MaskShape::Path);
+    (void)m;
+    d.replaceProject(p);
+    Vec2 mn, mx;
+    layerLocalBounds(d.project(), *d.project().activeComp()->findLayer(l), 1.0, mn, mx);
+    CHECK_NEAR(mx.x, 200, 1e-9);
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", back, err));
+    CHECK(back == d.project());
+    CHECK(textUnitCount("GO\xE2\x80\x82SLOWLY", SelectorUnit::Characters) == 9);
+    CHECK(textUnitCount("GO\xE2\x80\x82SLOWLY", SelectorUnit::Words) == 2);
+    CHECK(textUnitCount("a b\nc", SelectorUnit::Lines) == 2);
+}
+
+TEST(render_text_stroke_and_stagger) {
+    Document d(makeDefaultProject(800, 300, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId t = d.addLayer(comp, LayerKind::Text);
+    TextData td;
+    td.string = "IIII";
+    td.font = "Helvetica-Bold";
+    d.setLayerText(comp, t, td);
+    d.setPropertyValue(comp, t, PropId::FontSize, 0, {200, 0, 0, 0});
+    d.setPropertyValue(comp, t, PropId::FillColor, 0, {1, 0, 0, 1});
+    d.setPropertyValue(comp, t, PropId::Position, 0, {400, 220, 0, 0});
+    const Coverage plain = coverage(render(d.project()));
+    d.setLayerFillStroke(comp, t, true, true);
+    d.setPropertyValue(comp, t, PropId::StrokeColor, 0, {1, 1, 1, 1});
+    d.setPropertyValue(comp, t, PropId::StrokeWidth, 0, {16, 0, 0, 0});
+    Image img = render(d.project());
+    const Coverage stroked = coverage(img);
+    CHECK(stroked.area > plain.area * 1.2);           // the stroke adds an outline
+    CHECK(stroked.minY <= plain.minY - 6);            // half the width (8 px) outside the glyphs
+    // Fill over stroke (default): glyph interiors stay red; the rim is white.
+    int red = 0, white = 0;
+    for (int y = 0; y < img.h; ++y)
+        for (int x = 0; x < img.w; ++x) {
+            const float* c = img.at(x, y);
+            if (c[3] > 0.99 && c[0] > 0.99 && c[1] < 0.01) ++red;
+            if (c[3] > 0.99 && c[1] > 0.99) ++white;
+        }
+    CHECK(red > 1000 && white > 500);
+    // Stagger: one Amount curve cascades over the characters.
+    d.setLayerFillStroke(comp, t, true, false);
+    const ObjectId an = d.addTextAnimator(comp, t, Document::AnimatorPreset::Opacity);  // opacity 0 at 100%
+    d.setPropertyAnimated(comp, t, PropRef::animator(an, AnimParam::Amount), true, 0);
+    d.setPropertyValue(comp, t, PropRef::animator(an, AnimParam::Amount), 1, {0, 0, 0, 0});
+    d.setPropertyValue(comp, t, PropRef::animator(an, AnimParam::Amount), 0, {100, 0, 0, 0});
+    Project p = d.project();
+    p.activeComp()->findLayer(t)->animators[0].stagger = 1.0;
+    d.replaceProject(p);
+    const FrameDesc f = evaluateFrame(d.project(), *d.project().activeComp(), 1.0);
+    CHECK(f.animators.size() == 1 && f.animators[0].unitAmounts.size() == 4);
+    if (f.animators.size() == 1 && f.animators[0].unitAmounts.size() == 4) {
+        CHECK_NEAR(f.animators[0].unitAmounts[0], 0, 1e-6);  // char 0 at t=1: done
+        CHECK_NEAR(f.animators[0].unitAmounts[1], 1, 1e-6);  // char 1 sees t=0: hidden
+    }
+    const Coverage half = coverage(render(d.project(), 1.0));
+    CHECK(half.area < plain.area * 0.4 && half.area > plain.area * 0.1);  // one of four bars
+}
+
+// Fonts without the fixed-width Unicode spaces (Baloo 2 has no U+2002) still give them their
+// standard width, as After Effects does, instead of whatever the fallback font uses.
+TEST(text_fixed_width_spaces_use_unicode_widths) {
+    CTFontRef f = CTFontCreateWithName(CFSTR("Baloo2-ExtraBold"), 100, nullptr);
+    CFStringRef ps = CTFontCopyPostScriptName(f);
+    const bool have = ps && CFStringCompare(ps, CFSTR("Baloo2-ExtraBold"), 0) == kCFCompareEqualTo;
+    if (ps) CFRelease(ps);
+    CFRelease(f);
+    if (!have) {
+        std::printf("    (Baloo 2 not installed: skipped)\n");
+        return;
+    }
+    auto width = [](const char* s) {
+        TextStyle st;
+        st.text = s;
+        st.font = "Baloo2-ExtraBold";
+        st.size = 100;
+        st.align = TextAlign::Left;
+        auto lay = layoutText(st);
+        return lay->mx.x - lay->mn.x;
+    };
+    CHECK_NEAR(width("GO\xE2\x80\x82SLOWLY") - width("GOSLOWLY"), 50, 0.5);    // en space: 0.5 em
+    CHECK_NEAR(width("GO\xE2\x80\x83SLOWLY") - width("GOSLOWLY"), 100, 0.5);   // em space
+    CHECK(width("GO SLOWLY") - width("GOSLOWLY") < 40);                         // the font's own space
+}
+
+TEST(render_gradient_ramp_keeps_alpha) {
+    Document d(makeDefaultProject(400, 400, 30, 5));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Shape, ShapeType::Ellipse);
+    d.setPropertyValue(comp, l, PropId::ShapeSize, 0, {300, 300, 0, 0});
+    const ObjectId fx = d.addEffect(comp, l, EffectType::GradientRamp);
+    // Layer space is centred on the ellipse: top -> red, bottom -> blue.
+    d.setPropertyValue(comp, l, PropRef::effect(fx, 0), 0, {0, -150, 0, 0});
+    d.setPropertyValue(comp, l, PropRef::effect(fx, 1), 0, {1, 0, 0, 1});
+    d.setPropertyValue(comp, l, PropRef::effect(fx, 2), 0, {0, 150, 0, 0});
+    d.setPropertyValue(comp, l, PropRef::effect(fx, 3), 0, {0, 0, 1, 1});
+    const Image img = render(d.project());
+    CHECK(img.at(200, 60)[0] > 0.9 && img.at(200, 60)[2] < 0.1);
+    CHECK(img.at(200, 340)[2] > 0.9 && img.at(200, 340)[0] < 0.1);
+    CHECK_NEAR(img.at(200, 200)[0], 0.5, 0.02);
+    CHECK(img.a(10, 10) < 0.01);  // outside the ellipse: still transparent
+}
+
+TEST(motion_blur_per_layer_and_through_precomps) {
+    Project p = makeDefaultProject(400, 200, 30, 2);
+    Composition& c = *p.activeComp();
+    c.motionBlur = true;  // 180 degree shutter, phase -90, 8 samples
+    Layer mover = makeLayer(LayerKind::Shape, c, p.allocateId());
+    mover.prop(PropId::ShapeSize).value = {20, 20, 0, 0};
+    Keyframe a, b;
+    a.time = 0;
+    a.value = {0, 100, 0, 0};
+    b.time = 2;
+    b.value = {600, 100, 0, 0};  // 10 px per frame
+    mover.prop(PropId::Position).keyframes = {a, b};
+    Layer still = mover;
+    still.id = p.allocateId();
+    mover.motionBlur = true;
+    c.layers = {mover, still};
+    const auto offs = motionBlurOffsets(p, c);
+    CHECK(offs.size() == 8);
+    CHECK_NEAR(offs.front(), (-90 + 180 * 0.5 / 8) / 360.0 / 30, 1e-12);
+    CHECK_NEAR(offs.back(), (-90 + 180 * 7.5 / 8) / 360.0 / 30, 1e-12);
+    const FrameDesc f0 = evaluateFrame(p, c, 1.0, 1, nullptr, offs.front());
+    const FrameDesc f1 = evaluateFrame(p, c, 1.0, 1, nullptr, offs.back());
+    // Items are bottom-to-top: [still, mover]. The mover spans ~4.4 px across the shutter.
+    CHECK_NEAR(f1.items[1].toTarget.tx - f0.items[1].toTarget.tx, 600.0 / 2 * (180.0 * 7 / 8 / 360) / 30, 1e-6);
+    CHECK_NEAR(f1.items[0].toTarget.tx, f0.items[0].toTarget.tx, 1e-9);
+    // A precomp holding one source frame (time remap) does not blur its contents.
+    Composition src;
+    src.id = p.allocateId();
+    src.width = 400;
+    src.height = 200;
+    src.duration = 2;
+    Layer m2 = mover;
+    m2.id = p.allocateId();
+    src.layers = {m2};
+    p.compositions.push_back(src);
+    Composition& c2 = *p.activeComp();
+    Layer pl = makePrecompLayer(c2, src, p.allocateId());
+    pl.timeRemap = true;
+    pl.prop(PropId::TimeRemap).value = {0.5, 0, 0, 0};
+    pl.collapse = true;
+    pl.motionBlur = true;
+    c2.layers = {pl};
+    const FrameDesc g0 = evaluateFrame(p, c2, 1.0, 1, nullptr, offs.front());
+    const FrameDesc g1 = evaluateFrame(p, c2, 1.0, 1, nullptr, offs.back());
+    CHECK(g0.items.size() == 1 && g1.items.size() == 1);
+    if (g0.items.size() == 1 && g1.items.size() == 1) CHECK_NEAR(g0.items[0].toTarget.tx, g1.items[0].toTarget.tx, 1e-9);
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(p, ""), "", back, err));
+    CHECK(back == p);
 }
 
 // The exact path the app uses: Objective-C bridge -> document -> renderer -> PNG.

@@ -56,6 +56,7 @@ void Document::replaceProject(Project p) {
     project_ = std::move(p);
     undo_.clear();
     redo_.clear();
+    undoBytes_ = 0;
     groupDepth_ = 0;
     groupRecorded_ = false;
     touched();
@@ -65,29 +66,72 @@ void Document::replaceProject(Project p) {
 void Document::clearHistory() {
     undo_.clear();
     redo_.clear();
+    undoBytes_ = 0;
     groupDepth_ = 0;
     groupRecorded_ = false;
     markSaved();
 }
 
+size_t approxSnapshotBytes(const Project& p) {
+    size_t n = sizeof(Project) + p.assets.size() * sizeof(Asset);
+    auto prop = [](const Property& q) { return q.keyframes.size() * sizeof(Keyframe); };
+    auto path = [](const BezierPath& b) { return b.vertices.size() * sizeof(PathVertex); };
+    for (const Composition& c : p.compositions) {
+        n += sizeof(Composition);
+        for (const Layer& l : c.layers) {
+            n += sizeof(Layer) + l.name.size() + l.text.string.size() + path(l.path);
+            for (const Property& q : l.props) n += prop(q);
+            for (const Mask& m : l.masks) {
+                n += sizeof(Mask) + path(m.path);
+                for (const Property& q : m.params) n += prop(q);
+            }
+            for (const Effect& e : l.effects) {
+                n += sizeof(Effect) + e.params.size() * sizeof(Property);
+                for (const Property& q : e.params) n += prop(q);
+            }
+            for (const TextAnimator& a : l.animators) {
+                n += sizeof(TextAnimator);
+                for (const Property& q : a.params) n += prop(q);
+            }
+        }
+    }
+    return n;
+}
+
+void Document::push(std::deque<Snapshot>& stack, Project p, std::string label) {
+    const size_t bytes = approxSnapshotBytes(p);
+    stack.push_back({std::move(p), std::move(label), bytes});
+    undoBytes_ += bytes;
+}
+
+// Oldest undo steps go first; redo is cleared by every edit anyway.
+void Document::trimHistory() {
+    while (!undo_.empty() && (undo_.size() > kMaxUndo || (undoBytes_ > kUndoBudget && undo_.size() > 1))) {
+        undoBytes_ -= undo_.front().bytes;
+        undo_.pop_front();
+    }
+}
+
 Project& Document::edit(const std::string& label) {
     if (groupDepth_ > 0) {
         if (!groupRecorded_) {
-            undo_.push_back({project_, groupLabel_.empty() ? label : groupLabel_});
+            push(undo_, project_, groupLabel_.empty() ? label : groupLabel_);
             groupRecorded_ = true;
         }
     } else {
-        undo_.push_back({project_, label});
+        push(undo_, project_, label);
     }
-    while (undo_.size() > kMaxUndo) undo_.pop_front();
+    for (const Snapshot& r : redo_) undoBytes_ -= r.bytes;
     redo_.clear();
+    trimHistory();
     touched();
     return project_;
 }
 
 bool Document::undo() {
     if (undo_.empty()) return false;
-    redo_.push_back({project_, undo_.back().label});
+    push(redo_, project_, undo_.back().label);
+    undoBytes_ -= undo_.back().bytes;
     project_ = std::move(undo_.back().project);
     undo_.pop_back();
     touched();
@@ -96,9 +140,11 @@ bool Document::undo() {
 
 bool Document::redo() {
     if (redo_.empty()) return false;
-    undo_.push_back({project_, redo_.back().label});
+    push(undo_, project_, redo_.back().label);
+    undoBytes_ -= redo_.back().bytes;
     project_ = std::move(redo_.back().project);
     redo_.pop_back();
+    trimHistory();
     touched();
     return true;
 }
@@ -136,6 +182,61 @@ bool Document::setCompositionSettings(ObjectId comp, int width, int height, doub
     return true;
 }
 
+ObjectId Document::addComposition(const std::string& name, int width, int height, double fps, double duration) {
+    if (width < 1 || height < 1 || width > 16384 || height > 16384 || fps < 1 || fps > 240 || duration <= 0) return 0;
+    Project& p = edit("New Composition");
+    Composition c;
+    c.id = p.allocateId();
+    c.name = name.empty() ? "Comp " + std::to_string(p.compositions.size() + 1) : name;
+    c.width = width;
+    c.height = height;
+    c.fps = fps;
+    c.duration = std::max(duration, 1.0 / fps);
+    p.compositions.push_back(std::move(c));
+    return p.compositions.back().id;
+}
+
+bool Document::setActiveComposition(ObjectId comp) {
+    if (!project_.findComposition(comp) || project_.activeComposition == comp) return false;
+    project_.activeComposition = comp;
+    touched();
+    return true;
+}
+
+ObjectId Document::addPrecompLayer(ObjectId comp, ObjectId source) {
+    const Composition* c0 = project_.findComposition(comp);
+    const Composition* s0 = project_.findComposition(source);
+    // `source` must not already show `comp` (directly or nested), and a comp can't show itself.
+    if (!c0 || !s0 || compUses(project_, source, comp)) return 0;
+    Project& p = edit("New Precomp Layer");
+    Composition& c = *p.findComposition(comp);
+    Layer l = makePrecompLayer(c, *p.findComposition(source), p.allocateId());
+    l.name = uniqueName(c, l.name);
+    c.layers.insert(c.layers.begin(), l);
+    return l.id;
+}
+
+bool Document::setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime) {
+    const Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind != LayerKind::Precomp) return false;
+    if (l0->collapse == collapse && l0->timeRemap == timeRemap && l0->startTime == startTime) return false;
+    Layer& l = *edit("Precomp Options").findComposition(comp)->findLayer(layer);
+    if (timeRemap && !l.timeRemap && !l.prop(PropId::TimeRemap).animated() && !l.prop(PropId::TimeRemap).baked()) {
+        // Start remapping as an identity map over the layer's span: key in -> source time.
+        Property& r = l.prop(PropId::TimeRemap);
+        Keyframe a, b;
+        a.time = l.inPoint;
+        a.value = {l.inPoint - startTime, 0, 0, 0};
+        b.time = l.outPoint;
+        b.value = {l.outPoint - startTime, 0, 0, 0};
+        r.keyframes = {a, b};
+    }
+    l.collapse = collapse;
+    l.timeRemap = timeRemap;
+    l.startTime = startTime;
+    return true;
+}
+
 ObjectId Document::addImageAsset(const std::string& path, const std::string& name, int width, int height) {
     for (const Asset& a : project_.assets)
         if (a.path == path) return a.id;  // importing the same file twice reuses the asset
@@ -159,7 +260,7 @@ ObjectId Document::addLayer(ObjectId comp, LayerKind kind, ShapeType shape, Obje
     Layer l = makeLayer(kind, c, p.allocateId(), p.findAsset(asset));
     l.shape = shape;
     if (kind == LayerKind::Shape) {
-        static const char* names[] = {"Rectangle", "Ellipse", "Polygon", "Star"};
+        static const char* names[] = {"Rectangle", "Ellipse", "Polygon", "Star", "Shape"};
         l.name = names[static_cast<int>(shape)];
         if (shape == ShapeType::Polygon) l.prop(PropId::Points).value[0] = 6;
     }
@@ -191,6 +292,7 @@ ObjectId Document::duplicateLayer(ObjectId comp, ObjectId layer) {
     copy.id = p.allocateId();
     for (Mask& m : copy.masks) m.id = p.allocateId();
     for (Effect& e : copy.effects) e.id = p.allocateId();
+    for (TextAnimator& a : copy.animators) a.id = p.allocateId();
     copy.name = uniqueName(c, copy.name);
     c.layers.insert(c.layers.begin() + idx, copy);
     return copy.id;
@@ -316,6 +418,20 @@ bool Document::setPropertyValue(ObjectId comp, ObjectId layer, PropRef prop, dou
         const int k = findKeyAt(*p0, time);
         if (k >= 0 && p0->keyframes[size_t(k)].value == v) return false;
     }
+    if (p0->baked()) {
+        // Baked animation keeps its motion: the whole track shifts so it passes through `v` at `time`.
+        const Value cur = evaluateProperty(*p0, def, time);
+        if (cur == v) return false;
+        SampledTrack t = *p0->samples;
+        for (size_t i = 0; i < t.count(); ++i)
+            for (int k = 0; k < std::min(def.dims, t.dims); ++k) {
+                float& x = t.data[i * size_t(t.dims) + size_t(k)];
+                x = float(std::clamp(double(x) + v[size_t(k)] - cur[size_t(k)], def.minValue, def.maxValue));
+            }
+        edit(std::string("Change ") + def.label);
+        resolveProperty(*layerFor(comp, layer), prop)->samples = Shared<SampledTrack>(std::move(t));
+        return true;
+    }
     edit(std::string("Change ") + def.label);
     Property& p = *resolveProperty(*layerFor(comp, layer), prop);
     if (p.animated()) {
@@ -329,10 +445,11 @@ bool Document::setPropertyValue(ObjectId comp, ObjectId layer, PropRef prop, dou
 bool Document::setPropertyAnimated(ObjectId comp, ObjectId layer, PropRef prop, bool animated, double time) {
     Layer* l0 = layerFor(comp, layer);
     const Property* p0 = l0 ? resolveProperty(*l0, prop) : nullptr;
-    if (!p0 || p0->animated() == animated) return false;
+    if (!p0 || (p0->animated() == animated && !p0->baked())) return false;
     const Value current = evaluateProperty(*p0, *propertyDef(*l0, prop), time);
-    edit(animated ? "Enable Keyframes" : "Remove Keyframes");
+    edit(p0->baked() ? "Remove Baked Animation" : animated ? "Enable Keyframes" : "Remove Keyframes");
     Property& p = *resolveProperty(*layerFor(comp, layer), prop);
+    p.samples.reset();  // switching to (or off) keyframes replaces a baked track
     if (animated) {
         p.keyframes = {newKey(*propertyDef(*layerFor(comp, layer), prop), time, current)};
     } else {
@@ -748,6 +865,7 @@ std::vector<ObjectId> Document::insertLayers(ObjectId comp, std::vector<Layer> l
         l.id = fresh;
         for (Mask& m : l.masks) m.id = p.allocateId();
         for (Effect& e : l.effects) e.id = p.allocateId();
+        for (TextAnimator& a : l.animators) a.id = p.allocateId();
         if (l.kind == LayerKind::Image) {
             auto it = assetMap.find(l.asset);
             if (it != assetMap.end()) l.asset = it->second;
@@ -771,6 +889,152 @@ std::vector<ObjectId> Document::insertLayers(ObjectId comp, std::vector<Layer> l
     atIndex = std::clamp(atIndex, 0, int(c.layers.size()));
     c.layers.insert(c.layers.begin() + atIndex, layers.begin(), layers.end());
     return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Text, paths, graph easing
+
+bool Document::setLayerText(ObjectId comp, ObjectId layer, const TextData& text) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind != LayerKind::Text || l0->text == text) return false;
+    edit("Edit Text");
+    layerFor(comp, layer)->text = text;
+    return true;
+}
+
+ObjectId Document::addTextAnimator(ObjectId comp, ObjectId layer, AnimatorPreset preset) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind != LayerKind::Text) return 0;
+    Project& p = edit("Add Text Animator");
+    Layer& l = *layerFor(comp, layer);
+    TextAnimator a = makeTextAnimator(p.allocateId());
+    switch (preset) {
+        case AnimatorPreset::Opacity:
+            a.name = "Opacity";
+            a.param(AnimParam::Opacity).value[0] = 0;
+            break;
+        case AnimatorPreset::Position:
+            a.name = "Position";
+            a.param(AnimParam::Position).value = {0, 80, 0, 0};
+            break;
+        case AnimatorPreset::Scale:
+            a.name = "Scale";
+            a.param(AnimParam::Scale).value[0] = 0;
+            break;
+        case AnimatorPreset::Rotation:
+            a.name = "Rotation";
+            a.param(AnimParam::Rotation).value[0] = 90;
+            break;
+    }
+    a.name = "Animator " + std::to_string(l.animators.size() + 1) + " (" + a.name + ")";
+    l.animators.push_back(a);
+    return a.id;
+}
+
+bool Document::removeTextAnimator(ObjectId comp, ObjectId layer, ObjectId animator) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || !l0->findAnimator(animator)) return false;
+    edit("Remove Text Animator");
+    auto& v = layerFor(comp, layer)->animators;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const TextAnimator& a) { return a.id == animator; }), v.end());
+    return true;
+}
+
+bool Document::setTextAnimatorOptions(ObjectId comp, ObjectId layer, ObjectId animator, bool enabled, SelectorShape shape,
+                                      SelectorUnit unit) {
+    Layer* l0 = layerFor(comp, layer);
+    const TextAnimator* a0 = l0 ? l0->findAnimator(animator) : nullptr;
+    if (!a0 || (a0->enabled == enabled && a0->shape == shape && a0->unit == unit)) return false;
+    edit("Text Animator");
+    TextAnimator* a = layerFor(comp, layer)->findAnimator(animator);
+    a->enabled = enabled;
+    a->shape = shape;
+    a->unit = unit;
+    return true;
+}
+
+ObjectId Document::addPathLayer(ObjectId comp, const std::vector<PathVertex>& pts, bool closed) {
+    if (!project_.findComposition(comp) || pts.size() < 2) return 0;
+    BezierPath path;
+    path.vertices = pts;
+    path.closed = closed;
+    Vec2 mn, mx;
+    pathBounds(path, mn, mx);
+    const Vec2 centre{(mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5};
+    for (PathVertex& v : path.vertices) v.p = v.p - centre;
+    Project& p = edit("Draw Shape");
+    Composition& c = *p.findComposition(comp);
+    Layer l = makeLayer(LayerKind::Shape, c, p.allocateId());
+    l.shape = ShapeType::Path;
+    l.path = path;
+    l.prop(PropId::Position).value = {centre.x, centre.y, 0, 0};
+    l.fillEnabled = closed;
+    l.strokeEnabled = !closed;
+    l.name = uniqueName(c, closed ? "Shape" : "Line");
+    c.layers.insert(c.layers.begin(), l);
+    return l.id;
+}
+
+bool Document::setLayerPath(ObjectId comp, ObjectId layer, const BezierPath& path) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind != LayerKind::Shape || l0->path == path) return false;
+    edit("Edit Path");
+    Layer& l = *layerFor(comp, layer);
+    l.path = path;
+    l.shape = ShapeType::Path;
+    return true;
+}
+
+ObjectId Document::addPathMask(ObjectId comp, ObjectId layer, const BezierPath& path) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind == LayerKind::Null || path.empty()) return 0;
+    Project& p = edit("Draw Mask");
+    Layer& l = *layerFor(comp, layer);
+    Mask m;
+    m.id = p.allocateId();
+    m.shape = MaskShape::Path;
+    m.name = "Mask " + std::to_string(l.masks.size() + 1);
+    for (int i = 0; i < kMaskParamCount; ++i) m.params[size_t(i)].value = maskParamDef(static_cast<MaskParam>(i)).defaultValue;
+    m.path = path;
+    m.path.closed = true;
+    l.masks.push_back(m);
+    return m.id;
+}
+
+bool Document::setMaskPath(ObjectId comp, ObjectId layer, ObjectId mask, const BezierPath& path) {
+    Layer* l0 = layerFor(comp, layer);
+    const Mask* m0 = l0 ? l0->findMask(mask) : nullptr;
+    if (!m0 || m0->path == path) return false;
+    edit("Edit Mask Path");
+    Mask* m = layerFor(comp, layer)->findMask(mask);
+    m->path = path;
+    m->shape = MaskShape::Path;
+    return true;
+}
+
+bool Document::setKeyframeEase(ObjectId comp, ObjectId layer, PropRef prop, int index, bool outgoing, double influence,
+                               double slope) {
+    Layer* l0 = layerFor(comp, layer);
+    const Property* p0 = l0 ? resolveProperty(*l0, prop) : nullptr;
+    if (!p0 || index < 0 || index >= int(p0->keyframes.size())) return false;
+    influence = std::clamp(influence, 0.01, 1.0);
+    slope = std::clamp(slope, -20.0, 20.0);
+    const Keyframe& k0 = p0->keyframes[size_t(index)];
+    if (outgoing ? (k0.outInterp == Interp::Bezier && k0.easeOut == influence && k0.outSlope == slope)
+                 : (k0.inInterp == Interp::Bezier && k0.easeIn == influence && k0.inSlope == slope))
+        return false;
+    edit("Keyframe Velocity");
+    Keyframe& k = resolveProperty(*layerFor(comp, layer), prop)->keyframes[size_t(index)];
+    if (outgoing) {
+        k.outInterp = Interp::Bezier;
+        k.easeOut = influence;
+        k.outSlope = slope;
+    } else {
+        k.inInterp = Interp::Bezier;
+        k.easeIn = influence;
+        k.inSlope = slope;
+    }
+    return true;
 }
 
 }  // namespace mf

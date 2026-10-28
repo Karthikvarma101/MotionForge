@@ -77,6 +77,9 @@ struct TimelineView: View {
                         .padding(.leading, Self.nameWidth)
                     }
                     Divider()
+                    if model.showGraphEditor {
+                        GraphEditorView(model: model, time: time, mapper: mapper)
+                    } else {
                     ZStack(alignment: .topLeading) {
                         ScrollView(.vertical) {
                             LazyVStack(spacing: 0) {
@@ -97,6 +100,7 @@ struct TimelineView: View {
                         PlayheadLine(time: time, mapper: mapper)
                             .offset(x: Self.nameWidth)
                             .allowsHitTesting(false)
+                    }
                     }
                 }
                 .onChange(of: marquee.committed) { _, r in
@@ -169,6 +173,9 @@ private struct TransportBar: View {
                 Toggle(isOn: $time.loop) { Image(systemName: "repeat") }
                     .toggleStyle(.button).help("Loop playback")
             }
+            Toggle(isOn: $model.showGraphEditor) { Label("Graph", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
+                .toggleStyle(.button)
+                .help("Graph editor: value curves with ease handles for the selected keys")
             Spacer()
             Image(systemName: "minus.magnifyingglass").foregroundStyle(.secondary)
             Slider(value: $zoom, in: 1...32).frame(width: 120).help("Timeline zoom")
@@ -345,7 +352,10 @@ private struct LayerNameCell: View {
                     .frame(width: 12)
             }
             .buttonStyle(.plain)
-            Image(systemName: layer.icon).foregroundStyle(.secondary).frame(width: 16)
+            Image(systemName: layer.icon).foregroundStyle(layer.kind == .precomp ? Theme.accent : .secondary).frame(width: 16)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { if layer.kind == .precomp { model.openComposition(layer.sourceCompID) } }
+                .help(layer.kind == .precomp ? "Double-click to open this precomp" : "")
             if renaming {
                 TextField("", text: $name)
                     .textFieldStyle(.plain)

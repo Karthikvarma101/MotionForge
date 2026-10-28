@@ -22,6 +22,24 @@ const PropDef kPropDefs[kPropCount] = {
     {"strokeWidth", "Stroke Width", 1, {8, 0, 0, 0}, 0, 10000, false},
     {"points", "Points", 1, {5, 0, 0, 0}, 3, 64, false},
     {"innerRatio", "Inner Radius", 1, {0.45, 0, 0, 0}, 0.01, 1, false},
+    {"fontSize", "Font Size", 1, {120, 0, 0, 0}, 1, 4000, false},
+    {"tracking", "Tracking", 1, {0, 0, 0, 0}, -1000, 5000, false},
+    {"lineHeight", "Line Height", 1, {1.2, 0, 0, 0}, 0.1, 10, false},
+    {"trimStart", "Trim Start", 1, {0, 0, 0, 0}, 0, 100, false},
+    {"trimEnd", "Trim End", 1, {100, 0, 0, 0}, 0, 100, false},
+    {"trimOffset", "Trim Offset", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"timeRemap", "Time Remap", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+};
+
+const PropDef kAnimParamDefs[kAnimParamCount] = {
+    {"start", "Range Start", 1, {0, 0, 0, 0}, 0, 100, false},
+    {"end", "Range End", 1, {100, 0, 0, 0}, 0, 100, false},
+    {"offset", "Range Offset", 1, {0, 0, 0, 0}, -100, 100, false},
+    {"amount", "Amount", 1, {100, 0, 0, 0}, -200, 200, false},
+    {"position", "Char Position", 2, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"scale", "Char Scale", 1, {100, 0, 0, 0}, -10000, 10000, false},
+    {"rotation", "Char Rotation", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"opacity", "Char Opacity", 1, {100, 0, 0, 0}, 0, 100, false},
 };
 
 template <typename E, size_t N>
@@ -33,10 +51,13 @@ std::optional<E> fromKey(std::string_view key, const char* const (&keys)[N]) {
 
 const char* const kInterpKeys[] = {"linear", "hold", "bezier"};
 const char* const kSpatialKeys[] = {"linear", "auto", "bezier"};
-const char* const kLayerKindKeys[] = {"shape", "image", "null"};
-const char* const kShapeTypeKeys[] = {"rectangle", "ellipse", "polygon", "star"};
+const char* const kLayerKindKeys[] = {"shape", "image", "null", "text", "precomp"};
+const char* const kShapeTypeKeys[] = {"rectangle", "ellipse", "polygon", "star", "path"};
+const char* const kTextAlignKeys[] = {"left", "center", "right"};
+const char* const kSelectorShapeKeys[] = {"square", "rampUp", "rampDown", "triangle", "round", "smooth"};
+const char* const kSelectorUnitKeys[] = {"characters", "words", "lines"};
 const char* const kBlendKeys[] = {"normal", "add", "multiply", "screen", "overlay", "darken", "lighten"};
-const char* const kMaskShapeKeys[] = {"rectangle", "ellipse"};
+const char* const kMaskShapeKeys[] = {"rectangle", "ellipse", "path"};
 const char* const kMaskModeKeys[] = {"add", "subtract", "intersect", "difference"};
 const char* const kMatteModeKeys[] = {"none", "alpha", "alphaInverted", "luma", "lumaInverted"};
 
@@ -73,6 +94,14 @@ const std::vector<EffectDef>& effectDefs() {
         {"fill", "Fill", "Generate", "Replaces the layer's colour, keeping its alpha.",
          {{"color", "Fill Color", 4, {1, 0.25, 0.25, 1}, 0, 1, true},
           {"opacity", "Fill Opacity", 1, {100, 0, 0, 0}, 0, 100, false}}},
+        {"gradientRamp", "Gradient Ramp", "Generate",
+         "Colours the layer with a linear or radial gradient between two points (layer space), keeping its alpha.",
+         {{"startPoint", "Start of Ramp", 2, {0, 0, 0, 0}, -kBig, kBig, false},
+          {"startColor", "Start Color", 4, {0, 0, 0, 1}, 0, 1, true},
+          {"endPoint", "End of Ramp", 2, {0, 400, 0, 0}, -kBig, kBig, false},
+          {"endColor", "End Color", 4, {1, 1, 1, 1}, 0, 1, true},
+          {"radial", "Radial", 1, {0, 0, 0, 0}, 0, 1, false},
+          {"blend", "Blend With Original", 1, {0, 0, 0, 0}, 0, 100, false}}},
     };
     return defs;
 }
@@ -87,13 +116,14 @@ Value clampValue(Value v, const PropDef& def) {
 void segmentControls(const Keyframe& k0, const Keyframe& k1, double& x1, double& y1, double& x2, double& y2) {
     if (k0.outInterp == Interp::Bezier) {
         x1 = std::clamp(k0.easeOut, 0.0, 1.0);
-        y1 = 0;
+        y1 = x1 * std::clamp(k0.outSlope, -20.0, 20.0);
     } else {
         x1 = y1 = 1.0 / 3.0;
     }
     if (k1.inInterp == Interp::Bezier) {
-        x2 = 1.0 - std::clamp(k1.easeIn, 0.0, 1.0);
-        y2 = 1;
+        const double inf = std::clamp(k1.easeIn, 0.0, 1.0);
+        x2 = 1.0 - inf;
+        y2 = 1.0 - inf * std::clamp(k1.inSlope, -20.0, 20.0);
     } else {
         x2 = y2 = 2.0 / 3.0;
     }
@@ -110,6 +140,86 @@ std::optional<PropId> propFromKey(std::string_view key) {
 }
 
 const char* interpKey(Interp v) { return kInterpKeys[static_cast<size_t>(v)]; }
+const char* textAlignKey(TextAlign v) { return kTextAlignKeys[static_cast<size_t>(v)]; }
+const char* selectorShapeKey(SelectorShape v) { return kSelectorShapeKeys[static_cast<size_t>(v)]; }
+const char* selectorUnitKey(SelectorUnit v) { return kSelectorUnitKeys[static_cast<size_t>(v)]; }
+std::optional<TextAlign> textAlignFromKey(std::string_view k) { return fromKey<TextAlign>(k, kTextAlignKeys); }
+std::optional<SelectorShape> selectorShapeFromKey(std::string_view k) { return fromKey<SelectorShape>(k, kSelectorShapeKeys); }
+std::optional<SelectorUnit> selectorUnitFromKey(std::string_view k) { return fromKey<SelectorUnit>(k, kSelectorUnitKeys); }
+const PropDef& animParamDef(AnimParam p) { return kAnimParamDefs[static_cast<size_t>(p)]; }
+
+TextAnimator makeTextAnimator(ObjectId id) {
+    TextAnimator a;
+    a.id = id;
+    for (int i = 0; i < kAnimParamCount; ++i) a.params[size_t(i)].value = kAnimParamDefs[i].defaultValue;
+    return a;
+}
+
+double selectorWeight(SelectorShape shape, double start, double end, int i, int n) {
+    if (n <= 0) return 0;
+    double s = start * n, e = end * n;
+    if (s > e) std::swap(s, e);
+    if (shape == SelectorShape::Square) return std::clamp(std::min(e, double(i + 1)) - std::max(s, double(i)), 0.0, 1.0);
+    if (e - s < 1e-9) return 0;
+    const double u = (i + 0.5 - s) / (e - s);
+    switch (shape) {
+        case SelectorShape::RampUp: return std::clamp(u, 0.0, 1.0);          // fully selected after the range
+        case SelectorShape::RampDown: return std::clamp(1.0 - u, 0.0, 1.0);  // fully selected before it
+        default: break;
+    }
+    if (u < 0 || u > 1) return 0;
+    switch (shape) {
+        case SelectorShape::Triangle: return 1.0 - std::abs(2 * u - 1);
+        case SelectorShape::Round: return std::sqrt(std::max(0.0, 1.0 - (2 * u - 1) * (2 * u - 1)));
+        case SelectorShape::Smooth: return 0.5 - 0.5 * std::cos(2 * M_PI * u);
+        default: return 1;
+    }
+}
+
+namespace {
+void flattenCubic(Vec2 a, Vec2 b, Vec2 c, Vec2 d, double tol, int depth, std::vector<Vec2>& out) {
+    // Flat enough when both inner control points are within `tol` of the chord.
+    const double dx = d.x - a.x, dy = d.y - a.y;
+    const double len = std::hypot(dx, dy);
+    auto dist = [&](Vec2 p) {
+        if (len < 1e-12) return std::hypot(p.x - a.x, p.y - a.y);
+        return std::abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+    };
+    if (depth >= 12 || std::max(dist(b), dist(c)) <= tol) {
+        out.push_back(d);
+        return;
+    }
+    auto mid = [](Vec2 p, Vec2 q) { return Vec2{(p.x + q.x) * 0.5, (p.y + q.y) * 0.5}; };
+    const Vec2 ab = mid(a, b), bc = mid(b, c), cd = mid(c, d), abc = mid(ab, bc), bcd = mid(bc, cd), m = mid(abc, bcd);
+    flattenCubic(a, ab, abc, m, tol, depth + 1, out);
+    flattenCubic(m, bcd, cd, d, tol, depth + 1, out);
+}
+}  // namespace
+
+std::vector<Vec2> flattenPath(const BezierPath& p, double tolerance) {
+    std::vector<Vec2> out;
+    const auto& v = p.vertices;
+    if (v.empty()) return out;
+    out.push_back(v[0].p);
+    const size_t segs = p.closed ? v.size() : v.size() - 1;
+    for (size_t i = 0; i < segs; ++i) {
+        const PathVertex& a = v[i];
+        const PathVertex& b = v[(i + 1) % v.size()];
+        flattenCubic(a.p, a.p + a.out, b.p + b.in, b.p, std::max(tolerance, 1e-4), 0, out);
+    }
+    return out;  // a closed path ends back on its first point
+}
+
+void pathBounds(const BezierPath& p, Vec2& mn, Vec2& mx) {
+    mn = {1e300, 1e300};
+    mx = {-1e300, -1e300};
+    for (const PathVertex& v : p.vertices)
+        for (Vec2 q : {v.p, v.p + v.in, v.p + v.out}) {
+            mn = {std::min(mn.x, q.x), std::min(mn.y, q.y)};
+            mx = {std::max(mx.x, q.x), std::max(mx.y, q.y)};
+        }
+    if (p.vertices.empty()) mn = mx = {0, 0};
+}
 const char* layerKindKey(LayerKind v) { return kLayerKindKeys[static_cast<size_t>(v)]; }
 const char* shapeTypeKey(ShapeType v) { return kShapeTypeKeys[static_cast<size_t>(v)]; }
 const char* blendModeKey(BlendMode v) { return kBlendKeys[static_cast<size_t>(v)]; }
@@ -253,7 +363,57 @@ std::vector<std::array<double, 2>> sampleMotionPath(const Property& p, int perSe
     return pts;
 }
 
+Value SampledTrack::at(double time) const {
+    Value out{};
+    const size_t n = count();
+    if (n == 0) return out;
+    const double x = (time - t0) * rate;
+    size_t i = 0;
+    double f = 0;
+    if (x >= double(n - 1)) {
+        i = n - 1;
+    } else if (x > 0) {
+        i = size_t(x);
+        f = x - double(i);
+    }
+    const size_t d = size_t(std::min(dims, 4));
+    const float* a = data.data() + i * size_t(dims);
+    for (size_t k = 0; k < d; ++k) out[k] = a[k];
+    if (f > 1e-9 && i + 1 < n) {
+        const float* b = a + dims;
+        for (size_t k = 0; k < d; ++k) out[k] += (double(b[k]) - double(a[k])) * f;
+    }
+    return out;
+}
+
+BezierPath lerpPath(const BezierPath& a, const BezierPath& b, double t) {
+    if (a.vertices.size() != b.vertices.size() || a.closed != b.closed || t <= 0) return a;
+    if (t >= 1) return b;
+    BezierPath o = a;
+    auto mix = [t](Vec2 p, Vec2 q) { return Vec2{p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t}; };
+    for (size_t i = 0; i < o.vertices.size(); ++i) {
+        o.vertices[i].p = mix(a.vertices[i].p, b.vertices[i].p);
+        o.vertices[i].in = mix(a.vertices[i].in, b.vertices[i].in);
+        o.vertices[i].out = mix(a.vertices[i].out, b.vertices[i].out);
+    }
+    return o;
+}
+
+BezierPath PathTrack::at(double time) const {
+    if (frames.empty()) return {};
+    const double x = (time - t0) * rate;
+    if (x <= 0) return frames.front();
+    if (x >= double(frames.size() - 1)) return frames.back();
+    const size_t i = size_t(x);
+    return lerpPath(frames[i], frames[i + 1], x - double(i));
+}
+
+double Layer::sourceTime(double t) const {
+    return timeRemap ? evaluateProperty(prop(PropId::TimeRemap), PropId::TimeRemap, t)[0] : t - startTime;
+}
+
 Value evaluateProperty(const Property& p, const PropDef& def, double time) {
+    if (p.samples) return clampValue(p.samples->at(time), def);
     const auto& keys = p.keyframes;
     if (keys.empty()) return clampValue(p.value, def);
     if (time <= keys.front().time) return clampValue(keys.front().value, def);
@@ -323,6 +483,12 @@ Effect* Layer::findEffect(ObjectId eid) {
     return nullptr;
 }
 const Effect* Layer::findEffect(ObjectId eid) const { return const_cast<Layer*>(this)->findEffect(eid); }
+TextAnimator* Layer::findAnimator(ObjectId aid) {
+    for (auto& a : animators)
+        if (a.id == aid) return &a;
+    return nullptr;
+}
+const TextAnimator* Layer::findAnimator(ObjectId aid) const { return const_cast<Layer*>(this)->findAnimator(aid); }
 
 Property* resolveProperty(Layer& l, PropRef r) {
     switch (r.owner) {
@@ -336,6 +502,10 @@ Property* resolveProperty(Layer& l, PropRef r) {
             Effect* e = l.findEffect(r.ownerId);
             return (e && r.index >= 0 && r.index < int(e->params.size())) ? &e->params[size_t(r.index)] : nullptr;
         }
+        case PropOwner::TextAnimator: {
+            TextAnimator* a = l.findAnimator(r.ownerId);
+            return (a && r.index >= 0 && r.index < kAnimParamCount) ? &a->params[size_t(r.index)] : nullptr;
+        }
     }
     return nullptr;
 }
@@ -347,6 +517,7 @@ const PropDef* propertyDef(const Layer& l, PropRef r) {
         case PropOwner::Layer: return &propDef(static_cast<PropId>(r.index));
         case PropOwner::Mask: return &maskParamDef(static_cast<MaskParam>(r.index));
         case PropOwner::Effect: return &effectDef(l.findEffect(r.ownerId)->type).params[size_t(r.index)];
+        case PropOwner::TextAnimator: return &animParamDef(static_cast<AnimParam>(r.index));
     }
     return nullptr;
 }
@@ -408,8 +579,44 @@ Layer makeLayer(LayerKind kind, const Composition& comp, ObjectId id, const Asse
             l.name = "Null";
             l.prop(PropId::ShapeSize).value = {100, 100, 0, 0};
             break;
+        case LayerKind::Text:
+            l.name = "Text";
+            l.prop(PropId::FillColor).value = {1, 1, 1, 1};
+            l.prop(PropId::FontSize).value = {std::round(std::min(comp.width, comp.height) * 0.12), 0, 0, 0};
+            break;
+        case LayerKind::Precomp:
+            l.name = "Precomp";
+            break;
     }
     return l;
+}
+
+Layer makePrecompLayer(const Composition& comp, const Composition& source, ObjectId id) {
+    Layer l = makeLayer(LayerKind::Precomp, comp, id);
+    l.name = source.name;
+    l.source = source.id;
+    l.prop(PropId::AnchorPoint).value = {source.width * 0.5, source.height * 0.5, 0, 0};
+    l.outPoint = std::min(comp.duration, source.duration);
+    return l;
+}
+
+bool compUses(const Project& project, ObjectId comp, ObjectId target) {
+    if (comp == target) return true;
+    std::vector<ObjectId> stack{comp}, seen;
+    while (!stack.empty()) {
+        const ObjectId c = stack.back();
+        stack.pop_back();
+        if (std::find(seen.begin(), seen.end(), c) != seen.end()) continue;
+        seen.push_back(c);
+        const Composition* cc = project.findComposition(c);
+        if (!cc) continue;
+        for (const Layer& l : cc->layers) {
+            if (l.kind != LayerKind::Precomp || l.source == 0) continue;
+            if (l.source == target) return true;
+            stack.push_back(l.source);
+        }
+    }
+    return false;
 }
 
 Project makeDefaultProject(int width, int height, double fps, double duration) {

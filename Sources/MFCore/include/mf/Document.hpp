@@ -2,8 +2,9 @@
 // dirty tracking and revision counting stay correct.
 //
 // Undo uses whole-project snapshots. Projects hold no pixel data (media lives in the renderer's
-// asset cache), so a snapshot is small — a few KB for typical motion-graphics comps — and
-// snapshot undo is trivially correct for every operation, including ones added later.
+// asset cache) and baked tracks are shared between snapshots, so a snapshot is small — a few KB
+// for typical motion-graphics comps — and snapshot undo is trivially correct for every operation,
+// including ones added later. Very large (imported) projects are bounded by a byte budget.
 // Interactive drags are wrapped in begin/endGroup so a whole drag is one undo step.
 #pragma once
 
@@ -50,10 +51,18 @@ public:
     void endGroup();
     size_t undoDepth() const { return undo_.size(); }
     static constexpr size_t kMaxUndo = 500;
+    static constexpr size_t kUndoBudget = 1ull << 30;  // bytes of snapshots kept for undo + redo
+    size_t undoBytes() const { return undoBytes_; }
 
     // --- composition ------------------------------------------------------------------------
     bool setCompositionSettings(ObjectId comp, int width, int height, double fps, double duration, Value background,
                                 const std::string& name);
+    ObjectId addComposition(const std::string& name, int width, int height, double fps, double duration);
+    // Which composition the editor shows. Not an undoable edit (like scrolling), but saved.
+    bool setActiveComposition(ObjectId comp);
+    // A layer showing `source` in `comp`; refused when it would make a composition contain itself.
+    ObjectId addPrecompLayer(ObjectId comp, ObjectId source);
+    bool setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime);
 
     // --- assets & layers --------------------------------------------------------------------
     ObjectId addImageAsset(const std::string& path, const std::string& name, int width, int height);
@@ -91,7 +100,27 @@ public:
     // matte). matteLayer = 0 or mode None clears it. Refuses the layer itself.
     bool setLayerMatte(ObjectId comp, ObjectId layer, ObjectId matteLayer, MatteMode mode);
 
+    // --- text, paths ------------------------------------------------------------------------
+    bool setLayerText(ObjectId comp, ObjectId layer, const TextData& text);
+    enum class AnimatorPreset { Opacity, Position, Scale, Rotation };
+    // Adds a range-selector animator with one property set (e.g. Opacity 0%): animate its Range
+    // Start / End / Offset to sweep the effect across the text.
+    ObjectId addTextAnimator(ObjectId comp, ObjectId layer, AnimatorPreset preset);
+    bool removeTextAnimator(ObjectId comp, ObjectId layer, ObjectId animator);
+    bool setTextAnimatorOptions(ObjectId comp, ObjectId layer, ObjectId animator, bool enabled, SelectorShape shape,
+                                SelectorUnit unit);
+    // A new bezier shape layer from points drawn in composition space (pen tool). The layer is
+    // positioned at the path's centre; open paths get a stroke, closed ones a fill.
+    ObjectId addPathLayer(ObjectId comp, const std::vector<PathVertex>& compSpace, bool closed);
+    bool setLayerPath(ObjectId comp, ObjectId layer, const BezierPath& path);
+    ObjectId addPathMask(ObjectId comp, ObjectId layer, const BezierPath& layerSpace);
+    bool setMaskPath(ObjectId comp, ObjectId layer, ObjectId mask, const BezierPath& layerSpace);
+
     // --- properties & keyframes -------------------------------------------------------------
+    // Graph editor: sets one side of a keyframe to Bezier with this influence (0–1) and speed
+    // (slope of the normalised timing curve: 0 eases to a stop, 1 is linear speed).
+    bool setKeyframeEase(ObjectId comp, ObjectId layer, PropRef prop, int index, bool outgoing, double influence,
+                         double slope);
     // If the property is animated, writes (adds or replaces) a keyframe at `time`, otherwise sets
     // the static value — the same rule as a stopwatch-style motion tool.
     bool setPropertyValue(ObjectId comp, ObjectId layer, PropRef prop, double time, Value v);
@@ -132,7 +161,10 @@ private:
     struct Snapshot {
         Project project;
         std::string label;
+        size_t bytes = 0;
     };
+    void push(std::deque<Snapshot>& stack, Project p, std::string label);
+    void trimHistory();
     // Records an undo point (unless inside a group) and returns the mutable project.
     Project& edit(const std::string& label);
     void touched() { ++revision_; }
@@ -145,6 +177,10 @@ private:
     std::string groupLabel_;
     uint64_t revision_ = 1;
     uint64_t savedRevision_ = 1;
+    size_t undoBytes_ = 0;
 };
+
+// Approximate memory of one copy of `p` (shared baked tracks excluded: copies share them).
+size_t approxSnapshotBytes(const Project& p);
 
 }  // namespace mf

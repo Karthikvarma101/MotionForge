@@ -12,7 +12,7 @@ inline constexpr const char* kSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-// Must match ItemGPU in MetalRenderer.mm (7 x float4 = 112 bytes).
+// Must match ItemGPU in MetalRenderer.mm (8 x float4 = 128 bytes).
 struct Item {
     float4 m0;      // a b c d      (layer -> target pixel matrix, column-major 2x2)
     float4 m1;      // tx ty opacity kind
@@ -21,17 +21,20 @@ struct Item {
     float4 stroke;  // straight RGBA
     float4 p0;      // strokeWidth roundness points innerRatio
     float4 p1;      // shapeType blendMode maskStart maskCount
+    float4 p2;      // bezier paths: fillEdgeStart fillEdgeCount strokeEdgeStart strokeEdgeCount
 };
 
 // Must match MaskGPU in MetalRenderer.mm.
 struct Mask {
     float4 a;       // centre.xy halfSize.xy (layer space)
     float4 b;       // roundness feather expansion opacity
-    float4 c;       // shape(0 rect, 1 ellipse) mode(add, subtract, intersect, difference) inverted 0
-};
+    float4 c;       // shape(0 rect, 1 ellipse, 2 path) mode(add, subtract, intersect, difference) inverted 0
+};                  // path masks: a.xy = offset, a.z = edgeStart, a.w = edgeCount
 
 // Pipelines are specialised on this at build time, so layers without masks pay nothing for them.
 constant bool kHasMasks [[function_constant(0)]];
+// Bezier path shapes and path masks are specialised the same way.
+constant bool kHasPaths [[function_constant(1)]];
 
 struct FrameUniforms {
     float2 targetSize;
@@ -98,6 +101,37 @@ static float sdStar(float2 p, float R, float n, float ri) {
 
 // Analytic anti-aliasing: a one-pixel linear ramp across the edge. The Euclidean screen-space
 // gradient (not fwidth's L1 norm) keeps diagonal edges and corners as sharp as straight ones.
+// Bezier paths arrive flattened: edges are (x0, y0, x1, y1) in layer space.
+static float pathDistance(const device float4* e, uint start, uint count, float2 p) {
+    float d = 1e20f;
+    for (uint i = 0; i < count; ++i) {
+        const float2 a = e[start + i].xy, b = e[start + i].zw;
+        const float2 pa = p - a, ba = b - a;
+        const float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-12f), 0.0f, 1.0f);
+        d = min(d, length(pa - ba * h));
+    }
+    return d;
+}
+
+// Signed distance to a closed polygon, negative inside (non-zero winding rule).
+static float pathSignedDistance(const device float4* e, uint start, uint count, float2 p) {
+    float d = 1e20f;
+    int wind = 0;
+    for (uint i = 0; i < count; ++i) {
+        const float2 a = e[start + i].xy, b = e[start + i].zw;
+        const float2 pa = p - a, ba = b - a;
+        const float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-12f), 0.0f, 1.0f);
+        d = min(d, length(pa - ba * h));
+        const float side = ba.x * pa.y - ba.y * pa.x;
+        if (a.y <= p.y) {
+            if (b.y > p.y && side > 0.0f) ++wind;
+        } else if (b.y <= p.y && side < 0.0f) {
+            --wind;
+        }
+    }
+    return wind != 0 ? -d : d;
+}
+
 static float coverage(float d) {
     const float w = max(length(float2(dfdx(d), dfdy(d))), 1e-5f);
     return saturate(0.5f - d / w);
@@ -126,7 +160,8 @@ static float4 blendOver(float4 src, float4 dst, int mode) {
     return float4(co, sa + da * (1.0f - sa));
 }
 
-static float shapeDistance(const Item it, float2 local) {
+static float shapeDistance(const Item it, float2 local, const device float4* edges) {
+    if (kHasPaths && int(it.p1.x) == 4) return pathSignedDistance(edges, uint(it.p2.x), uint(it.p2.y), local);
     const float2 hs = (it.bounds.zw - it.bounds.xy) * 0.5f;
     const float2 p = local - (it.bounds.zw + it.bounds.xy) * 0.5f;
     const int type = int(it.p1.x);
@@ -143,7 +178,7 @@ static float shapeDistance(const Item it, float2 local) {
 
 // Combined coverage of a layer's masks at `local` (1 = keep). The first mask decides the
 // starting state: an Add mask starts from nothing, any other mode starts from the full layer.
-static float maskFactor(const device Mask* masks, const Item it, float2 local) {
+static float maskFactor(const device Mask* masks, const device float4* edges, const Item it, float2 local) {
     if (!kHasMasks) return 1.0f;
     const uint count = uint(it.p1.w);
     if (count == 0) return 1.0f;
@@ -153,7 +188,10 @@ static float maskFactor(const device Mask* masks, const Item it, float2 local) {
         const Mask k = masks[start + i];
         const float2 hs = max(k.a.zw, float2(1e-4f));
         const float2 p = local - k.a.xy;
-        float d = int(k.c.x) == 1 ? sdEllipse(p, hs) : sdRoundBox(p, hs, min(k.b.x, min(hs.x, hs.y)));
+        const int shape = int(k.c.x);
+        float d = (kHasPaths && shape == 2) ? pathSignedDistance(edges, uint(k.a.z), uint(k.a.w), local - k.a.xy)
+                  : shape == 1 ? sdEllipse(p, hs)
+                               : sdRoundBox(p, hs, min(k.b.x, min(hs.x, hs.y)));
         d -= k.b.z;                                                        // expansion
         float c = k.b.y > 0.0f ? 1.0f - smoothstep(-0.5f * k.b.y, 0.5f * k.b.y, d) : coverage(d);
         if (k.c.z > 0.5f) c = 1.0f - c;                                    // inverted
@@ -167,14 +205,30 @@ static float maskFactor(const device Mask* masks, const Item it, float2 local) {
     return m;
 }
 
-static float4 shapeColor(const Item it, float2 local) {
-    const float d = shapeDistance(it, local);
+static float4 shapeColor(const Item it, float2 local, const device float4* edges) {
+    const float d = shapeDistance(it, local, edges);
     const float sw = it.p0.x;
     const float fc = coverage(d);
-    const float sc = sw > 0.0f ? coverage(abs(d) - sw * 0.5f) : 0.0f;
+    float sc = 0.0f;
+    if (sw > 0.0f) {
+        // Paths stroke their own (possibly trimmed) edge list; primitives stroke the outline.
+        const bool path = kHasPaths && int(it.p1.x) == 4;
+        const float sd = path ? (it.p2.w > 0.0f ? pathDistance(edges, uint(it.p2.z), uint(it.p2.w), local) : 1e20f) : abs(d);
+        sc = coverage(sd - sw * 0.5f);
+    }
     const float4 f = float4(it.fill.rgb * it.fill.a, it.fill.a) * fc;
     const float4 s = float4(it.stroke.rgb * it.stroke.a, it.stroke.a) * sc;
     return (s + f * (1.0f - s.a)) * it.m1.z;
+}
+
+// Glyphs: 8-bit coverage from the glyph sheet (R fill, G stroke); the uv rectangle travels in
+// `stroke`, the stroke colour in p2 and "stroke over fill" in p0.z.
+static float4 glyphColor(const Item it, float2 local, texture2d<float> tex, sampler smp) {
+    const float2 t = saturate((local - it.bounds.xy) / max(it.bounds.zw - it.bounds.xy, float2(1e-6f)));
+    const float2 c = tex.sample(smp, mix(it.stroke.xy, it.stroke.zw, t)).rg;
+    const float4 f = float4(it.fill.rgb * it.fill.a, it.fill.a) * c.x;
+    const float4 s = float4(it.p2.rgb * it.p2.a, it.p2.a) * c.y;
+    return (it.p0.z > 0.5f ? s + f * (1.0f - s.a) : f + s * (1.0f - f.a)) * it.m1.z;
 }
 
 static float4 imageColor(const Item it, float2 local, texture2d<float> tex, sampler smp) {
@@ -187,31 +241,49 @@ static float4 imageColor(const Item it, float2 local, texture2d<float> tex, samp
 
 #if MF_FBFETCH
 fragment float4 shape_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
-                               const device Mask* masks [[buffer(2)]], float4 dst [[color(0)]]) {
+                               const device Mask* masks [[buffer(2)]], const device float4* edges [[buffer(3)]],
+                               float4 dst [[color(0)]]) {
     const Item it = items[in.item];
-    return blendOver(shapeColor(it, in.local) * maskFactor(masks, it, in.local), dst, int(it.p1.y));
+    return blendOver(shapeColor(it, in.local, edges) * maskFactor(masks, edges, it, in.local), dst, int(it.p1.y));
 }
 fragment float4 image_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
-                               const device Mask* masks [[buffer(2)]],
+                               const device Mask* masks [[buffer(2)]], const device float4* edges [[buffer(3)]],
                                texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],
                                float4 dst [[color(0)]]) {
     const Item it = items[in.item];
-    return blendOver(imageColor(it, in.local, tex, smp) * maskFactor(masks, it, in.local), dst, int(it.p1.y));
+    return blendOver(imageColor(it, in.local, tex, smp) * maskFactor(masks, edges, it, in.local), dst, int(it.p1.y));
+}
+fragment float4 glyph_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
+                               texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]],
+                               float4 dst [[color(0)]]) {
+    const Item it = items[in.item];
+    return blendOver(glyphColor(it, in.local, tex, smp), dst, int(it.p1.y));
 }
 #else
 // Fixed-function fallback (non-Apple GPUs): premultiplied "normal" only.
 fragment float4 shape_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
-                               const device Mask* masks [[buffer(2)]]) {
+                               const device Mask* masks [[buffer(2)]], const device float4* edges [[buffer(3)]]) {
     const Item it = items[in.item];
-    return shapeColor(it, in.local) * maskFactor(masks, it, in.local);
+    return shapeColor(it, in.local, edges) * maskFactor(masks, edges, it, in.local);
 }
 fragment float4 image_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
-                               const device Mask* masks [[buffer(2)]],
+                               const device Mask* masks [[buffer(2)]], const device float4* edges [[buffer(3)]],
                                texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {
     const Item it = items[in.item];
-    return imageColor(it, in.local, tex, smp) * maskFactor(masks, it, in.local);
+    return imageColor(it, in.local, tex, smp) * maskFactor(masks, edges, it, in.local);
+}
+fragment float4 glyph_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
+                               texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {
+    return glyphColor(items[in.item], in.local, tex, smp);
 }
 #endif
+
+// Masks for layers drawn as many pieces (text): multiplies what is already there by the mask,
+// through fixed-function blending (destination x source alpha).
+fragment float4 mask_apply_fragment(VOut in [[stage_in]], const device Item* items [[buffer(1)]],
+                                    const device Mask* masks [[buffer(2)]], const device float4* edges [[buffer(3)]]) {
+    return float4(maskFactor(masks, edges, items[in.item], in.local));
+}
 
 // ---- viewer presentation --------------------------------------------------------------------
 
@@ -338,9 +410,10 @@ kernel void fx_color(texture2d<float, access::read> src [[texture(0)]],
                      constant FxParams& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (outside(gid, dst)) return;
     const float4 s = src.read(gid);
+    const int op = int(p.d.x);
+    if (op == 3) { dst.write(s * p.b.x, gid); return; }  // opacity
     if (s.a <= 0.0f) { dst.write(float4(0.0f), gid); return; }
     float3 c = s.rgb / s.a;
-    const int op = int(p.d.x);
     if (op == 0) {
         const float k = p.a.y >= 0.0f ? 1.0f / (1.0f - 0.009f * p.a.y) : 1.0f + p.a.y / 100.0f;
         c = (c - 0.5f) * k + 0.5f + p.a.x / 200.0f;
@@ -368,6 +441,21 @@ kernel void fx_matte(texture2d<float, access::read> layer [[texture(0)]],
     float f = (mode <= 2) ? m.a : saturate(luma(m.rgb));   // luma of the matte over black
     if (mode == 2 || mode == 4) f = 1.0f - f;
     dst.write(layer.read(gid) * f, gid);
+}
+
+// Gradient Ramp: a.xy start, a.zw end (region pixels); b, c straight colours; d.x radial, d.y blend
+// with the original (0-1). Keeps the layer's alpha.
+kernel void fx_ramp(texture2d<float, access::read> src [[texture(0)]],
+                    texture2d<float, access::write> dst [[texture(1)]],
+                    constant FxParams& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (outside(gid, dst)) return;
+    const float4 o = src.read(gid);
+    const float2 q = float2(gid) + 0.5f, s = p.a.xy, e = p.a.zw, se = e - s;
+    const float len2 = max(dot(se, se), 1e-6f);
+    const float t = saturate(p.d.x > 0.5f ? length(q - s) / sqrt(len2) : dot(q - s, se) / len2);
+    const float3 rgb = mix(p.b.rgb, p.c.rgb, t);
+    const float4 ramp = float4(rgb * o.a, o.a);
+    dst.write(mix(ramp, o, p.d.y), gid);
 }
 
 // Frame-cache copy: RGBA16F -> RGBA8 (premultiplied). Half the memory, same 8-bit display output.

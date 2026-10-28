@@ -19,6 +19,13 @@ struct InspectorView: View {
                         if layer.kind == .shape {
                             ShapeSection(model: model, time: time, layer: layer)
                         }
+                        if layer.kind == .text {
+                            TextSection(model: model, time: time, layer: layer)
+                            AnimatorsSection(model: model, time: time, layer: layer)
+                        }
+                        if layer.kind == .precomp {
+                            PrecompSection(model: model, time: time, layer: layer)
+                        }
                         if layer.kind != .null {
                             MasksSection(model: model, time: time, layer: layer)
                             EffectsSection(model: model, time: time, layer: layer)
@@ -191,6 +198,12 @@ private struct ShapeSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionBox(title: "Shape") {
+                if layer.shape == .path {
+                    Label("Bezier path · \(layer.pathVertices.count) points\(layer.pathClosed ? "" : " · open")", systemImage: "scribble")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("Drag its points and handles in the viewer. Trim Start/End animate a line drawing itself.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                } else {
                 Picker("", selection: Binding(get: { layer.shape },
                                               set: { s in model.edit { _ = $0.setLayer(layer.layerID, shapeType: s) } })) {
                     Image(systemName: "rectangle").tag(MFShapeType.rectangle)
@@ -200,6 +213,7 @@ private struct ShapeSection: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                }
                 HStack(spacing: 14) {
                     Toggle("Fill", isOn: Binding(get: { layer.fillEnabled },
                                                  set: { v in model.edit { _ = $0.setLayer(layer.layerID, fillEnabled: v, strokeEnabled: layer.strokeEnabled) } }))
@@ -242,6 +256,184 @@ struct PropertyRows: View {
                 PropertyEditorRow(model: model, time: time, layer: layer, spec: spec)
             }
         }
+    }
+}
+
+// MARK: - Text
+
+private struct TextSection: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var time: TimeModel
+    let layer: MFLayerInfo
+    @State private var text = ""
+
+    static let fonts = ["Helvetica-Bold", "HelveticaNeue-Medium", "AvenirNext-Heavy", "AvenirNext-Regular", "Futura-Bold",
+                        "GillSans-Bold", "DINAlternate-Bold", "Georgia-Bold", "Didot-Bold", "Menlo-Bold",
+                        "AmericanTypewriter-Bold", "MarkerFelt-Wide", "Copperplate-Bold", "Baskerville-SemiBold"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionBox(title: "Text") {
+                TextEditor(text: $text)
+                    .font(.system(size: 12))
+                    .frame(minHeight: 48, maxHeight: 90)
+                    .scrollContentBackground(.hidden)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.25)))
+                    .onAppear { text = layer.text }
+                    .onChange(of: layer.layerID) { _, _ in text = layer.text }
+                    .onChange(of: text) { _, new in
+                        guard new != layer.text else { return }
+                        model.coalescedEdit("Edit Text") { _ = $0.setLayer(layer.layerID, text: new, font: layer.fontName, align: layer.textAlign) }
+                    }
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(Self.fonts, id: \.self) { f in
+                            Button { setFont(f) } label: { Text(f) }
+                        }
+                    } label: {
+                        Text(layer.fontName).lineLimit(1)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .help("Font (PostScript name)")
+                    Picker("", selection: Binding(get: { layer.textAlign },
+                                                  set: { a in model.edit { _ = $0.setLayer(layer.layerID, text: layer.text, font: layer.fontName, align: a) } })) {
+                        Image(systemName: "text.alignleft").tag(MFTextAlign.left)
+                        Image(systemName: "text.aligncenter").tag(MFTextAlign.center)
+                        Image(systemName: "text.alignright").tag(MFTextAlign.right)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+                .font(.system(size: 11))
+            }
+            PropertySection(title: "Character", model: model, time: time, layer: layer,
+                            specs: [MFProp.fontSize, .tracking, .lineHeight, .fillColor].map(ParamSpec.init))
+            HStack(spacing: 12) {
+                Toggle("Fill", isOn: Binding(get: { layer.fillEnabled },
+                                             set: { v in model.edit { _ = $0.setLayer(layer.layerID, fillEnabled: v, strokeEnabled: layer.strokeEnabled) } }))
+                Toggle("Stroke", isOn: Binding(get: { layer.strokeEnabled },
+                                               set: { v in model.edit { _ = $0.setLayer(layer.layerID, fillEnabled: layer.fillEnabled, strokeEnabled: v) } }))
+            }
+            .toggleStyle(.checkbox)
+            .font(.system(size: 11))
+            if layer.strokeEnabled {
+                PropertySection(title: "Stroke", model: model, time: time, layer: layer,
+                                specs: [MFProp.strokeColor, .strokeWidth].map(ParamSpec.init))
+            }
+        }
+    }
+
+    private func setFont(_ f: String) {
+        model.edit { _ = $0.setLayer(layer.layerID, text: layer.text, font: f, align: layer.textAlign) }
+    }
+}
+
+private struct PrecompSection: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var time: TimeModel
+    let layer: MFLayerInfo
+
+    var body: some View {
+        let source = model.compositions.first { $0.compID == layer.sourceCompID }
+        VStack(alignment: .leading, spacing: 10) {
+            SectionBox(title: "Precomp") {
+                HStack {
+                    Image(systemName: "square.stack.3d.up").foregroundStyle(Theme.accent)
+                    Text(source?.name ?? "Missing composition").lineLimit(1)
+                    Spacer()
+                    Button("Open") { model.openComposition(layer.sourceCompID) }
+                        .disabled(source == nil)
+                        .help("Edit the source composition (double-click the layer in the timeline does the same)")
+                }
+                .font(.system(size: 11))
+                Toggle("Collapse transformations", isOn: Binding(get: { layer.collapse },
+                                                                 set: { v in model.edit { _ = $0.setPrecomp(layer.layerID, collapse: v, timeRemap: layer.timeRemapEnabled, startTime: layer.startTime) } }))
+                    .help("Draw the source's layers straight into this composition (vector-sharp, not clipped to its frame)")
+                Toggle("Time remapping", isOn: Binding(get: { layer.timeRemapEnabled },
+                                                       set: { v in model.edit { _ = $0.setPrecomp(layer.layerID, collapse: layer.collapse, timeRemap: v, startTime: layer.startTime) } }))
+                HStack {
+                    Text("Starts at").foregroundStyle(.secondary)
+                    ScrubField(value: layer.startTime, step: 1 / max(model.comp.fps, 1), precision: 2, suffix: " s",
+                               onBegin: { model.closeCoalescedEdit() },
+                               onChange: { v in model.edit { _ = $0.setPrecomp(layer.layerID, collapse: layer.collapse, timeRemap: layer.timeRemapEnabled, startTime: v) } },
+                               onEnd: {})
+                }
+            }
+            .toggleStyle(.checkbox)
+            .font(.system(size: 11))
+            if layer.timeRemapEnabled {
+                PropertySection(title: "Time", model: model, time: time, layer: layer, specs: [ParamSpec(MFProp.timeRemap)])
+            }
+        }
+    }
+}
+
+private struct AnimatorsSection: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var time: TimeModel
+    let layer: MFLayerInfo
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Text Animators").font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Menu {
+                    Button("Opacity") { add(.opacity) }
+                    Button("Position") { add(.position) }
+                    Button("Scale") { add(.scale) }
+                    Button("Rotation") { add(.rotation) }
+                } label: { Image(systemName: "plus") }
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .help("Add an animator: animate Range Start / End / Offset to sweep it across the text")
+            }
+            if layer.animators.isEmpty {
+                Text("Animate characters, words or lines: add an animator, then keyframe its Range Start, End or Offset. The Text presets in the Effects tab are ready-made examples.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(layer.animators, id: \.animatorID) { a in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Toggle("", isOn: Binding(get: { a.enabled }, set: { v in set(a, enabled: v) }))
+                            .labelsHidden().toggleStyle(.checkbox)
+                        Text(a.name).font(.system(size: 11, weight: .medium)).lineLimit(1)
+                        Spacer()
+                        Button { model.edit { _ = $0.removeTextAnimator(a.animatorID, layer: layer.layerID) } } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless).help("Remove animator")
+                    }
+                    HStack(spacing: 6) {
+                        Picker("", selection: Binding(get: { a.shape }, set: { v in set(a, shape: v) })) {
+                            Text("Square").tag(MFSelectorShape.square)
+                            Text("Ramp Up").tag(MFSelectorShape.rampUp)
+                            Text("Ramp Down").tag(MFSelectorShape.rampDown)
+                            Text("Triangle").tag(MFSelectorShape.triangle)
+                            Text("Round").tag(MFSelectorShape.round)
+                            Text("Smooth").tag(MFSelectorShape.smooth)
+                        }
+                        .labelsHidden()
+                        Picker("", selection: Binding(get: { a.unit }, set: { v in set(a, unit: v) })) {
+                            Text("Characters").tag(MFSelectorUnit.characters)
+                            Text("Words").tag(MFSelectorUnit.words)
+                            Text("Lines").tag(MFSelectorUnit.lines)
+                        }
+                        .labelsHidden()
+                    }
+                    .font(.system(size: 11))
+                    PropertyRows(model: model, time: time, layer: layer, specs: a.params.map(ParamSpec.init))
+                        .padding(.leading, 6)
+                        .opacity(a.enabled ? 1 : 0.5)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.035)))
+            }
+        }
+    }
+
+    private func add(_ p: MFAnimatorPreset) { model.edit { _ = $0.addTextAnimator(p, layer: layer.layerID) } }
+    private func set(_ a: MFAnimatorInfo, enabled: Bool? = nil, shape: MFSelectorShape? = nil, unit: MFSelectorUnit? = nil) {
+        model.edit { _ = $0.setTextAnimator(a.animatorID, layer: layer.layerID, enabled: enabled ?? a.enabled,
+                                             shape: shape ?? a.shape, unit: unit ?? a.unit) }
     }
 }
 
@@ -385,10 +577,11 @@ struct PropertyEditorRow: View {
         let t = time.time
         let ref = spec.ref
         let animated = layer.isAnimatedRef(ref)
+        let baked = layer.isBakedRef(ref)
         let keys = layer.keyframes(for: ref)
         let onKey = keys.contains { abs($0.time - t) < 0.5 / model.comp.fps }
         HStack(spacing: 6) {
-            StopwatchButton(animated: animated) {
+            StopwatchButton(animated: animated, baked: baked) {
                 model.closeCoalescedEdit()
                 model.edit { _ = $0.set(animated: !animated, ref: ref, layer: layer.layerID, time: t) }
             }

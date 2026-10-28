@@ -5,7 +5,7 @@
 //
 // Variants
 //   phase1   the Phase 1 fragment shader (benchmarks/ab/phase1_shaders.hpp)
-//   current  today's shader, mask-free specialisation (what plain layers use)
+//   current  today's shader (128-byte instances since Phase 4), mask-free specialisation
 //   masked   today's shader, mask-enabled specialisation with zero masks (what plain layers would
 //            cost if the pipelines were not specialised)
 //
@@ -29,10 +29,15 @@ using namespace mf;
 
 namespace {
 
-struct ItemGPU {
+struct ItemGPU {  // Phase 1 instance layout (112 bytes)
     float m0[4], m1[4], bounds[4], fill[4], stroke[4], p0[4], p1[4];
 };
 static_assert(sizeof(ItemGPU) == 112);
+struct ItemGPU4 {  // since Phase 4: + bezier-path edge ranges (128 bytes)
+    ItemGPU base;
+    float p2[4];
+};
+static_assert(sizeof(ItemGPU4) == 128);
 
 void packItem(const DrawItem& d, ItemGPU& g) {
     const Affine& m = d.toTarget;
@@ -87,8 +92,9 @@ id<MTLRenderPipelineState> makePSO(id<MTLDevice> dev, const char* source, int ma
         d.fragmentFunction = [lib newFunctionWithName:@"shape_fragment"];
     } else {
         MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
-        bool m = masks != 0;
+        bool m = masks != 0, paths = false;
         [fc setConstantValue:&m type:MTLDataTypeBool atIndex:0];
+        [fc setConstantValue:&paths type:MTLDataTypeBool atIndex:1];
         d.vertexFunction = [lib newFunctionWithName:@"item_vertex" constantValues:fc error:&err];
         d.fragmentFunction = [lib newFunctionWithName:@"shape_fragment" constantValues:fc error:&err];
     }
@@ -124,12 +130,13 @@ int main(int argc, const char* argv[]) {
         struct Variant {
             const char* name;
             id<MTLRenderPipelineState> pso;
+            bool wide;  // 128-byte instances
             std::vector<double> gpu;
         };
         std::vector<Variant> variants = {
-            {"phase1", makePSO(dev, phase1::kSource, -1), {}},
-            {"current", makePSO(dev, shaders::kSource, 0), {}},
-            {"masked", makePSO(dev, shaders::kSource, 1), {}},
+            {"phase1", makePSO(dev, phase1::kSource, -1), false, {}},
+            {"current", makePSO(dev, shaders::kSource, 0), true, {}},
+            {"masked", makePSO(dev, shaders::kSource, 1), true, {}},
         };
 
         const Project p = makeScene(1920, 1080, layers);
@@ -142,6 +149,8 @@ int main(int argc, const char* argv[]) {
         td.storageMode = MTLStorageModePrivate;
         id<MTLTexture> target = [dev newTextureWithDescriptor:td];
         id<MTLBuffer> buf = [dev newBufferWithLength:size_t(layers) * sizeof(ItemGPU) + 4096 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wide = [dev newBufferWithLength:size_t(layers) * sizeof(ItemGPU4) + 4096 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> edges = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
         id<MTLBuffer> masks = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
 
         auto renderWith = [&](Variant& v, size_t n, bool record) {
@@ -155,9 +164,10 @@ int main(int argc, const char* argv[]) {
             const float size[4] = {1920, 1080, 0, 0};
             [enc setRenderPipelineState:v.pso];
             [enc setVertexBytes:size length:sizeof size atIndex:0];
-            [enc setVertexBuffer:buf offset:0 atIndex:1];
-            [enc setFragmentBuffer:buf offset:0 atIndex:1];
+            [enc setVertexBuffer:(v.wide ? wide : buf) offset:0 atIndex:1];
+            [enc setFragmentBuffer:(v.wide ? wide : buf) offset:0 atIndex:1];
             [enc setFragmentBuffer:masks offset:0 atIndex:2];
+            [enc setFragmentBuffer:edges offset:0 atIndex:3];
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:n baseInstance:0];
             [enc endEncoding];
             [cb commit];
@@ -168,7 +178,12 @@ int main(int argc, const char* argv[]) {
         for (int f = -10; f < frames; ++f) {  // first 10 frames warm up, not recorded
             const FrameDesc fd = evaluateFrame(p, c, double(std::max(f, 0) % int(c.frameCount())) / c.fps);
             auto* g = static_cast<ItemGPU*>(buf.contents);
-            for (size_t i = 0; i < fd.items.size(); ++i) packItem(fd.items[i], g[i]);
+            auto* g4 = static_cast<ItemGPU4*>(wide.contents);
+            for (size_t i = 0; i < fd.items.size(); ++i) {
+                packItem(fd.items[i], g[i]);
+                g4[i].base = g[i];
+                g4[i].p2[0] = g4[i].p2[1] = g4[i].p2[2] = g4[i].p2[3] = 0;
+            }
             // Rotate the order every frame so no variant always runs first (or last).
             for (size_t k = 0; k < variants.size(); ++k)
                 renderWith(variants[(size_t(f + 10) + k) % variants.size()], fd.items.size(), f >= 0);
