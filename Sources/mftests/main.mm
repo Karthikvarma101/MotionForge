@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,9 @@
 #include "mf/Json.hpp"
 #include "mf/LruCache.hpp"
 #include "mf/ProjectIO.hpp"
+#include "mf/Bundle.hpp"
+#include "mf/Commands.hpp"
+#include "mf/Sync.hpp"
 
 using namespace mf;
 namespace fs = std::filesystem;
@@ -2003,6 +2007,884 @@ TEST(audio_import_mix_and_export_bridge) {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+
+// ---- collaboration (mf/Sync.hpp) --------------------------------------------------------------
+
+// Two Macs on one shared project: A shares, B joins, then each edits a Document of its own.
+struct SyncPair {
+    SyncEngine a{"mac-a"}, b{"mac-b"};
+    Document da, db;
+    explicit SyncPair(Project p) : da(p) {
+        da.reserveIds(syncIdBase(1));
+        std::vector<SyncPiece> seed = a.start(da.project());
+        db.applyExternal(b.join(seed, da.project()));
+        db.reserveIds(syncIdBase(2));
+    }
+    // A's and B's local edits so far, exchanged the way the live channel does.
+    void exchange() {
+        auto fromA = a.collectLocal(da.project(), true);
+        auto fromB = b.collectLocal(db.project(), true);
+        Project pa = da.project(), pb = db.project();
+        if (b.applyRemote(fromA, pb)) db.applyExternal(pb);
+        if (a.applyRemote(fromB, pa)) da.applyExternal(pa);
+    }
+    // Same content; nextId differs on purpose (each Mac has its own id range).
+    bool same() const {
+        Project x = da.project(), y = db.project();
+        x.nextId = y.nextId = 0;
+        return serializeProject(x, "") == serializeProject(y, "");
+    }
+};
+
+static Project syncSample() {
+    Project p = makeDefaultProject(1280, 720, 30, 5);
+    Document d(p);
+    const ObjectId c = d.project().activeComposition;
+    d.addLayer(c, LayerKind::Shape, ShapeType::Rectangle);
+    d.addLayer(c, LayerKind::Shape, ShapeType::Ellipse);
+    d.addLayer(c, LayerKind::Text);
+    return d.project();
+}
+
+TEST(sync_join_rebuilds_the_same_project) {
+    SyncPair s(syncSample());
+    CHECK(s.same());
+    CHECK(s.a.pieceCount() > 3 * kPropCount);
+    // Nothing changed, so nothing to send — also after a round trip through the wire format with the
+    // keys reordered, the way the server's jsonb returns them.
+    CHECK(s.b.collectLocal(s.db.project(), true).empty());
+    std::vector<SyncPiece> seed = SyncEngine("x").start(s.da.project()), shuffled;
+    std::string err;
+    std::string wire = piecesToJson(seed);
+    Json arr;
+    CHECK(Json::parse(wire, arr, err));
+    Json reordered = Json::array();
+    for (const Json& p : arr.items()) {
+        Json q = Json::object();
+        for (auto it = p.members().rbegin(); it != p.members().rend(); ++it) {
+            Json v = it->second;
+            if (v.isObject()) {  // reverse the value's own keys too
+                Json r = Json::object();
+                for (auto vt = v.members().rbegin(); vt != v.members().rend(); ++vt) r.set(vt->first, vt->second);
+                v = r;
+            }
+            q.set(it->first, v);
+        }
+        reordered.push(std::move(q));
+    }
+    CHECK(piecesFromJson(reordered.dump(0), shuffled, err));
+    CHECK(shuffled.size() == seed.size());
+    SyncEngine c("mac-c");
+    Document dc(c.join(shuffled, s.da.project()));
+    CHECK(c.collectLocal(dc.project(), true).empty());
+    Project x = dc.project(), y = s.da.project();
+    x.nextId = y.nextId = 0;
+    CHECK(serializeProject(x, "") == serializeProject(y, ""));
+}
+
+TEST(sync_edits_to_different_properties_merge) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[0].id;
+    s.da.setPropertyValue(c, layer, PropId::Position, 0, Value{100, 200, 0, 0});
+    s.db.setPropertyValue(c, layer, PropId::Rotation, 0, Value{45, 0, 0, 0});
+    s.db.setLayerName(c, layer, "Renamed on B");
+    s.exchange();
+    CHECK(s.same());
+    const Layer& la = *s.da.project().activeComp()->findLayer(layer);
+    CHECK_NEAR(la.prop(PropId::Position).value[0], 100, 1e-9);
+    CHECK_NEAR(la.prop(PropId::Rotation).value[0], 45, 1e-9);
+    CHECK(la.name == "Renamed on B");
+}
+
+TEST(sync_same_property_last_writer_wins_everywhere) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[1].id;
+    s.da.setPropertyValue(c, layer, PropId::Opacity, 0, Value{10, 0, 0, 0});
+    s.db.setPropertyValue(c, layer, PropId::Opacity, 0, Value{90, 0, 0, 0});
+    s.exchange();
+    CHECK(s.same());
+    const double o = s.da.project().activeComp()->findLayer(layer)->prop(PropId::Opacity).value[0];
+    CHECK(o == 10 || o == 90);
+}
+
+TEST(sync_concurrent_inserts_and_moves_keep_one_order) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId x = s.da.addLayer(c, LayerKind::Null);
+    const ObjectId y = s.db.addLayer(c, LayerKind::Shape, ShapeType::Star);
+    CHECK(x != y);
+    CHECK(x >= syncIdBase(1) && y >= syncIdBase(2));
+    const ObjectId bottom = s.db.project().activeComp()->layers.back().id;
+    s.db.moveLayer(c, bottom, 0);
+    s.exchange();
+    CHECK(s.same());
+    const Composition& ca = *s.da.project().activeComp();
+    CHECK(ca.layers.size() == 5);
+    CHECK(ca.findLayer(x) && ca.findLayer(y));
+    CHECK(ca.layers[0].id == bottom || ca.layers[0].id == x || ca.layers[0].id == y);
+    // Many moves in a row stay consistent.
+    for (int i = 0; i < 40; ++i) {
+        s.da.moveLayer(c, s.da.project().activeComp()->layers.back().id, 1);
+        s.exchange();
+    }
+    CHECK(s.same());
+}
+
+TEST(sync_delete_while_someone_edits) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[2].id;
+    s.da.removeLayer(c, layer);
+    s.db.setPropertyValue(c, layer, PropId::Position, 0, Value{1, 2, 0, 0});
+    s.exchange();
+    CHECK(s.same());
+    CHECK(!s.da.project().activeComp()->findLayer(layer));
+}
+
+TEST(sync_undo_is_per_person) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[0].id;
+    s.da.setPropertyValue(c, layer, PropId::Position, 0, Value{300, 300, 0, 0});
+    s.db.setPropertyValue(c, layer, PropId::Rotation, 0, Value{30, 0, 0, 0});
+    s.exchange();
+    CHECK(s.a.canUndo());
+    // A undoes: only A's move goes back; B's rotation stays.
+    Project pa = s.da.project();
+    auto undoPieces = s.a.undo(pa);
+    s.da.applyExternal(pa);
+    CHECK(!undoPieces.empty());
+    Project pb = s.db.project();
+    s.b.applyRemote(undoPieces, pb);
+    s.db.applyExternal(pb);
+    CHECK(s.same());
+    const Layer& l = *s.db.project().activeComp()->findLayer(layer);
+    CHECK_NEAR(l.prop(PropId::Position).value[0], 640, 1e-9);  // comp centre: where it started
+    CHECK_NEAR(l.prop(PropId::Rotation).value[0], 30, 1e-9);
+    // Redo brings A's move back.
+    CHECK(s.a.canRedo());
+    pa = s.da.project();
+    auto redoPieces = s.a.redo(pa);
+    s.da.applyExternal(pa);
+    pb = s.db.project();
+    s.b.applyRemote(redoPieces, pb);
+    s.db.applyExternal(pb);
+    CHECK(s.same());
+    CHECK_NEAR(s.db.project().activeComp()->findLayer(layer)->prop(PropId::Position).value[0], 300, 1e-9);
+}
+
+TEST(sync_undo_leaves_newer_edits_by_others) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[0].id;
+    s.da.setPropertyValue(c, layer, PropId::Opacity, 0, Value{50, 0, 0, 0});
+    s.exchange();
+    s.db.setPropertyValue(c, layer, PropId::Opacity, 0, Value{20, 0, 0, 0});
+    s.exchange();
+    Project pa = s.da.project();
+    s.a.undo(pa);  // A's 50 was overwritten by B's 20: nothing to revert
+    s.da.applyExternal(pa);
+    CHECK_NEAR(s.da.project().activeComp()->findLayer(layer)->prop(PropId::Opacity).value[0], 20, 1e-9);
+}
+
+TEST(sync_undo_of_an_added_layer_removes_it_everywhere) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId x = s.da.addLayer(c, LayerKind::Text);
+    s.exchange();
+    CHECK(s.db.project().activeComp()->findLayer(x));
+    Project pa = s.da.project();
+    auto pieces = s.a.undo(pa);
+    s.da.applyExternal(pa);
+    Project pb = s.db.project();
+    s.b.applyRemote(pieces, pb);
+    s.db.applyExternal(pb);
+    CHECK(!s.da.project().activeComp()->findLayer(x));
+    CHECK(!s.db.project().activeComp()->findLayer(x));
+    CHECK(s.same());
+}
+
+TEST(sync_drag_is_one_undo_step) {
+    SyncPair s(syncSample());
+    const ObjectId c = s.da.project().activeComposition;
+    const ObjectId layer = s.da.project().activeComp()->layers[0].id;
+    // A drag sends live updates (newStep only at the start) but undoes in one go.
+    for (int i = 0; i < 10; ++i) {
+        s.da.setPropertyValue(c, layer, PropId::Position, 0, Value{double(i * 10), 0, 0, 0});
+        s.a.collectLocal(s.da.project(), i == 0);
+    }
+    Project pa = s.da.project();
+    s.a.undo(pa);
+    CHECK_NEAR(pa.activeComp()->findLayer(layer)->prop(PropId::Position).value[0], 640, 1e-9);
+    CHECK(!s.a.canUndo());
+}
+
+TEST(sync_media_resolves_when_downloaded) {
+    const fs::path dir = fs::path(NSTemporaryDirectory().fileSystemRepresentation) / ("mftests-" + std::to_string(getpid())) / "sync-media";
+    fs::create_directories(dir);
+    Project p = makeDefaultProject();
+    Asset a;
+    a.id = 900;
+    a.name = "logo.png";
+    a.path = (dir / "original.png").string();
+    a.width = 64;
+    a.height = 32;
+    p.assets.push_back(a);
+    SyncEngine sa("a"), sb("b");
+    sa.mediaNameForAsset = [](const Asset&) { return std::string("abc123.png"); };
+    const fs::path cache = dir / "cache";
+    sb.pathForMedia = [&](const std::string& m) { return (cache / m).string(); };
+    Project pb = sb.join(sa.start(p), p);
+    CHECK(pb.findAsset(900) && pb.findAsset(900)->missing);
+    CHECK(!sb.refreshMedia(pb));
+    fs::create_directories(cache);
+    { FILE* f = std::fopen((cache / "abc123.png").string().c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
+    CHECK(sb.refreshMedia(pb));
+    CHECK(!pb.findAsset(900)->missing);
+    CHECK(pb.findAsset(900)->path == (cache / "abc123.png").string());
+    CHECK(pb.findAsset(900)->width == 64);
+}
+
+// ---- Claude tools (mf/Commands.hpp) ----------------------------------------------------------
+
+static Json toolArgs(const char* text) {
+    Json j;
+    std::string err;
+    Json::parse(text, j, err);
+    return j;
+}
+
+TEST(claude_tool_catalog_is_valid) {
+    const auto& tools = toolCatalog();
+    CHECK(tools.size() >= 25);
+    std::set<std::string> names;
+    for (const ToolDef& t : tools) {
+        CHECK(!t.name.empty() && !t.description.empty());
+        CHECK(t.inputSchema.get("type").string() == "object");
+        CHECK(names.insert(t.name).second);  // unique
+    }
+    CHECK(findTool("render_frame") && findTool("render_frame")->host);
+    CHECK(findTool("add_layer") && !findTool("add_layer")->host);
+    Document d;
+    CHECK(!runTool(d, "render_frame", Json::object()).handled);
+    CHECK(!runTool(d, "no_such_tool", Json::object()).ok);
+}
+
+TEST(claude_tools_build_an_animation) {
+    Document d;
+    ToolResult r = runTool(d, "create_composition", toolArgs(R"({"name": "Promo", "width": 1080, "height": 1920, "fps": 30, "duration": 6, "background": "#101820"})"));
+    CHECK(r.ok);
+    const ObjectId comp = ObjectId(r.value.get("composition").number());
+    CHECK(d.project().activeComposition == comp);
+    CHECK_NEAR(d.project().activeComp()->background[0], 0x10 / 255.0, 1e-9);
+
+    r = runTool(d, "add_layer", toolArgs(R"({"kind": "text", "text": "Hello\nWorld", "font": "Futura-Bold", "fontSize": 140, "fillColor": [1, 0.8, 0.2, 1]})"));
+    CHECK(r.ok);
+    const ObjectId title = ObjectId(r.value.get("layer").number());
+    const Layer* l = d.project().activeComp()->findLayer(title);
+    CHECK(l && l->text.string == "Hello\nWorld" && l->text.font == "Futura-Bold");
+    CHECK(l && l->name == "Hello");
+    CHECK_NEAR(l->prop(PropId::FontSize).value[0], 140, 1e-9);
+
+    // By name, with easing; one undo step per call.
+    const size_t depth = d.undoDepth();
+    r = runTool(d, "set_keyframes", toolArgs(R"({"layer": "hello", "property": "position", "keyframes": [
+        {"time": 0, "value": [-300, 960], "interpolation": "ease_out"}, {"time": 1, "value": [540, 960], "interpolation": "ease"}]})"));
+    CHECK(r.ok);
+    CHECK(d.undoDepth() == depth + 1);
+    l = d.project().activeComp()->findLayer(title);
+    CHECK(l->prop(PropId::Position).keyframes.size() == 2);
+    CHECK(l->prop(PropId::Position).keyframes[0].outInterp == Interp::Bezier);
+    CHECK_NEAR(evaluateProperty(l->prop(PropId::Position), PropId::Position, 1.0)[0], 540, 1e-6);
+
+    r = runTool(d, "add_effect", toolArgs(R"({"layer": "Hello", "effect": "Drop Shadow"})"));
+    CHECK(r.ok);
+    const ObjectId fx = ObjectId(r.value.get("effect").number());
+    Json setFx = Json::object();
+    setFx.set("layer", Json(title));
+    setFx.set("effect", Json(fx));
+    setFx.set("property", Json("distance"));
+    setFx.set("value", Json(40));
+    CHECK(runTool(d, "set_property", setFx).ok);
+
+    r = runTool(d, "get_layer", toolArgs(R"({"layer": "Hello", "time": 0.5})"));
+    CHECK(r.ok);
+    CHECK(r.value.get("effects").items().size() == 1);
+    CHECK(r.value.get("kind").string() == "text");
+
+    CHECK(runTool(d, "undo", Json::object()).ok);  // removes the shadow distance change
+    CHECK(!runTool(d, "set_property", toolArgs(R"({"layer": "Nope", "property": "opacity", "value": 50})")).ok);
+    CHECK(!runTool(d, "set_property", toolArgs(R"({"layer": "Hello", "property": "wobble", "value": 50})")).ok);
+    CHECK(!runTool(d, "add_layer", toolArgs(R"({"kind": "image"})")).ok);
+    r = runTool(d, "get_composition", Json::object());
+    CHECK(r.ok && r.value.get("layers").items().size() == 1);
+}
+
+TEST(claude_tool_values) {
+    Value v;
+    CHECK(valueFromArgument(toolArgs(R"("#FF8000")"), 4, true, v) && std::abs(v[1] - 128 / 255.0) < 1e-9 && v[3] == 1);
+    CHECK(valueFromArgument(toolArgs("[255, 0, 0]"), 4, true, v) && v[0] == 1 && v[3] == 1);
+    CHECK(valueFromArgument(toolArgs("50"), 2, false, v) && v[0] == 50 && v[1] == 50);
+    CHECK(valueFromArgument(toolArgs(R"({"x": 3, "y": 4})"), 2, false, v) && v[1] == 4);
+    CHECK(!valueFromArgument(toolArgs(R"("red")"), 4, true, v));
+    CHECK(!valueFromArgument(toolArgs("[]"), 2, false, v));
+}
+
+// ---- project bundles (mf/Bundle.hpp) ---------------------------------------------------------
+
+TEST(bundle_round_trip_with_media) {
+    const fs::path dir = fs::path(NSTemporaryDirectory().fileSystemRepresentation) / ("mftests-" + std::to_string(getpid())) / "bundle";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "src" / "a");
+    fs::create_directories(dir / "src" / "b");
+    auto write = [](const fs::path& p, const char* s) { FILE* f = std::fopen(p.string().c_str(), "wb"); std::fputs(s, f); std::fclose(f); };
+    write(dir / "src" / "a" / "logo.png", "png-a");
+    write(dir / "src" / "b" / "logo.png", "png-b");  // same name, different file
+    Project p = makeDefaultProject();
+    auto asset = [&](ObjectId id, fs::path path) {
+        Asset a;
+        a.id = id;
+        a.name = path.filename().string();
+        a.path = path.string();
+        a.width = 10;
+        a.height = 10;
+        p.assets.push_back(a);
+    };
+    asset(50, dir / "src" / "a" / "logo.png");
+    asset(51, dir / "src" / "b" / "logo.png");
+    asset(52, dir / "src" / "a" / "logo.png");  // shares a file
+    asset(53, dir / "src" / "gone.wav");        // missing
+    p.assets.back().kind = AssetKind::Audio;
+
+    BundleReport report;
+    std::string err;
+    CHECK(writeProjectBundle(p, (dir / "out").string(), "MotionForge test", report, err));
+    CHECK(report.mediaFiles == 2);
+    CHECK(report.missing.size() == 1);
+    CHECK(fs::exists(dir / "out" / "Media" / "logo.png") && fs::exists(dir / "out" / "Media" / "logo 2.png"));
+    CHECK(!writeProjectBundle(p, (dir / "out").string(), "x", report, err));  // not empty any more
+
+    // Move it somewhere else (another Mac) and open it there.
+    fs::rename(dir / "out", dir / "moved");
+    fs::remove_all(dir / "src");
+    std::string projectPath;
+    CHECK(checkProjectBundle((dir / "moved").string(), projectPath, err));
+    Project q;
+    CHECK(loadProjectFile(projectPath, q, err));
+    CHECK(q.assets.size() == 4);
+    CHECK(!q.findAsset(50)->missing && !q.findAsset(51)->missing);
+    CHECK(q.findAsset(50)->path == q.findAsset(52)->path);
+    CHECK(q.findAsset(50)->path != q.findAsset(51)->path);
+    CHECK(q.findAsset(53)->missing);
+    std::string text;
+    {
+        FILE* f = std::fopen(projectPath.c_str(), "rb");
+        char buf[65536];
+        size_t n = std::fread(buf, 1, sizeof buf, f);
+        text.assign(buf, n);
+        std::fclose(f);
+    }
+    CHECK(text.find(dir.string()) == std::string::npos);  // no paths from the old Mac
+
+    // Wrapped in one folder (as zips made with --keepParent unpack) still opens.
+    fs::create_directories(dir / "wrapped");
+    fs::rename(dir / "moved", dir / "wrapped" / "Project");
+    CHECK(checkProjectBundle((dir / "wrapped").string(), projectPath, err));
+    // A link inside is refused.
+    fs::create_symlink("/etc/hosts", dir / "wrapped" / "Project" / "Media" / "hosts");
+    CHECK(!checkProjectBundle((dir / "wrapped").string(), projectPath, err));
+    CHECK(!checkProjectBundle((dir / "nothing-here").string(), projectPath, err));
+
+    CHECK(isSafeBundleEntry("Project/Media/logo.png"));
+    CHECK(isSafeBundleEntry("project.mfproj"));
+    CHECK(!isSafeBundleEntry("../evil"));
+    CHECK(!isSafeBundleEntry("Project/../../evil"));
+    CHECK(!isSafeBundleEntry("/etc/passwd"));
+    CHECK(!isSafeBundleEntry(""));
+}
+
+// ---- After Effects-style commands: work area, split, pre-compose ----------------------------
+
+TEST(work_area_saves_and_trims_the_comp) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId a = d.addLayer(comp, LayerKind::Shape);
+    d.setLayerTiming(comp, a, 0.5, 3.5);
+    d.setPropertyAnimated(comp, a, PropId::Position, true, 1.0);
+    d.setPropertyValue(comp, a, PropId::Position, 1.0, {10, 20, 0, 0});
+    d.setPropertyValue(comp, a, PropId::Position, 3.0, {90, 20, 0, 0});
+    CHECK(!d.project().activeComp()->hasWorkArea());
+
+    CHECK(d.setWorkArea(comp, 1.01, 3.0));  // snaps to the frame at 1.0
+    const Composition* c = d.project().activeComp();
+    CHECK_NEAR(c->workAreaStart(), 1.0, 1e-9);
+    CHECK_NEAR(c->workAreaEnd(), 3.0, 1e-9);
+    CHECK(c->hasWorkArea());
+    CHECK(!d.setWorkArea(comp, 1.0, 3.0));  // no change, no undo step
+
+    // Saved with the project, and back after a round trip.
+    Project loaded;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", loaded, err));
+    CHECK_NEAR(loaded.activeComp()->workAreaStart(), 1.0, 1e-9);
+    CHECK_NEAR(loaded.activeComp()->workAreaEnd(), 3.0, 1e-9);
+
+    // Trim: the work area becomes the comp and everything moves 1 s earlier.
+    CHECK(d.trimToWorkArea(comp));
+    c = d.project().activeComp();
+    CHECK_NEAR(c->duration, 2.0, 1e-9);
+    CHECK(!c->hasWorkArea());
+    const Layer& l = *c->findLayer(a);
+    CHECK_NEAR(l.inPoint, -0.5, 1e-9);
+    CHECK_NEAR(l.outPoint, 2.5, 1e-9);
+    CHECK(l.prop(PropId::Position).keyframes.size() == 2);
+    CHECK_NEAR(l.prop(PropId::Position).keyframes[0].time, 0.0, 1e-9);
+    CHECK_NEAR(l.prop(PropId::Position).keyframes[1].time, 2.0, 1e-9);
+    CHECK_NEAR(evaluateProperty(l.prop(PropId::Position), PropId::Position, 0)[0], 10, 1e-9);
+    CHECK(!d.trimToWorkArea(comp));  // nothing left to trim
+
+    CHECK(d.undo());  // one step
+    c = d.project().activeComp();
+    CHECK_NEAR(c->duration, 4.0, 1e-9);
+    CHECK_NEAR(c->findLayer(a)->prop(PropId::Position).keyframes[0].time, 1.0, 1e-9);
+
+    // An end at (or past) the comp's end means "to the end".
+    CHECK(d.setWorkArea(comp, 0, 9));
+    CHECK(!d.project().activeComp()->hasWorkArea());
+}
+
+TEST(split_layer_makes_two_halves) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId a = d.addLayer(comp, LayerKind::Shape);
+    d.addEffect(comp, a, EffectType::GaussianBlur);
+    d.setPropertyAnimated(comp, a, PropId::Opacity, true, 1.0);
+    d.setPropertyValue(comp, a, PropId::Opacity, 3.0, {0, 0, 0, 0});
+    const size_t steps = d.undoDepth();
+
+    CHECK(d.splitLayers(comp, {a}, 0.01).empty());  // snaps to frame 0: nothing to split off
+    const std::vector<ObjectId> halves = d.splitLayers(comp, {a}, 2.0);
+    CHECK(halves.size() == 1);
+    CHECK(d.undoDepth() == steps + 1);
+    const Composition& c = *d.project().activeComp();
+    CHECK(c.layers.size() == 2);
+    const Layer& second = c.layers[0];  // the copy sits above
+    const Layer& first = c.layers[1];
+    CHECK(second.id == halves[0] && first.id == a);
+    CHECK_NEAR(first.inPoint, 0, 1e-9);
+    CHECK_NEAR(first.outPoint, 2.0, 1e-9);
+    CHECK_NEAR(second.inPoint, 2.0, 1e-9);
+    CHECK_NEAR(second.outPoint, 4.0, 1e-9);
+    CHECK(second.name == first.name);
+    CHECK(second.prop(PropId::Opacity).keyframes == first.prop(PropId::Opacity).keyframes);
+    CHECK(second.effects.size() == 1 && second.effects[0].id != first.effects[0].id);
+
+    CHECK(d.undo());
+    CHECK(d.project().activeComp()->layers.size() == 1);
+    CHECK_NEAR(d.project().activeComp()->findLayer(a)->outPoint, 4.0, 1e-9);
+}
+
+TEST(precompose_moves_layers_into_a_new_comp) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId a = d.addLayer(comp, LayerKind::Shape);
+    const ObjectId b = d.addLayer(comp, LayerKind::Shape);
+    const ObjectId c1 = d.addLayer(comp, LayerKind::Shape);
+    const ObjectId n = d.addLayer(comp, LayerKind::Null);
+    d.setLayerParent(comp, a, n);                       // a's parent stays behind
+    d.setLayerParent(comp, c1, b);                      // both move: kept
+    d.setLayerMatte(comp, n, a, MatteMode::Alpha);      // n stays, its matte moves: cleared
+    const int indexOfTopMoved = d.project().activeComp()->indexOf(c1);
+    const size_t comps = d.project().compositions.size();
+
+    const ObjectId inner = d.precompose(comp, {a, c1, b}, "Inner");
+    CHECK(inner != 0);
+    CHECK(d.project().compositions.size() == comps + 1);
+    const Composition& host = *d.project().findComposition(comp);
+    const Composition& in = *d.project().findComposition(inner);
+    CHECK(in.name == "Inner" && in.width == 320 && in.height == 240 && in.fps == 25 && in.duration == 4);
+    CHECK(in.layers.size() == 3);
+    CHECK(in.layers[0].id == c1 && in.layers[1].id == b && in.layers[2].id == a);  // stack order kept
+    CHECK(in.findLayer(a)->parent == 0);
+    CHECK(in.findLayer(c1)->parent == b);
+    CHECK(host.layers.size() == 2);
+    const Layer& pl = host.layers[indexOfTopMoved];
+    CHECK(pl.kind == LayerKind::Precomp && pl.source == inner && pl.name == "Inner");
+    CHECK(host.findLayer(n)->matteLayer == 0 && host.findLayer(n)->matteMode == MatteMode::None);
+    CHECK(d.precompose(comp, {}, "x") == 0);
+    CHECK(d.precompose(comp, {a}, "x") == 0);  // a isn't in this comp any more
+
+    // A second pre-compose without a name gets a unique one.
+    const ObjectId again = d.precompose(comp, {n}, "");
+    CHECK(d.project().findComposition(again)->name == "Main Comp");
+
+    CHECK(d.undo());
+    CHECK(d.undo());  // one step each
+    CHECK(d.project().compositions.size() == comps);
+    CHECK(d.project().findComposition(comp)->layers.size() == 4);
+    CHECK(d.project().findComposition(comp)->findLayer(a)->parent == n);
+}
+
+TEST(modified_properties_are_the_changed_ones) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId a = d.addLayer(comp, LayerKind::Shape, ShapeType::Polygon);
+    auto modified = [&] { return modifiedProps(d.project(), *d.project().activeComp(), *d.project().activeComp()->findLayer(a)); };
+    CHECK(modified().empty());  // a new layer, polygon points included
+    d.setPropertyValue(comp, a, PropId::Opacity, 0, {50, 0, 0, 0});
+    d.setPropertyAnimated(comp, a, PropId::Rotation, true, 1.0);  // animated, value unchanged
+    const std::vector<PropId> m = modified();
+    CHECK(m.size() == 2);
+    CHECK(std::find(m.begin(), m.end(), PropId::Opacity) != m.end());
+    CHECK(std::find(m.begin(), m.end(), PropId::Rotation) != m.end());
+}
+
+// ---- video footage ---------------------------------------------------------------------------
+
+// An H.264 movie whose frame i is a flat colour with red = 10·i (green = 255 − 10·i, blue 128), with
+// an optional AAC sound track and an optional 90° rotation flag (as phones record portrait).
+static std::string writeTestMovie(const char* name, int w, int h, int fps, int frames, bool portrait, bool sound) {
+    const std::string path = (fs::path(tempDir("video")) / name).string();
+    fs::remove(path);
+    NSError* err = nil;
+    AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:@(path.c_str())]
+                                                     fileType:AVFileTypeQuickTimeMovie
+                                                        error:&err];
+    NSDictionary* vs = @{AVVideoCodecKey : AVVideoCodecTypeH264, AVVideoWidthKey : @(w), AVVideoHeightKey : @(h),
+                         AVVideoCompressionPropertiesKey : @{AVVideoAverageBitRateKey : @(20000000)}};
+    AVAssetWriterInput* video = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vs];
+    video.expectsMediaDataInRealTime = NO;
+    if (portrait) video.transform = CGAffineTransformMakeRotation(M_PI_2);
+    AVAssetWriterInputPixelBufferAdaptor* adaptor = [AVAssetWriterInputPixelBufferAdaptor
+        assetWriterInputPixelBufferAdaptorWithAssetWriterInput:video
+                                   sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+                                                                 (id)kCVPixelBufferWidthKey : @(w), (id)kCVPixelBufferHeightKey : @(h)}];
+    [writer addInput:video];
+    AVAssetWriterInput* audio = nil;
+    CMAudioFormatDescriptionRef format = nullptr;
+    const int rate = 48000, perFrame = rate / fps;
+    if (sound) {
+        audio = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                                   outputSettings:@{AVFormatIDKey : @(kAudioFormatMPEG4AAC), AVSampleRateKey : @(rate),
+                                                                    AVNumberOfChannelsKey : @1, AVEncoderBitRateKey : @64000}];
+        audio.expectsMediaDataInRealTime = NO;
+        [writer addInput:audio];
+        AudioStreamBasicDescription asbd = {double(rate), kAudioFormatLinearPCM,
+                                            kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked, 2, 1, 2, 1, 16, 0};
+        CMAudioFormatDescriptionCreate(nullptr, &asbd, 0, nullptr, 0, nullptr, nullptr, &format);
+    }
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+    auto wait = [](AVAssetWriterInput* in) {
+        for (int i = 0; i < 4000 && !in.readyForMoreMediaData; ++i) usleep(500);
+    };
+    for (int i = 0; i < frames; ++i) {
+        if (audio) {  // interleaved: one frame's worth of a quiet tone before each frame
+            std::vector<int16_t> pcm(perFrame);
+            for (int k = 0; k < perFrame; ++k) pcm[k] = int16_t(3000 * std::sin(2 * M_PI * 440 * (i * perFrame + k) / rate));
+            CMBlockBufferRef block = nullptr;
+            CMBlockBufferCreateWithMemoryBlock(nullptr, nullptr, pcm.size() * 2, nullptr, nullptr, 0, pcm.size() * 2,
+                                               kCMBlockBufferAssureMemoryNowFlag, &block);
+            CMBlockBufferReplaceDataBytes(pcm.data(), block, 0, pcm.size() * 2);
+            CMSampleBufferRef sb = nullptr;
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(nullptr, block, format, perFrame,
+                                                                 CMTimeMake(int64_t(i) * perFrame, rate), nullptr, &sb);
+            wait(audio);
+            [audio appendSampleBuffer:sb];
+            CFRelease(sb);
+            CFRelease(block);
+        }
+        CVPixelBufferRef pb = nullptr;
+        CVPixelBufferPoolCreatePixelBuffer(nullptr, adaptor.pixelBufferPool, &pb);
+        CVPixelBufferLockBaseAddress(pb, 0);
+        uint8_t* base = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+        const size_t rb = CVPixelBufferGetBytesPerRow(pb);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* px = base + size_t(y) * rb + size_t(x) * 4;
+                px[0] = 128;                       // B
+                px[1] = uint8_t(255 - 10 * i);     // G
+                px[2] = uint8_t(10 * i);           // R
+                px[3] = 255;
+            }
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        wait(video);
+        [adaptor appendPixelBuffer:pb withPresentationTime:CMTimeMake(i, fps)];
+        CVPixelBufferRelease(pb);
+    }
+    [video markAsFinished];
+    if (audio) [audio markAsFinished];
+    if (format) CFRelease(format);
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return writer.status == AVAssetWriterStatusCompleted ? path : std::string();
+}
+
+// The red channel (0–255) at the centre of the engine's render at `t`.
+static int centreRed(MFEngine* e, double t) {
+    NSError* error = nil;
+    CGImageRef img = [e copyImageAtTime:t scale:1 transparent:NO error:&error];
+    if (!img) return -1;
+    uint8_t px[4] = {};
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    const double w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    CGContextDrawImage(ctx, CGRectMake(-w / 2, -h / 2, w, h), img);  // its centre lands on the one pixel
+    CGContextRelease(ctx);
+    CGImageRelease(img);
+    return px[0];
+}
+
+TEST(video_footage_shows_the_right_frames) {
+    const std::string movie = writeTestMovie("clip.mov", 160, 120, 24, 24, false, true);
+    CHECK(!movie.empty());
+    if (movie.empty()) return;
+    NSError* error = nil;
+    MFEngine* e = [[MFEngine alloc] initWithDevice:nil error:&error];
+    if (!e) return;
+    [e newProjectWithWidth:160 height:120 fps:30 duration:2];
+    NSNumber* aid = [e importVideoAtPath:@(movie.c_str()) error:&error];
+    CHECK(aid != nil);
+    if (!aid) return;
+    MFAssetInfo* info = [e assets].firstObject;
+    CHECK(info.isVideo && !info.isAudio && info.hasAudio);
+    CHECK(info.width == 160 && info.height == 120);
+    CHECK_NEAR(info.fps, 24, 0.01);
+    CHECK_NEAR(info.duration, 1.0, 0.05);
+    const uint64_t l = [e addImageLayerWithAsset:aid.unsignedLongLongValue];
+    MFLayerInfo* layer = [e layerWithID:l];
+    CHECK(layer.isVideo && layer.hasAudio && layer.kind == MFLayerKindImage);
+    CHECK_NEAR(layer.outPoint, 1.0, 0.05);  // as long as the clip
+    // Each moment shows its own source frame: 24 fps footage in a 30 fps composition.
+    for (double t : {0.0, 0.25, 0.5, 0.9, 0.5, 0.1}) {  // forwards, then seeking back
+        const int expected = 10 * int(std::floor(t * 24 + 1e-6));
+        const int red = centreRed(e, t);
+        CHECK(std::abs(red - expected) <= 6);
+        if (std::abs(red - expected) > 6) std::fprintf(stderr, "    t=%.2f red %d, expected %d\n", t, red, expected);
+    }
+    // Sliding the clip: at 1.0 s with its start at 0.5 s, it is 0.5 s in.
+    CHECK([e setLayer:l inPoint:0 outPoint:2]);
+    CHECK([e setLayer:l startTime:0.5]);
+    CHECK(std::abs(centreRed(e, 1.0) - 120) <= 6);
+    CHECK(std::abs(centreRed(e, 0.2) - 0) <= 6);  // before it starts: its first frame holds
+    // Its sound plays with it.
+    NSArray<MFAudioClipInfo*>* clips = [e audioClips];
+    CHECK(clips.count == 1);
+    if (clips.count == 1) CHECK_NEAR(clips[0].start, 0.5, 0.01);
+    // Saved and opened again: still footage, same rate and sound.
+    const std::string project = (fs::path(tempDir("video")) / "footage.mfproj").string();
+    CHECK([e saveProjectToPath:@(project.c_str()) error:&error]);
+    MFEngine* e2 = [[MFEngine alloc] initWithDevice:nil error:&error];
+    CHECK([e2 openProjectAtPath:@(project.c_str()) error:&error]);
+    MFAssetInfo* back = [e2 assets].firstObject;
+    CHECK(back.isVideo && back.hasAudio);
+    CHECK_NEAR(back.fps, 24, 0.01);
+    CHECK(std::abs(centreRed(e2, 1.0) - 120) <= 6);
+}
+
+TEST(video_footage_portrait_and_vector_artwork) {
+    // Phone footage recorded sideways with a rotation flag comes in upright.
+    const std::string movie = writeTestMovie("portrait.mov", 160, 96, 30, 6, true, false);
+    NSError* error = nil;
+    MFEngine* e = [[MFEngine alloc] initWithDevice:nil error:&error];
+    if (!e || movie.empty()) return;
+    [e newProjectWithWidth:96 height:160 fps:30 duration:1];
+    NSNumber* aid = [e importVideoAtPath:@(movie.c_str()) error:&error];
+    CHECK(aid != nil);
+    MFAssetInfo* info = [e assets].firstObject;
+    CHECK(info.width == 96 && info.height == 160 && !info.hasAudio);
+    if (aid) {
+        [e addImageLayerWithAsset:aid.unsignedLongLongValue];
+        CHECK(std::abs(centreRed(e, 3.0 / 30) - 30) <= 6);
+    }
+    CHECK([e importVideoAtPath:@(writeTone("silent.wav", 0.5).c_str()) error:nil] == nil);  // sound only: not footage
+    // SVG artwork (ImageIO can't read it): drawn by AppKit, small artwork at ~1000 px.
+    const std::string svg = (fs::path(tempDir("video")) / "dot.svg").string();
+    FILE* f = std::fopen(svg.c_str(), "w");
+    std::fputs("<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><rect width='40' height='20' fill='#ff0000'/></svg>", f);
+    std::fclose(f);
+    MFEngine* v = [[MFEngine alloc] initWithDevice:nil error:&error];
+    [v newProjectWithWidth:1000 height:500 fps:30 duration:1];
+    NSNumber* sid = [v importImageAtPath:@(svg.c_str()) error:&error];
+    CHECK(sid != nil);
+    if (!sid) {
+        std::fprintf(stderr, "    svg: %s\n", error.localizedDescription.UTF8String);
+        return;
+    }
+    MFAssetInfo* art = [v assets].firstObject;
+    CHECK(art.width == 1000 && art.height == 500);
+    [v addImageLayerWithAsset:sid.unsignedLongLongValue];
+    CHECK([v waitForMediaWithTimeout:10]);
+    CHECK(centreRed(v, 0) >= 250);
+}
+
+// ---- rotoscoping -----------------------------------------------------------------------------
+
+TEST(roto_mask_path_keys_morph_and_save) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Shape);
+    auto square = [](double x0, double size) {
+        BezierPath p;
+        p.vertices = {{{x0, 10}, {}, {}}, {{x0 + size, 10}, {}, {}}, {{x0 + size, 10 + size}, {}, {}}, {{x0, 10 + size}, {}, {}}};
+        return p;
+    };
+    const ObjectId m = d.addPathMask(comp, l, square(0, 20));
+    CHECK(m != 0);
+    CHECK(d.setMaskPathAnimated(comp, l, m, true, 1.0));  // first key: the shape as it is
+    CHECK(d.setMaskPathAt(comp, l, m, 3.0, square(100, 40)));  // a key at 3 s
+    const Mask* mask = d.project().activeComp()->findLayer(l)->findMask(m);
+    CHECK(mask->pathKeys.size() == 2);
+    // Halfway: every point halfway.
+    const BezierPath mid = maskPathAt(*mask, 2.0);
+    CHECK(mid.vertices.size() == 4);
+    CHECK_NEAR(mid.vertices[0].p.x, 50, 1e-9);
+    CHECK_NEAR(mid.vertices[2].p.x, 80, 1e-9);
+    CHECK_NEAR(maskPathAt(*mask, 0).vertices[0].p.x, 0, 1e-9);   // before the first key: held
+    CHECK_NEAR(maskPathAt(*mask, 9).vertices[0].p.x, 100, 1e-9); // after the last
+    CHECK(d.setMaskPathAt(comp, l, m, 3.0, square(120, 40)));  // same time: replaces that key
+    CHECK(d.project().activeComp()->findLayer(l)->findMask(m)->pathKeys.size() == 2);
+    // The renderer sees it too.
+    const FrameDesc f = evaluateFrame(d.project(), *d.project().activeComp(), 2.0);
+    CHECK(!f.masks.empty() && f.masks[0].shape == MaskShape::Path && std::abs(f.masks[0].path.vertices[0].p.x - 60) < 1e-9);
+    // Saved and loaded.
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", back, err));
+    const Mask* bm = back.activeComp()->findLayer(l)->findMask(m);
+    CHECK(bm && bm->pathKeys == d.project().activeComp()->findLayer(l)->findMask(m)->pathKeys);
+    // Deleting a key, then stopping the animation, keeps the shape at that time.
+    CHECK(d.removeMaskPathKey(comp, l, m, 1.0));
+    CHECK(d.setMaskPathAnimated(comp, l, m, false, 3.0));
+    mask = d.project().activeComp()->findLayer(l)->findMask(m);
+    CHECK(mask->pathKeys.empty() && std::abs(mask->path.vertices[0].p.x - 120) < 1e-9);
+}
+
+TEST(roto_brush_track_and_hand_corrections) {
+    Document d(makeDefaultProject(320, 240, 25, 4));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId l = d.addLayer(comp, LayerKind::Shape);
+    PathTrack track;
+    track.t0 = 1;
+    track.rate = 25;
+    for (int i = 0; i < 25; ++i) {  // a square sliding right a pixel a frame, then a triangle
+        BezierPath p;
+        if (i < 20) p.vertices = {{{double(i), 0}, {}, {}}, {{i + 10.0, 0}, {}, {}}, {{i + 10.0, 10}, {}, {}}, {{double(i), 10}, {}, {}}};
+        else p.vertices = {{{0, 0}, {}, {}}, {{10, 0}, {}, {}}, {{5, 9}, {}, {}}};
+        track.frames.push_back(p);
+    }
+    const size_t steps = d.undoDepth();
+    const ObjectId m = d.addTrackedMask(comp, l, track, "");
+    CHECK(m != 0 && d.undoDepth() == steps + 1);
+    const Mask* mask = d.project().activeComp()->findLayer(l)->findMask(m);
+    CHECK(mask->name == "Roto Brush" && mask->pathTrack && mask->param(MaskParam::Feather).value[0] == 2);
+    CHECK_NEAR(maskPathAt(*mask, 1 + 5.0 / 25).vertices[0].p.x, 5, 1e-9);
+    CHECK(maskPathAt(*mask, 1 + 22.0 / 25).vertices.size() == 3);  // the outline can change shape
+    // A hand correction turns the track into keyframes from there.
+    BezierPath fixed = maskPathAt(*mask, 1.4);
+    fixed.vertices[0].p.y = -3;
+    CHECK(d.setMaskPathAt(comp, l, m, 1.4, fixed));
+    mask = d.project().activeComp()->findLayer(l)->findMask(m);
+    CHECK(!mask->pathTrack && mask->pathKeys.size() == 1 && mask->pathKeys[0].path == fixed);
+    CHECK(d.undo());
+    CHECK(d.project().activeComp()->findLayer(l)->findMask(m)->pathTrack);
+    CHECK(d.undo());
+    CHECK(d.project().activeComp()->findLayer(l)->masks.empty());
+}
+
+// ---- 3D layers and cameras ---------------------------------------------------------------------
+
+TEST(three_d_layers_through_the_camera) {
+    ObjectId l;
+    Document d = rectDoc(&l);  // 640x360, a 200x100 rectangle at the centre
+    const ObjectId comp = d.project().activeComposition;
+    const Coverage flat = coverage(render(d.project()));
+    CHECK(d.setLayerThreeD(comp, l, true));
+    CHECK(!d.setLayerThreeD(comp, l, true));  // no change
+    // At z = 0 the default camera shows it exactly as 2D.
+    Coverage c = coverage(render(d.project()));
+    CHECK_NEAR(c.area, flat.area, flat.area * 0.003);
+    CHECK_NEAR(c.cx, 320, 0.05);
+    CHECK_NEAR(c.cy, 180, 0.05);
+    // Twice as far: half as wide and high.
+    const double zoom = std::round(640 * 50.0 / 36.0 * 10) / 10;
+    d.setPropertyValue(comp, l, PropId::PositionZ, 0, {zoom, 0, 0, 0});
+    c = coverage(render(d.project()));
+    CHECK_NEAR(c.area, flat.area / 4, flat.area * 0.01);
+    CHECK_NEAR(c.cx, 320, 0.1);
+    CHECK_NEAR(c.maxX - c.minX + 1, 100, 2);
+    // Turned 60° about Y at z = 0: about half as wide, still as high in the middle.
+    d.setPropertyValue(comp, l, PropId::PositionZ, 0, {0, 0, 0, 0});
+    d.setPropertyValue(comp, l, PropId::RotationY, 0, {60, 0, 0, 0});
+    c = coverage(render(d.project()));
+    CHECK_NEAR(c.area, flat.area * 0.5, flat.area * 0.03);
+    CHECK(c.maxX - c.minX + 1 < 104 && c.maxX - c.minX + 1 > 96);
+    // The side swung towards the viewer looks taller than the far side (perspective, not a squash).
+    const Image img = render(d.project());
+    auto columnHeight = [&](int x) { int n = 0; for (int y = 0; y < img.h; ++y) n += img.a(x, y) > 0.5; return n; };
+    CHECK(columnHeight(c.maxX - 2) > columnHeight(c.minX + 2) + 4);
+    // Hit testing follows the projection.
+    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {320, 180}) == l);
+    CHECK(hitTest(d.project(), *d.project().activeComp(), 0, {410, 180}) == 0);  // inside the 2D footprint, outside the turned one
+    d.setPropertyValue(comp, l, PropId::RotationY, 0, {0, 0, 0, 0});
+
+    // A camera: moving it right moves 3D layers left on screen, 2D layers stay.
+    const ObjectId flatLayer = d.addLayer(comp, LayerKind::Shape, ShapeType::Rectangle);
+    d.setPropertyValue(comp, flatLayer, PropId::ShapeSize, 0, {20, 20, 0, 0});
+    d.setPropertyValue(comp, flatLayer, PropId::Position, 0, {40, 40, 0, 0});
+    const ObjectId cam = d.addLayer(comp, LayerKind::Camera);
+    const Layer* camLayer = d.project().activeComp()->findLayer(cam);
+    CHECK(camLayer && camLayer->is3D() && std::abs(camLayer->prop(PropId::CameraZoom).value[0] - zoom) < 1e-6);
+    c = coverage(render(d.project()));
+    CHECK_NEAR(c.area, flat.area + 400, flat.area * 0.005);  // a new camera changes nothing
+    d.setPropertyValue(comp, cam, PropId::Position, 0, {420, 180, 0, 0});  // 100 px right
+    const Image moved = render(d.project());
+    double sx = 0, n = 0;
+    for (int y = 120; y < 240; ++y)
+        for (int x = 100; x < 640; ++x) {
+            sx += moved.a(x, y) * x;
+            n += moved.a(x, y);
+        }
+    CHECK_NEAR(sx / n + 0.5, 220, 0.5);  // pixel centres: 100 px left of 320
+    CHECK(moved.a(40, 40) > 0.99);  // the 2D layer didn't move
+    // Behind the camera: not drawn.
+    d.setPropertyValue(comp, l, PropId::PositionZ, 0, {-zoom - 50, 0, 0, 0});
+    CHECK(evaluateFrame(d.project(), *d.project().activeComp(), 0).items.size() == 1);
+
+    // Saved and loaded with the switch, the camera and its zoom.
+    Project back;
+    std::string err;
+    CHECK(deserializeProject(serializeProject(d.project(), ""), "", back, err));
+    CHECK(back.activeComp()->findLayer(l)->threeD);
+    CHECK(back.activeComp()->findLayer(cam)->kind == LayerKind::Camera);
+    CHECK(back == d.project());
+}
+
+TEST(three_d_layers_paint_far_to_near) {
+    Document d(makeDefaultProject(320, 180, 30, 2));
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId nearLayer = d.addLayer(comp, LayerKind::Shape, ShapeType::Rectangle);  // lower in the stack
+    const ObjectId farLayer = d.addLayer(comp, LayerKind::Shape, ShapeType::Rectangle);   // on top of the stack
+    for (ObjectId id : {nearLayer, farLayer}) {
+        d.setPropertyValue(comp, id, PropId::ShapeSize, 0, {100, 100, 0, 0});
+        d.setLayerThreeD(comp, id, true);
+    }
+    d.setPropertyValue(comp, nearLayer, PropId::FillColor, 0, {0, 0, 1, 1});
+    d.setPropertyValue(comp, farLayer, PropId::FillColor, 0, {1, 0, 0, 1});
+    d.setPropertyValue(comp, farLayer, PropId::PositionZ, 0, {300, 0, 0, 0});
+    const Image img = render(d.project());
+    const float* px = img.at(160, 90);
+    CHECK(px[2] > 0.9 && px[0] < 0.1);  // the near (blue) one in front, though it's lower in the stack
+    // A 2D layer between them keeps stacking order.
+    d.setLayerThreeD(comp, nearLayer, false);
+    const float* px2 = render(d.project()).at(160, 90);
+    CHECK(px2[0] > 0.9);  // now the red one (top of the stack) covers it
+}
 
 int main(int argc, const char* argv[]) {
     @autoreleasepool {

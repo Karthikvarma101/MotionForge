@@ -1,5 +1,6 @@
 #import "MFRender/MetalRenderer.hpp"
 
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
@@ -12,6 +13,7 @@
 
 #include "Shaders.hpp"
 #include "TextEngine.hpp"
+#include "VideoDecoder.hpp"
 
 namespace mf {
 
@@ -27,8 +29,9 @@ struct ItemGPU {
     float p0[4];
     float p1[4];
     float p2[4];  // bezier paths: fill edge start/count, stroke edge start/count
+    float m3[4];  // 3D layers: perspective row (gx, gy, w)
 };
-static_assert(sizeof(ItemGPU) == 128, "ItemGPU must match the MSL layout");
+static_assert(sizeof(ItemGPU) == 144, "ItemGPU must match the MSL layout");
 
 struct EdgeGPU {
     float x0, y0, x1, y1;
@@ -96,6 +99,10 @@ void packItem(const DrawItem& d, ItemGPU& g) {
     g.p1[2] = 0;  // mask start / count are filled in by the pass
     g.p1[3] = 0;
     g.p2[0] = g.p2[1] = g.p2[2] = g.p2[3] = 0;
+    g.m3[0] = float(d.persp.x);
+    g.m3[1] = float(d.persp.y);
+    g.m3[2] = float(d.perspW);
+    g.m3[3] = 0;
 }
 
 void appendEdges(const std::vector<Vec2>& pts, bool close, std::vector<EdgeGPU>& out) {
@@ -228,7 +235,7 @@ bool offscreenRegion(const FrameDesc& f, const DrawItem& d, int out[4]) {
     const Vec2 corners[4] = {{bmn.x - pad, bmn.y - pad}, {bmx.x + pad, bmn.y - pad}, {bmx.x + pad, bmx.y + pad}, {bmn.x - pad, bmx.y + pad}};
     double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
     for (const Vec2& c : corners) {
-        const Vec2 p = m.apply(c);
+        const Vec2 p = d.project(c);
         x0 = std::min(x0, p.x);
         y0 = std::min(y0, p.y);
         x1 = std::max(x1, p.x);
@@ -267,6 +274,9 @@ std::unique_ptr<MetalRenderer> MetalRenderer::create(id<MTLDevice> device, std::
 }
 
 MetalRenderer::~MetalRenderer() {
+    // Image decodes run on a background queue with `this`: let them finish first (a short-lived
+    // engine, e.g. one opened just to read a file, can go away while its media is still decoding).
+    dispatch_group_wait(decodes_, DISPATCH_TIME_FOREVER);
     // Completion handlers capture `this`; drain the queue before tearing down.
     if (queue_) {
         id<MTLCommandBuffer> cb = [queue_ commandBuffer];
@@ -508,8 +518,51 @@ void MetalRenderer::recycleBuffer(id<MTLBuffer> b) {
 
 // ---- media ----------------------------------------------------------------------------------
 
+namespace {
+
+// SVG and PDF artwork, which ImageIO doesn't read: drawn by AppKit, small artwork at about 1000 px so
+// it stays sharp when scaled up (the first page of a PDF).
+CGImageRef rasterizeVector(NSURL* url) {
+    NSImage* img = [[NSImage alloc] initWithContentsOfURL:url];
+    if (!img || img.size.width < 1 || img.size.height < 1) return nullptr;
+    const double s = std::max(1.0, 1000.0 / std::max(img.size.width, img.size.height));
+    const size_t w = size_t(std::clamp(std::lround(img.size.width * s), 1L, 8192L));
+    const size_t h = size_t(std::clamp(std::lround(img.size.height * s), 1L, 8192L));
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(nullptr, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nullptr;
+    NSGraphicsContext* g = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = g;
+    [img drawInRect:NSMakeRect(0, 0, w, h) fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1];
+    [NSGraphicsContext restoreGraphicsState];
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    return out;
+}
+
+bool isVectorFile(const std::string& path) {
+    NSString* ext = @(path.c_str()).pathExtension.lowercaseString;
+    return [ext isEqualToString:@"svg"] || [ext isEqualToString:@"svgz"] || [ext isEqualToString:@"pdf"] ||
+           [ext isEqualToString:@"ai"] || [ext isEqualToString:@"eps"];
+}
+
+}  // namespace
+
 bool MetalRenderer::probeImage(const std::string& path, int& width, int& height, std::string& error) {
     NSURL* url = [NSURL fileURLWithPath:@(path.c_str())];
+    if (isVectorFile(path)) {
+        CGImageRef img = rasterizeVector(url);
+        if (!img) {
+            error = "Cannot read the artwork in " + path;
+            return false;
+        }
+        width = int(CGImageGetWidth(img));
+        height = int(CGImageGetHeight(img));
+        CGImageRelease(img);
+        return true;
+    }
     CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
     if (!src) {
         error = "Cannot open image " + path;
@@ -539,6 +592,10 @@ bool MetalRenderer::probeImage(const std::string& path, int& width, int& height,
 
 bool MetalRenderer::decodeAndUpload(ObjectId asset, uint32_t generation, const std::string& path, std::string& error) {
     NSURL* url = [NSURL fileURLWithPath:@(path.c_str())];
+    CGImageRef img = nullptr;
+    if (isVectorFile(path)) {
+        img = rasterizeVector(url);
+    } else {
     CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
     if (!src) {
         error = "Cannot open image " + path;
@@ -562,8 +619,9 @@ bool MetalRenderer::decodeAndUpload(ObjectId asset, uint32_t generation, const s
         (id)kCGImageSourceThumbnailMaxPixelSize : @(std::min(std::max(maxDim, 1), 16384)),
         (id)kCGImageSourceShouldCacheImmediately : @YES,
     };
-    CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
+    img = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
     CFRelease(src);
+    }
     if (!img) {
         error = "Cannot decode image " + path;
         return false;
@@ -638,7 +696,7 @@ void MetalRenderer::requestImage(ObjectId asset, uint32_t generation, const std:
         e.texture = nil;
     }
     std::string p = path;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_group_async(decodes_, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         std::string err;
         const bool ok = decodeAndUpload(asset, generation, p, err);
         if (!ok) {
@@ -661,6 +719,44 @@ bool MetalRenderer::imagePending(ObjectId asset, uint32_t generation) const {
     std::lock_guard lock(mutex_);
     auto it = images_.find(asset);
     return it != images_.end() && it->second.pending && it->second.generation == generation;
+}
+
+void MetalRenderer::registerVideo(ObjectId asset, uint32_t generation, const std::string& path, double fps,
+                                  int64_t frameCount) {
+    std::lock_guard lock(mutex_);
+    VideoEntry& e = videos_[asset];
+    if (e.decoder && e.generation == generation) return;
+    e.generation = generation;
+    e.decoder = std::make_shared<VideoDecoder>(device_, path, fps, frameCount);
+}
+
+std::shared_ptr<VideoDecoder> MetalRenderer::videoDecoder(ObjectId asset, uint32_t generation) const {
+    std::lock_guard lock(mutex_);
+    auto it = videos_.find(asset);
+    return it != videos_.end() && it->second.generation == generation ? it->second.decoder : nullptr;
+}
+
+id<MTLTexture> MetalRenderer::videoTexture(const DrawItem& d, bool* exact) const {
+    *exact = false;
+    auto decoder = videoDecoder(d.asset, d.assetGeneration);
+    return decoder ? decoder->texture(d.videoFrame, exact) : nil;
+}
+
+bool MetalRenderer::prepareVideoFrames(const FrameDesc& f, double timeoutSeconds, std::string& error) {
+    auto item = [&](const DrawItem& d) -> bool {
+        if (d.nested && !prepareVideoFrames(*d.nested, timeoutSeconds, error)) return false;
+        if (d.videoFrame < 0) return true;
+        auto decoder = videoDecoder(d.asset, d.assetGeneration);
+        if (!decoder) return true;  // not registered: drawn without it (as missing media is)
+        if (decoder->decodeSync(d.videoFrame, timeoutSeconds)) return true;
+        error = decoder->error().empty() ? "Timed out decoding a video frame" : decoder->error();
+        return false;
+    };
+    for (const DrawItem& d : f.items)
+        if (!item(d)) return false;
+    for (const DrawItem& d : f.mattes)
+        if (!item(d)) return false;
+    return true;
 }
 
 id<MTLTexture> MetalRenderer::imageTexture(ObjectId asset, uint32_t generation) const {
@@ -832,7 +928,10 @@ void MetalRenderer::appendGlyphs(const FrameDesc& f, const DrawItem& d, std::vec
         pi.d.layerId = d.layerId;
         pi.d.kind = LayerKind::Text;
         pi.d.blend = d.blend;
-        pi.d.toTarget = d.toTarget * t;
+        pi.d.toTarget = d.toTarget;
+        pi.d.persp = d.persp;
+        pi.d.perspW = d.perspW;
+        pi.d.append(t);  // the glyph inside the (possibly 3D) layer
         pi.d.opacity = d.opacity * op;
         pi.d.fill = d.fillOn ? d.fill : Value{};
         pi.d.stroke = {r.u0, r.v0, r.u1, r.v1};
@@ -931,6 +1030,7 @@ void MetalRenderer::encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> targ
     [enc setFragmentSamplerState:linearMip_ atIndex:0];
 
     // Consecutive items sharing a pipeline and texture are one instanced draw.
+    bool staleVideo = false;
     auto drawState = [&](const PassItem& it, id<MTLTexture>* tex) -> id<MTLRenderPipelineState> {
         const bool m = it.masks && it.d.maskCount > 0;
         bool pathMask = false;
@@ -942,7 +1042,15 @@ void MetalRenderer::encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> targ
             case PassItem::Role::Normal: break;
         }
         if (it.d.kind == LayerKind::Image) {
-            *tex = it.tex ? it.tex : imageTexture(it.d.asset, it.d.assetGeneration);
+            if (it.tex) {
+                *tex = it.tex;
+            } else if (it.d.videoFrame >= 0) {  // footage: a stand-in frame keeps playback smooth, never cached
+                bool exact = false;
+                *tex = videoTexture(it.d, &exact);
+                if (!exact) staleVideo = true;
+            } else {
+                *tex = imageTexture(it.d.asset, it.d.assetGeneration);
+            }
             return pathMask ? imagePathMaskPSO_ : m ? imageMaskPSO_ : imagePSO_;
         }
         if (it.d.shape == ShapeType::Path || pathMask) return m ? shapePathMaskPSO_ : shapePathPSO_;
@@ -971,6 +1079,7 @@ void MetalRenderer::encodeItemsPass(id<MTLCommandBuffer> cb, id<MTLTexture> targ
         i = j;
     }
     [enc endEncoding];
+    if (staleVideo) *complete = false;
 }
 
 MetalRenderer::Prepared MetalRenderer::renderOffscreen(id<MTLCommandBuffer> cb, const FrameDesc& f, const DrawItem& d,
@@ -996,7 +1105,7 @@ MetalRenderer::Prepared MetalRenderer::renderOffscreen(id<MTLCommandBuffer> cb, 
     // is composited (effects see the full-opacity layer); a matte source keeps its opacity.
     PassItem pi;
     pi.d = d;
-    pi.d.toTarget = Affine::translate(-r[0], -r[1]) * d.toTarget;
+    pi.d.prepend(Affine::translate(-r[0], -r[1]));  // (3D layers stay in perspective)
     pi.d.blend = BlendMode::Normal;
     if (!keepOpacity) pi.d.opacity = 1;
     uint64_t draws = 0;
@@ -1072,14 +1181,22 @@ void MetalRenderer::applyMasks(id<MTLCommandBuffer> cb, id<MTLTexture> tex, cons
     PassItem m;
     m.role = PassItem::Role::MaskApply;
     m.d = d;
-    m.d.toTarget = Affine::translate(-r[0], -r[1]) * d.toTarget;
+    m.d.prepend(Affine::translate(-r[0], -r[1]));
     m.d.strokeWidth = 0;
     m.d.nested = nullptr;
-    Affine inv;
-    if (!m.d.toTarget.inverse(inv)) return;
+    // The region's corners in layer space (through the perspective of a 3D layer).
+    LayerMapping map;
+    map.aff = m.d.toTarget;
+    map.persp = m.d.persp;
+    map.perspW = m.d.perspW;
     Vec2 mn{1e300, 1e300}, mx{-1e300, -1e300};
     for (Vec2 c : {Vec2{0, 0}, Vec2{double(r[2]), 0}, Vec2{double(r[2]), double(r[3])}, Vec2{0, double(r[3])}}) {
-        const Vec2 q = inv.apply(c);
+        Vec2 q;
+        if (!map.inverse(c, q)) {  // past a 3D layer's horizon: its own bounds cover it
+            mn = d.boundsMin;
+            mx = d.boundsMax;
+            break;
+        }
         mn = {std::min(mn.x, q.x), std::min(mn.y, q.y)};
         mx = {std::max(mx.x, q.x), std::max(mx.y, q.y)};
     }
@@ -1099,7 +1216,7 @@ void MetalRenderer::encodeLayers(const FrameDesc& f, id<MTLCommandBuffer> cb, id
         PassItem pi;
         pi.d = d;
         pi.d.nested = nullptr;  // the pass never needs it; don't copy the reference around
-        pi.d.toTarget = shift * d.toTarget;
+        pi.d.prepend(shift);
         if (d.kind == LayerKind::Text && !d.needsOffscreen()) {
             appendGlyphs(f, pi.d, items);
             continue;
@@ -1245,6 +1362,7 @@ void MetalRenderer::encodePresent(id<MTLCommandBuffer> cb, MTLRenderPassDescript
 }
 
 bool MetalRenderer::renderToRGBA(const FrameDesc& f, std::vector<float>& rgba, double* gpuMs, std::string& error) {
+    if (!prepareVideoFrames(f, 20, error)) return false;
     id<MTLTexture> target = acquire(f.width, f.height, PoolKind::Target);
     if (!target) {
         error = "Cannot allocate render target";
@@ -1291,6 +1409,8 @@ bool MetalRenderer::renderToBGRA8(const std::vector<FrameDesc>& subframes, const
         error = "Nothing to render";
         return false;
     }
+    for (const FrameDesc& f : subframes)
+        if (!prepareVideoFrames(f, 20, error)) return false;
     const int w = subframes[0].width, h = subframes[0].height;
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];
     bool complete = true;
@@ -1422,6 +1542,8 @@ void MetalRenderer::handleMemoryPressure(PressureLevel level) {
     poolBytes_ = 0;
     freeBuffers_.clear();
     blurKernels_.clear();
+    if (level == PressureLevel::Critical)
+        for (auto& [id, v] : videos_) v.decoder->purge();  // decoded again on demand
 }
 
 RendererStats MetalRenderer::stats() const {
@@ -1437,6 +1559,7 @@ RendererStats MetalRenderer::stats() const {
         s.assetBytes += e.texture ? e.bytes : 0;
         s.pendingAssets += e.pending ? 1 : 0;
     }
+    for (const auto& [id, v] : videos_) s.assetBytes += v.decoder->bytes();
     s.deviceAllocated = device_.currentAllocatedSize;
     s.recommendedWorkingSet = size_t(device_.recommendedMaxWorkingSetSize);
     return s;

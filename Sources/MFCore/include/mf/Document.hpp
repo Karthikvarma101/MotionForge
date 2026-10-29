@@ -8,6 +8,7 @@
 // Interactive drags are wrapped in begin/endGroup so a whole drag is one undo step.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -36,9 +37,16 @@ public:
     uint64_t revision() const { return revision_; }  // bumps on every change (incl. undo/redo)
     bool dirty() const { return revision_ != savedRevision_; }
     void markSaved() { savedRevision_ = revision_; }
+    void markSaved(uint64_t revision) { savedRevision_ = revision; }  // a background save of that revision finished
     void replaceProject(Project p);  // open/new: clears history
     void clearHistory();             // forget undo/redo and treat the current state as saved
     void markUnsaved() { savedRevision_ = 0; }  // e.g. restored from an autosave
+    // Collaboration: the project as merged with other people's edits. Not an undo step: shared
+    // projects undo per person (SyncEngine), so the snapshot history is dropped here, which keeps
+    // a stray snapshot undo from wiping out other people's work. An open undo group is closed.
+    void applyExternal(Project p);
+    // New objects get ids from `base` up (each collaborator has their own range).
+    void reserveIds(ObjectId base) { project_.nextId = std::max(project_.nextId, base); }
 
     // --- undo -------------------------------------------------------------------------------
     bool canUndo() const { return !undo_.empty(); }
@@ -49,6 +57,10 @@ public:
     bool redo();
     void beginGroup(const std::string& label);  // nestable; one snapshot for the outermost group
     void endGroup();
+    bool inGroup() const { return groupDepth_ > 0; }  // e.g. a drag is in progress
+    // Counts undo steps begun (a whole group counts once); never goes down. Collaboration uses it
+    // to tell a new step from more of the same drag.
+    uint64_t editSerial() const { return editSerial_; }
     size_t undoDepth() const { return undo_.size(); }
     static constexpr size_t kMaxUndo = 500;
     static constexpr size_t kUndoBudget = 1ull << 30;  // bytes of snapshots kept for undo + redo
@@ -66,15 +78,30 @@ public:
     bool setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime);
     // Precomp and audio layers: where their source's time 0 sits (moves the content in time).
     bool setLayerStartTime(ObjectId comp, ObjectId layer, double startTime);
+    // Work area (B / N), snapped to frames; end < 0 = the end of the composition.
+    bool setWorkArea(ObjectId comp, double start, double end);
+    // Trim Comp to Work Area: the work area becomes the whole composition and everything in it
+    // (layers, keyframes, baked tracks) moves earlier by the work area's start.
+    bool trimToWorkArea(ObjectId comp);
+    // Pre-compose: moves `layers` into a new composition with the same size, rate and length and
+    // puts a layer showing it where the top one was. Parent / matte links between the moved layers
+    // and the ones left behind are cleared. Returns the new composition.
+    ObjectId precompose(ObjectId comp, const std::vector<ObjectId>& layers, const std::string& name);
 
     // --- assets & layers --------------------------------------------------------------------
     ObjectId addImageAsset(const std::string& path, const std::string& name, int width, int height);
     ObjectId addAudioAsset(const std::string& path, const std::string& name, double duration);
+    // Footage: `width` × `height` as displayed (rotation applied), `fps` frames per second.
+    ObjectId addVideoAsset(const std::string& path, const std::string& name, int width, int height, double duration,
+                           double fps, bool hasAudio);
     ObjectId addLayer(ObjectId comp, LayerKind kind, ShapeType shape = ShapeType::Rectangle, ObjectId asset = 0);
     bool removeLayer(ObjectId comp, ObjectId layer);
     ObjectId duplicateLayer(ObjectId comp, ObjectId layer);
     bool removeLayers(ObjectId comp, const std::vector<ObjectId>& layers);              // one undo step
     std::vector<ObjectId> duplicateLayers(ObjectId comp, const std::vector<ObjectId>& layers);
+    // Split Layer: each layer running through `time` (a frame or more each side) becomes two, the
+    // copy above it starting at `time`. Returns the copies' ids (one undo step).
+    std::vector<ObjectId> splitLayers(ObjectId comp, const std::vector<ObjectId>& layers, double time);
     // Inserts copies of `layers` (e.g. from the clipboard) above stack index `atIndex`, with fresh
     // ids. Parent / matte links between the inserted layers are kept, links to anything else are
     // cleared. Media in `assets` is matched to this project's media by path or added.
@@ -83,6 +110,8 @@ public:
     bool moveLayer(ObjectId comp, ObjectId layer, int newIndex);  // 0 = top
     bool setLayerName(ObjectId comp, ObjectId layer, const std::string& name);
     bool setLayerVisible(ObjectId comp, ObjectId layer, bool visible);
+    // The 3D switch. Turning it on changes nothing on screen until the layer moves in depth or turns.
+    bool setLayerThreeD(ObjectId comp, ObjectId layer, bool threeD);
     bool setLayerTiming(ObjectId comp, ObjectId layer, double in, double out);
     bool setLayerParent(ObjectId comp, ObjectId layer, ObjectId parent);  // refuses cycles
     bool setLayerBlend(ObjectId comp, ObjectId layer, BlendMode mode);
@@ -119,6 +148,14 @@ public:
     bool setLayerPath(ObjectId comp, ObjectId layer, const BezierPath& path);
     ObjectId addPathMask(ObjectId comp, ObjectId layer, const BezierPath& layerSpace);
     bool setMaskPath(ObjectId comp, ObjectId layer, ObjectId mask, const BezierPath& layerSpace);
+    // Rotoscoping. With the mask's path animated this writes (or replaces) the key at `time`,
+    // otherwise it sets the path; a Roto Brush track is replaced by keys from here on.
+    bool setMaskPathAt(ObjectId comp, ObjectId layer, ObjectId mask, double time, const BezierPath& layerSpace);
+    // On: a first key at `time` with the current shape. Off: the shape at `time` stays.
+    bool setMaskPathAnimated(ObjectId comp, ObjectId layer, ObjectId mask, bool animated, double time);
+    bool removeMaskPathKey(ObjectId comp, ObjectId layer, ObjectId mask, double time);
+    // Roto Brush: a new mask (Add, slightly feathered) following `track`, one outline per frame.
+    ObjectId addTrackedMask(ObjectId comp, ObjectId layer, const PathTrack& track, const std::string& name);
 
     // --- properties & keyframes -------------------------------------------------------------
     // Graph editor: sets one side of a keyframe to Bezier with this influence (0–1) and speed
@@ -181,6 +218,7 @@ private:
     std::string groupLabel_;
     uint64_t revision_ = 1;
     uint64_t savedRevision_ = 1;
+    uint64_t editSerial_ = 0;
     size_t undoBytes_ = 0;
 };
 

@@ -50,7 +50,61 @@ std::string uniqueName(const Composition& c, const std::string& base) {
     }
 }
 
+std::string uniqueCompName(const Project& p, const std::string& base) {
+    auto taken = [&](const std::string& n) {
+        return std::any_of(p.compositions.begin(), p.compositions.end(), [&](const Composition& c) { return c.name == n; });
+    };
+    if (!taken(base)) return base;
+    for (int i = 2;; ++i) {
+        std::string n = base + " " + std::to_string(i);
+        if (!taken(n)) return n;
+    }
+}
+
+// Moves everything a layer shows in time by `dt`: its span, source time, keys and baked tracks.
+void shiftLayerTime(Layer& l, double dt) {
+    auto shift = [dt](Property& p) {
+        for (Keyframe& k : p.keyframes) k.time += dt;
+        if (p.samples) {
+            SampledTrack s = *p.samples;
+            s.t0 += dt;
+            p.samples = Shared<SampledTrack>(std::move(s));
+        }
+    };
+    auto shiftPath = [dt](Shared<PathTrack>& t) {
+        if (!t) return;
+        PathTrack copy = *t;
+        copy.t0 += dt;
+        t = Shared<PathTrack>(std::move(copy));
+    };
+    for (Property& p : l.props) shift(p);
+    for (Mask& m : l.masks) {
+        for (Property& p : m.params) shift(p);
+        shiftPath(m.pathTrack);
+    }
+    for (Effect& e : l.effects)
+        for (Property& p : e.params) shift(p);
+    for (TextAnimator& a : l.animators)
+        for (Property& p : a.params) shift(p);
+    shiftPath(l.pathTrack);
+    l.inPoint += dt;
+    l.outPoint += dt;
+    l.startTime += dt;
+}
+
 }  // namespace
+
+void Document::applyExternal(Project p) {
+    const ObjectId next = std::max(project_.nextId, p.nextId);
+    project_ = std::move(p);
+    project_.nextId = next;
+    groupDepth_ = 0;
+    groupRecorded_ = false;
+    undo_.clear();
+    redo_.clear();
+    undoBytes_ = 0;
+    touched();
+}
 
 void Document::replaceProject(Project p) {
     project_ = std::move(p);
@@ -117,9 +171,11 @@ Project& Document::edit(const std::string& label) {
         if (!groupRecorded_) {
             push(undo_, project_, groupLabel_.empty() ? label : groupLabel_);
             groupRecorded_ = true;
+            ++editSerial_;
         }
     } else {
         push(undo_, project_, label);
+        ++editSerial_;
     }
     for (const Snapshot& r : redo_) undoBytes_ -= r.bytes;
     redo_.clear();
@@ -128,22 +184,28 @@ Project& Document::edit(const std::string& label) {
     return project_;
 }
 
+// Which composition is shown isn't an edit, so undo and redo stay in the one you're looking at
+// (when it still exists) instead of jumping back to wherever the snapshot was taken.
 bool Document::undo() {
     if (undo_.empty()) return false;
+    const ObjectId shown = project_.activeComposition;
     push(redo_, project_, undo_.back().label);
     undoBytes_ -= undo_.back().bytes;
     project_ = std::move(undo_.back().project);
     undo_.pop_back();
+    if (project_.findComposition(shown)) project_.activeComposition = shown;
     touched();
     return true;
 }
 
 bool Document::redo() {
     if (redo_.empty()) return false;
+    const ObjectId shown = project_.activeComposition;
     push(undo_, project_, redo_.back().label);
     undoBytes_ -= redo_.back().bytes;
     project_ = std::move(redo_.back().project);
     redo_.pop_back();
+    if (project_.findComposition(shown)) project_.activeComposition = shown;
     trimHistory();
     touched();
     return true;
@@ -221,9 +283,95 @@ ObjectId Document::addPrecompLayer(ObjectId comp, ObjectId source) {
 
 bool Document::setLayerStartTime(ObjectId comp, ObjectId layer, double startTime) {
     const Layer* l0 = layerFor(comp, layer);
-    if (!l0 || (l0->kind != LayerKind::Precomp && l0->kind != LayerKind::Audio) || l0->startTime == startTime) return false;
+    if (!l0 || l0->startTime == startTime) return false;
+    const Asset* a = project_.findAsset(l0->asset);
+    const bool footage = l0->kind == LayerKind::Image && a && a->isVideo();
+    if (l0->kind != LayerKind::Precomp && l0->kind != LayerKind::Audio && !footage) return false;
     edit("Move Layer in Time").findComposition(comp)->findLayer(layer)->startTime = startTime;
     return true;
+}
+
+bool Document::setWorkArea(ObjectId comp, double start, double end) {
+    const Composition* c0 = project_.findComposition(comp);
+    if (!c0) return false;
+    const double fd = c0->frameDuration();
+    start = std::clamp(c0->snapToFrame(start), 0.0, std::max(0.0, c0->duration - fd));
+    end = end < 0 ? -1 : std::clamp(c0->snapToFrame(end), start + fd, std::max(c0->duration, start + fd));
+    if (end >= c0->duration - kTimeEps) end = -1;
+    if (std::abs(start - c0->workStart) < kTimeEps && std::abs(end - c0->workEnd) < kTimeEps) return false;
+    Composition& c = *edit("Work Area").findComposition(comp);
+    c.workStart = start;
+    c.workEnd = end;
+    return true;
+}
+
+bool Document::trimToWorkArea(ObjectId comp) {
+    const Composition* c0 = project_.findComposition(comp);
+    if (!c0 || !c0->hasWorkArea()) return false;
+    const double start = c0->workAreaStart(), end = c0->workAreaEnd();
+    Composition& c = *edit("Trim Comp to Work Area").findComposition(comp);
+    if (start > 0)
+        for (Layer& l : c.layers) shiftLayerTime(l, -start);
+    c.duration = std::max(end - start, c.frameDuration());
+    c.workStart = 0;
+    c.workEnd = -1;
+    return true;
+}
+
+ObjectId Document::precompose(ObjectId comp, const std::vector<ObjectId>& ids, const std::string& name) {
+    const Composition* c0 = project_.findComposition(comp);
+    if (!c0) return 0;
+    std::vector<ObjectId> moving;  // stack order
+    for (const Layer& l : c0->layers)
+        if (std::find(ids.begin(), ids.end(), l.id) != ids.end()) moving.push_back(l.id);
+    if (moving.empty()) return 0;
+    auto moved = [&](ObjectId id) { return id != 0 && std::find(moving.begin(), moving.end(), id) != moving.end(); };
+
+    Project& p = edit("Pre-compose");
+    Composition inner;
+    int top = 0;
+    {
+        Composition& c = *p.findComposition(comp);
+        top = c.indexOf(moving.front());
+        inner.id = p.allocateId();
+        inner.name = uniqueCompName(p, name.empty() ? c.name + " Comp" : name);
+        inner.folder = c.folder;
+        inner.width = c.width;
+        inner.height = c.height;
+        inner.fps = c.fps;
+        inner.duration = c.duration;
+        inner.background = c.background;
+        inner.motionBlur = c.motionBlur;
+        inner.shutterAngle = c.shutterAngle;
+        inner.shutterPhase = c.shutterPhase;
+        inner.motionBlurSamples = c.motionBlurSamples;
+        for (Layer& l : c.layers)
+            if (moved(l.id)) inner.layers.push_back(std::move(l));
+        c.layers.erase(std::remove_if(c.layers.begin(), c.layers.end(), [&](const Layer& l) { return moved(l.id); }),
+                       c.layers.end());
+        // A link can't reach into another composition.
+        for (Layer& l : c.layers) {
+            if (moved(l.parent)) l.parent = 0;
+            if (moved(l.matteLayer)) {
+                l.matteLayer = 0;
+                l.matteMode = MatteMode::None;
+            }
+        }
+        for (Layer& l : inner.layers) {
+            if (l.parent && !moved(l.parent)) l.parent = 0;
+            if (l.matteLayer && !moved(l.matteLayer)) {
+                l.matteLayer = 0;
+                l.matteMode = MatteMode::None;
+            }
+        }
+    }
+    const ObjectId innerId = inner.id;
+    p.compositions.push_back(std::move(inner));
+    Composition& host = *p.findComposition(comp);  // the push may have moved it
+    Layer pl = makePrecompLayer(host, *p.findComposition(innerId), p.allocateId());
+    pl.name = uniqueName(host, pl.name);
+    host.layers.insert(host.layers.begin() + std::clamp(top, 0, int(host.layers.size())), std::move(pl));
+    return innerId;
 }
 
 bool Document::setPrecompOptions(ObjectId comp, ObjectId layer, bool collapse, bool timeRemap, double startTime) {
@@ -272,6 +420,25 @@ ObjectId Document::addAudioAsset(const std::string& path, const std::string& nam
     a.path = path;
     a.name = name;
     a.duration = duration;
+    p.assets.push_back(a);
+    return a.id;
+}
+
+ObjectId Document::addVideoAsset(const std::string& path, const std::string& name, int width, int height, double duration,
+                                 double fps, bool hasAudio) {
+    for (const Asset& a : project_.assets)
+        if (a.path == path) return a.id;
+    Project& p = edit("Import");
+    Asset a;
+    a.id = p.allocateId();
+    a.kind = AssetKind::Video;
+    a.path = path;
+    a.name = name;
+    a.width = width;
+    a.height = height;
+    a.duration = duration;
+    a.fps = fps;
+    a.hasAudio = hasAudio;
     p.assets.push_back(a);
     return a.id;
 }
@@ -352,6 +519,16 @@ bool Document::setLayerVisible(ObjectId comp, ObjectId layer, bool visible) {
     if (!l0 || l0->visible == visible) return false;
     edit("Toggle Visibility");
     layerFor(comp, layer)->visible = visible;
+    return true;
+}
+
+bool Document::setLayerThreeD(ObjectId comp, ObjectId layer, bool threeD) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->threeD == threeD || l0->kind == LayerKind::Audio || l0->kind == LayerKind::Precomp ||
+        l0->kind == LayerKind::Camera)
+        return false;
+    edit(threeD ? "3D Layer" : "2D Layer");
+    layerFor(comp, layer)->threeD = threeD;
     return true;
 }
 
@@ -867,6 +1044,35 @@ std::vector<ObjectId> Document::duplicateLayers(ObjectId comp, const std::vector
     return insertLayers(comp, std::move(copies), {}, top);
 }
 
+std::vector<ObjectId> Document::splitLayers(ObjectId comp, const std::vector<ObjectId>& ids, double time) {
+    const Composition* c0 = project_.findComposition(comp);
+    if (!c0) return {};
+    const double t = c0->snapToFrame(time), fd = c0->frameDuration();
+    std::vector<ObjectId> splitting;
+    for (ObjectId id : ids)
+        if (const Layer* l = c0->findLayer(id);
+            l && t - l->inPoint >= fd - kTimeEps && l->outPoint - t >= fd - kTimeEps &&
+            std::find(splitting.begin(), splitting.end(), id) == splitting.end())
+            splitting.push_back(id);
+    if (splitting.empty()) return {};
+    Project& p = edit(splitting.size() == 1 ? "Split Layer" : "Split Layers");
+    Composition& c = *p.findComposition(comp);
+    std::vector<ObjectId> out;
+    for (ObjectId id : splitting) {
+        const int idx = c.indexOf(id);
+        Layer copy = c.layers[idx];  // keeps its name, like the halves of a cut clip
+        copy.id = p.allocateId();
+        for (Mask& m : copy.masks) m.id = p.allocateId();
+        for (Effect& e : copy.effects) e.id = p.allocateId();
+        for (TextAnimator& a : copy.animators) a.id = p.allocateId();
+        copy.inPoint = t;
+        c.layers[idx].outPoint = t;
+        c.layers.insert(c.layers.begin() + idx, std::move(copy));
+        out.push_back(c.layers[idx].id);
+    }
+    return out;
+}
+
 std::vector<ObjectId> Document::insertLayers(ObjectId comp, std::vector<Layer> layers, const std::vector<Asset>& assets,
                                              int atIndex) {
     if (!project_.findComposition(comp) || layers.empty()) return {};
@@ -1037,6 +1243,84 @@ bool Document::setMaskPath(ObjectId comp, ObjectId layer, ObjectId mask, const B
     m->path = path;
     m->shape = MaskShape::Path;
     return true;
+}
+
+bool Document::setMaskPathAt(ObjectId comp, ObjectId layer, ObjectId mask, double time, const BezierPath& path) {
+    Layer* l0 = layerFor(comp, layer);
+    const Mask* m0 = l0 ? l0->findMask(mask) : nullptr;
+    if (!m0 || path.empty()) return false;
+    const bool keyed = !m0->pathKeys.empty() || m0->pathTrack;
+    if (!keyed) return setMaskPath(comp, layer, mask, path);
+    const Composition* c = project_.findComposition(comp);
+    const double t = c ? c->snapToFrame(time) : time;
+    if (!m0->pathTrack) {
+        auto same = std::find_if(m0->pathKeys.begin(), m0->pathKeys.end(), [&](const PathKey& k) { return std::abs(k.time - t) < kTimeEps; });
+        if (same != m0->pathKeys.end() && same->path == path) return false;
+    }
+    edit("Edit Mask Path");
+    Mask& m = *layerFor(comp, layer)->findMask(mask);
+    if (m.pathTrack) {  // hand corrections on a tracked mask: it becomes keyframes, starting with this one
+        m.pathTrack.reset();
+        m.pathKeys.clear();
+    }
+    m.shape = MaskShape::Path;
+    auto it = std::find_if(m.pathKeys.begin(), m.pathKeys.end(), [&](const PathKey& k) { return std::abs(k.time - t) < kTimeEps; });
+    if (it != m.pathKeys.end()) {
+        it->path = path;
+    } else {
+        auto at = std::upper_bound(m.pathKeys.begin(), m.pathKeys.end(), t, [](double x, const PathKey& k) { return x < k.time; });
+        m.pathKeys.insert(at, PathKey{t, path});
+    }
+    m.path = path;
+    return true;
+}
+
+bool Document::setMaskPathAnimated(ObjectId comp, ObjectId layer, ObjectId mask, bool animated, double time) {
+    Layer* l0 = layerFor(comp, layer);
+    const Mask* m0 = l0 ? l0->findMask(mask) : nullptr;
+    if (!m0 || animated == (!m0->pathKeys.empty() || bool(m0->pathTrack))) return false;
+    const BezierPath now = maskPathAt(*m0, time);
+    if (now.empty()) return false;
+    edit(animated ? "Animate Mask Path" : "Stop Animating Mask Path");
+    Mask& m = *layerFor(comp, layer)->findMask(mask);
+    const Composition* c = project_.findComposition(comp);
+    m.shape = MaskShape::Path;
+    m.path = now;
+    m.pathTrack.reset();
+    m.pathKeys.clear();
+    if (animated) m.pathKeys.push_back({c ? c->snapToFrame(time) : time, now});
+    return true;
+}
+
+bool Document::removeMaskPathKey(ObjectId comp, ObjectId layer, ObjectId mask, double time) {
+    Layer* l0 = layerFor(comp, layer);
+    const Mask* m0 = l0 ? l0->findMask(mask) : nullptr;
+    if (!m0) return false;
+    auto it = std::find_if(m0->pathKeys.begin(), m0->pathKeys.end(), [&](const PathKey& k) { return std::abs(k.time - time) < 0.5 / 240; });
+    if (it == m0->pathKeys.end()) return false;
+    const size_t index = size_t(it - m0->pathKeys.begin());
+    edit("Delete Mask Path Key");
+    Mask& m = *layerFor(comp, layer)->findMask(mask);
+    m.path = m.pathKeys[index].path;
+    m.pathKeys.erase(m.pathKeys.begin() + index);
+    return true;
+}
+
+ObjectId Document::addTrackedMask(ObjectId comp, ObjectId layer, const PathTrack& track, const std::string& name) {
+    Layer* l0 = layerFor(comp, layer);
+    if (!l0 || l0->kind == LayerKind::Null || l0->kind == LayerKind::Audio || track.frames.empty()) return 0;
+    Project& p = edit("Roto Brush");
+    Layer& l = *layerFor(comp, layer);
+    Mask m;
+    m.id = p.allocateId();
+    m.shape = MaskShape::Path;
+    m.name = name.empty() ? "Roto Brush" : name;
+    for (int i = 0; i < kMaskParamCount; ++i) m.params[size_t(i)].value = maskParamDef(static_cast<MaskParam>(i)).defaultValue;
+    m.param(MaskParam::Feather).value = {2, 0, 0, 0};  // a soft edge hides the outline's steps
+    m.path = track.frames.front();
+    m.pathTrack = Shared<PathTrack>(track);
+    l.masks.push_back(std::move(m));
+    return l.masks.back().id;
 }
 
 bool Document::setKeyframeEase(ObjectId comp, ObjectId layer, PropRef prop, int index, bool outgoing, double influence,

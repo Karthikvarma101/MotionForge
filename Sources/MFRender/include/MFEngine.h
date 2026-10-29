@@ -9,7 +9,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, MFLayerKind) {
-    MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull, MFLayerKindText, MFLayerKindPrecomp, MFLayerKindAudio
+    MFLayerKindShape = 0, MFLayerKindImage, MFLayerKindNull, MFLayerKindText, MFLayerKindPrecomp, MFLayerKindAudio, MFLayerKindCamera
 };
 typedef NS_ENUM(NSInteger, MFShapeType) { MFShapeTypeRectangle = 0, MFShapeTypeEllipse, MFShapeTypePolygon, MFShapeTypeStar, MFShapeTypePath };
 typedef NS_ENUM(NSInteger, MFBlendMode) {
@@ -23,7 +23,8 @@ typedef NS_ENUM(NSInteger, MFProp) {
     MFPropAnchorPoint = 0, MFPropPosition, MFPropScale, MFPropRotation, MFPropOpacity,
     MFPropSize, MFPropRoundness, MFPropFillColor, MFPropStrokeColor, MFPropStrokeWidth,
     MFPropPoints, MFPropInnerRatio, MFPropFontSize, MFPropTracking, MFPropLineHeight,
-    MFPropTrimStart, MFPropTrimEnd, MFPropTrimOffset, MFPropTimeRemap, MFPropAudioLevel
+    MFPropTrimStart, MFPropTrimEnd, MFPropTrimOffset, MFPropTimeRemap, MFPropAudioLevel,
+    MFPropPositionZ, MFPropRotationX, MFPropRotationY, MFPropCameraZoom  // 3D layers and cameras
 };
 typedef NS_ENUM(NSInteger, MFMemoryPressure) { MFMemoryPressureNormal = 0, MFMemoryPressureWarning, MFMemoryPressureCritical };
 typedef NS_ENUM(NSInteger, MFEffectType) {
@@ -169,6 +170,9 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) BOOL inverted;
 @property(nonatomic, readonly) BOOL enabled;
 @property(nonatomic, readonly) NSArray<MFParamInfo*>* params;
+@property(nonatomic, readonly) BOOL pathAnimated;                    // rotoscoped: keyframed or tracked
+@property(nonatomic, readonly) BOOL tracked;                         // Roto Brush (one outline per frame)
+@property(nonatomic, readonly) NSArray<NSNumber*>* pathKeyTimes;     // keyframed path: key times
 @end
 
 @interface MFEffectCatalogEntry : NSObject
@@ -191,6 +195,9 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) double outPoint;
 @property(nonatomic, readonly) uint64_t parentID;
 @property(nonatomic, readonly) uint64_t assetID;
+@property(nonatomic, readonly) BOOL isVideo;   // image layer showing footage
+@property(nonatomic, readonly) BOOL threeD;    // the 3D switch (cameras are always 3D)
+@property(nonatomic, readonly) BOOL hasAudio;  // footage with sound (Audio Level applies)
 - (BOOL)isAnimated:(MFProp)prop;
 - (NSArray<MFKeyframeInfo*>*)keyframesFor:(MFProp)prop;
 - (BOOL)isAnimatedRef:(MFPropRef)ref;
@@ -229,6 +236,10 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) MFValue background;
 @property(nonatomic, readonly, copy) NSString* folder;  // "" = top level
 @property(nonatomic, readonly) NSInteger layerCount;
+// Work area (B / N): previews loop over it, Trim Comp to Work Area keeps it.
+@property(nonatomic, readonly) double workAreaStart;
+@property(nonatomic, readonly) double workAreaEnd;
+@property(nonatomic, readonly) BOOL hasWorkArea;
 // Compositions shown by this one's precomp layers (each once, in stack order).
 @property(nonatomic, readonly) NSArray<NSNumber*>* precompSources;
 @end
@@ -242,7 +253,10 @@ FOUNDATION_EXPORT NSInteger MFPropDimensions(MFProp prop);
 @property(nonatomic, readonly) BOOL missing;
 @property(nonatomic, readonly) BOOL loaded;
 @property(nonatomic, readonly) BOOL isAudio;
-@property(nonatomic, readonly) double duration;  // seconds (audio)
+@property(nonatomic, readonly) BOOL isVideo;     // footage: shown by image layers
+@property(nonatomic, readonly) double duration;  // seconds (audio, video)
+@property(nonatomic, readonly) double fps;       // video
+@property(nonatomic, readonly) BOOL hasAudio;    // video with sound
 @end
 
 // One stretch of an audio file on the active composition's timeline (from its audio layers, including
@@ -363,9 +377,33 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (BOOL)openProjectAtPath:(NSString*)path error:(NSError**)error;
 - (BOOL)saveProjectToPath:(NSString*)path error:(NSError**)error;        // marks the document clean
 - (BOOL)writeRecoveryCopyToPath:(NSString*)path error:(NSError**)error;  // autosave; leaves dirty state
+// Autosave without stalling playback: the project is copied here (cheap) and written on a
+// background queue; `completion` runs on the main queue. `markSaved` = YES saves the project file
+// (marking that revision clean if nothing changed since), NO writes a recovery copy.
+- (void)saveProjectInBackgroundToPath:(NSString*)path
+                            markSaved:(BOOL)markSaved
+                           completion:(void (^)(NSError* _Nullable error, double seconds))completion;
 - (BOOL)recoverFromPath:(NSString*)path error:(NSError**)error;          // opens an autosave as unsaved work
 - (void)markCleanForNewDocument;                                        // drop undo history, mark saved
 - (NSString*)serializedProjectRelativeTo:(nullable NSString*)directory;
+
+// ---- project bundles (File › Export / Import Project Bundle) ----
+// Writes the project and copies of its media into `directory` (new or empty). The result holds
+// "mediaFiles", "mediaBytes" and "missing" (names of media that couldn't be found).
+- (nullable NSDictionary<NSString*, id>*)writeBundleToDirectory:(NSString*)directory error:(NSError**)error;
+// The project file inside an unpacked bundle, after checking it is one and holds no links.
++ (nullable NSString*)projectPathInBundleDirectory:(NSString*)directory error:(NSError**)error;
++ (BOOL)isSafeBundleEntry:(NSString*)entry;  // a zip entry name that stays inside the bundle
+
+// ---- Claude tools (mf/Commands.hpp: the MCP server and the in-app Claude panel) ----
+// [{name, description, inputSchema, host}], as JSON.
++ (NSString*)claudeToolCatalogJSON;
+// Runs a document tool. Returns the answer as JSON, or nil with `error` set (a message for
+// Claude). `handled` is NO for host tools (render, import, save, export…), which the app runs.
+- (nullable NSString*)runClaudeTool:(NSString*)name
+                          arguments:(NSString*)argumentsJSON
+                            handled:(BOOL*)handled
+                              error:(NSString* _Nullable* _Nullable)error;
 
 // ---- undo ----
 @property(nonatomic, readonly) BOOL canUndo;
@@ -376,6 +414,7 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (BOOL)redo;
 - (void)beginUndoGroup:(NSString*)label;
 - (void)endUndoGroup;
+@property(nonatomic, readonly) BOOL inUndoGroup;  // an interactive edit (drag) is open
 
 // ---- composition ----
 @property(nonatomic, readonly) MFCompositionInfo* composition;
@@ -390,11 +429,19 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (uint64_t)addPrecompLayer:(uint64_t)sourceCompID NS_SWIFT_NAME(addPrecompLayer(source:));
 - (BOOL)setPrecompLayer:(uint64_t)layerID collapse:(BOOL)collapse timeRemap:(BOOL)timeRemap startTime:(double)startTime
     NS_SWIFT_NAME(setPrecomp(_:collapse:timeRemap:startTime:));
+// Work area of the shown composition, snapped to frames; end < 0 = to the end.
+- (BOOL)setWorkAreaStart:(double)start end:(double)end NS_SWIFT_NAME(setWorkArea(start:end:));
+- (BOOL)trimCompositionToWorkArea;  // the work area becomes the whole composition
+// Moves layers into a new composition and shows it as a layer in their place. Returns its id.
+- (uint64_t)precomposeLayers:(NSArray<NSNumber*>*)layerIDs name:(NSString*)name NS_SWIFT_NAME(precompose(_:name:));
 
 // ---- media ----
 - (NSArray<MFAssetInfo*>*)assets;
 - (nullable NSNumber*)importImageAtPath:(NSString*)path error:(NSError**)error;  // asset id
 - (nullable NSNumber*)importAudioAtPath:(NSString*)path error:(NSError**)error;  // asset id (WAV, MP3, AAC, AIFF, …)
+// Footage (MP4, MOV, M4V, … anything AVFoundation decodes: H.264, HEVC, ProRes, …). Asset id; add it with
+// addImageLayerWithAsset (footage plays in image layers).
+- (nullable NSNumber*)importVideoAtPath:(NSString*)path error:(NSError**)error;
 // The active composition's audible clips (cheap; compare to see whether the mix changed).
 - (NSArray<MFAudioClipInfo*>*)audioClips;
 - (BOOL)waitForMediaWithTimeout:(NSTimeInterval)seconds;               // tests / CLI only
@@ -402,14 +449,27 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 // ---- layers (index 0 = top of the stack) ----
 - (NSArray<MFLayerInfo*>*)layers;
 - (nullable MFLayerInfo*)layerWithID:(uint64_t)layerID;
+// Properties (MFProp) that are animated or changed from a new layer's values (the timeline's UU).
+- (NSArray<NSNumber*>*)modifiedPropertiesOfLayer:(uint64_t)layerID NS_SWIFT_NAME(modifiedProperties(layer:));
 - (uint64_t)addShapeLayer:(MFShapeType)shape;
 - (uint64_t)addImageLayerWithAsset:(uint64_t)assetID;
 - (uint64_t)addAudioLayerWithAsset:(uint64_t)assetID;  // starts at the composition's time 0
 - (uint64_t)addNullLayer;
+// A camera (3D layers are seen through the topmost one; a new one shows them exactly as 2D).
+- (uint64_t)addCameraLayer;
+// The 3D switch: Z Position and X / Y Rotation, seen through the camera (not for precomps or audio).
+- (BOOL)setLayer:(uint64_t)layerID threeD:(BOOL)threeD;
+// The viewer's Custom View of the 3D scene (orbiting the composition's centre), used for drawing,
+// hit testing and the overlays; clearViewOrbit goes back to the active camera. Export ignores it.
+- (void)setViewOrbitYaw:(double)yaw pitch:(double)pitch distance:(double)distance pan:(CGPoint)pan
+    NS_SWIFT_NAME(setViewOrbit(yaw:pitch:distance:pan:));
+- (void)clearViewOrbit;
 - (BOOL)removeLayer:(uint64_t)layerID;
 - (uint64_t)duplicateLayer:(uint64_t)layerID;
 - (BOOL)removeLayers:(NSArray<NSNumber*>*)layerIDs NS_SWIFT_NAME(removeLayers(_:));  // one undo step
 - (NSArray<NSNumber*>*)duplicateLayers:(NSArray<NSNumber*>*)layerIDs NS_SWIFT_NAME(duplicateLayers(_:));  // new ids, top first
+// Each layer running through `time` becomes two; returns the second halves (one undo step).
+- (NSArray<NSNumber*>*)splitLayers:(NSArray<NSNumber*>*)layerIDs atTime:(double)time NS_SWIFT_NAME(splitLayers(_:at:));
 - (BOOL)moveLayer:(uint64_t)layerID toIndex:(NSInteger)index;
 - (BOOL)setLayer:(uint64_t)layerID name:(NSString*)name;
 - (BOOL)setLayer:(uint64_t)layerID visible:(BOOL)visible;
@@ -453,6 +513,19 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
     NS_SWIFT_NAME(setLayer(_:pathVertices:closed:));
 - (uint64_t)addPathMaskWithVertices:(NSArray<MFPathVertex*>*)vertices layer:(uint64_t)layerID
     NS_SWIFT_NAME(addPathMask(vertices:layer:));
+// Rotoscoping. The mask's outline at `time` (layer space; rectangles and ellipses as paths too).
+- (NSArray<MFPathVertex*>*)pathOfMask:(uint64_t)maskID layer:(uint64_t)layerID time:(double)time
+    NS_SWIFT_NAME(maskPath(_:layer:time:));
+// Animated: writes the key at `time`; otherwise sets the outline. One undo step (inside a drag's group).
+- (BOOL)setMask:(uint64_t)maskID layer:(uint64_t)layerID pathVertices:(NSArray<MFPathVertex*>*)vertices time:(double)time
+    NS_SWIFT_NAME(setMaskPath(_:layer:vertices:time:));
+- (BOOL)setMask:(uint64_t)maskID layer:(uint64_t)layerID pathAnimated:(BOOL)animated time:(double)time
+    NS_SWIFT_NAME(setMaskPathAnimated(_:layer:animated:time:));
+- (BOOL)removeMaskPathKeyAtTime:(double)time mask:(uint64_t)maskID layer:(uint64_t)layerID
+    NS_SWIFT_NAME(removeMaskPathKey(at:mask:layer:));
+// Roto Brush: a new mask following one outline per frame from `start` at `rate` frames a second.
+- (uint64_t)addTrackedMaskToLayer:(uint64_t)layerID frames:(NSArray<NSArray<MFPathVertex*>*>*)frames start:(double)start
+                             rate:(double)rate name:(NSString*)name NS_SWIFT_NAME(addTrackedMask(layer:frames:start:rate:name:));
 // Composition space <-> a layer's own space at `time` (inverse of its full parent chain).
 - (CGPoint)compPoint:(CGPoint)p toLayer:(uint64_t)layerID time:(double)time NS_SWIFT_NAME(compToLayer(_:layer:time:));
 - (CGPoint)layerPoint:(CGPoint)p ofLayer:(uint64_t)layerID time:(double)time NS_SWIFT_NAME(layerToComp(_:layer:time:));
@@ -564,6 +637,32 @@ typedef NS_ENUM(NSInteger, MFExportFormat) {
 - (MFRenderStats*)stats;
 - (void)resetStats;
 
+@end
+
+// ---- live collaboration (mf/Sync.hpp) ---------------------------------------------------------
+// Keeps the engine's open project in step with a shared copy. Pieces travel as JSON:
+// [{"k": key, "v": value or null, "c": clock, "n": client}]. Call collectLocalChanges after every
+// local edit; remote pieces replace the open project in place (not an undo step: shared projects
+// undo per person, through undo / redo here).
+@interface MFCollabSync : NSObject
+- (instancetype)initWithEngine:(MFEngine*)engine clientID:(NSString*)clientID slot:(NSInteger)slot;
+- (instancetype)init NS_UNAVAILABLE;
+// "<sha256>.<ext>" of an asset's file ("" if unreadable), and where a media file lives on this Mac.
+@property(nonatomic, copy, nullable) NSString* (^mediaNameForAsset)(uint64_t assetID, NSString* path);
+@property(nonatomic, copy, nullable) NSString* (^pathForMedia)(NSString* media);
+- (NSString*)startSharing;                                          // every piece of the open project
+- (BOOL)joinWithPieces:(NSString*)json error:(NSError**)error;       // replaces the open project
+// Local edits since the last call ("[]" when nothing changed).
+@property(nonatomic, readonly) BOOL hasLocalChanges;
+- (NSString*)collectLocalChanges;
+// Applies other people's pieces. Local edits not yet collected come back in `pending` (send them).
+- (BOOL)applyRemotePieces:(NSString*)json pending:(NSString* _Nullable* _Nullable)pending;
+@property(nonatomic, readonly) BOOL canUndo;
+@property(nonatomic, readonly) BOOL canRedo;
+- (NSString*)undo;  // pieces to send
+- (NSString*)redo;
+- (BOOL)refreshMedia;  // media finished downloading
+@property(nonatomic, readonly) NSUInteger pieceCount;
 @end
 
 NS_ASSUME_NONNULL_END

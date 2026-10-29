@@ -223,10 +223,23 @@ private struct RulerView: View {
     @ObservedObject var time: TimeModel
     @ObservedObject var perf: PerfModel
     let mapper: TimeMapper
+    private enum Grab { case scrub, workStart, workEnd }
+    @State private var grab: Grab?
+
+    static let workBarHeight: CGFloat = 5
 
     var body: some View {
         Canvas { ctx, size in
             let fps = model.comp.fps
+            // Work area (B / N): a bar along the top, dimmed outside; drag its ends to change it.
+            let c = model.comp
+            let w0 = mapper.x(c.workAreaStart), w1 = mapper.x(c.workAreaEnd)
+            if c.hasWorkArea {
+                ctx.fill(Path(CGRect(x: 0, y: 0, width: max(0, w0), height: size.height)), with: .color(.black.opacity(0.28)))
+                ctx.fill(Path(CGRect(x: w1, y: 0, width: max(0, size.width - w1), height: size.height)), with: .color(.black.opacity(0.28)))
+            }
+            ctx.fill(Path(roundedRect: CGRect(x: w0, y: 0, width: max(2, w1 - w0), height: Self.workBarHeight), cornerRadius: 2),
+                     with: .color(Theme.accent.opacity(c.hasWorkArea ? 0.75 : 0.22)))
             let frameW = mapper.pxPerSecond / CGFloat(fps)
             // Pick a tick step (in frames) at least ~8 px apart; label every 5th-ish step.
             let candidates: [Double] = [1, 2, 5, 10, 15, fps, fps * 2, fps * 5, fps * 10, fps * 30, fps * 60]
@@ -265,10 +278,36 @@ private struct RulerView: View {
         }
         .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 0).onChanged { g in
-            time.isPlaying = false
-            time.time = model.snap(mapper.t(g.location.x))
+            if grab == nil {
+                let c = model.comp
+                let near0 = abs(g.startLocation.x - mapper.x(c.workAreaStart)) <= 6
+                let near1 = abs(g.startLocation.x - mapper.x(c.workAreaEnd)) <= 6
+                if g.startLocation.y <= Self.workBarHeight + 4 && (near0 || near1) {
+                    grab = near1 && (!near0 || g.startLocation.x > mapper.x(c.workAreaEnd)) ? .workEnd : .workStart
+                    model.engine.beginUndoGroup("Work Area")
+                } else {
+                    grab = .scrub
+                }
+            }
+            let t = model.snap(mapper.t(g.location.x))
+            switch grab {
+            case .workStart?:
+                let end = model.comp.hasWorkArea ? model.comp.workAreaEnd : -1
+                model.edit { _ = $0.setWorkArea(start: min(t, model.comp.workAreaEnd - model.frameDuration), end: end) }
+            case .workEnd?:
+                model.edit { _ = $0.setWorkArea(start: model.comp.workAreaStart, end: max(t, model.comp.workAreaStart + model.frameDuration)) }
+            default:
+                time.isPlaying = false
+                time.time = t
+            }
+        }.onEnded { _ in
+            if grab == .workStart || grab == .workEnd {
+                model.engine.endUndoGroup()
+                model.refresh()
+            }
+            grab = nil
         })
-        .help("Drag to scrub")
+        .help("Drag to scrub · drag the ends of the bar on top to set the work area (B / N)")
     }
 }
 
@@ -322,7 +361,8 @@ private struct LayerRows: View {
     let marquee: MarqueeModel
 
     var body: some View {
-        let expanded = model.expandedLayers.contains(layer.layerID)
+        let specs = trackSpecs
+        let expanded = model.propertyReveal[layer.layerID] != nil ? !specs.isEmpty : model.expandedLayers.contains(layer.layerID)
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 LayerNameCell(model: model, layer: layer, expanded: expanded)
@@ -334,7 +374,7 @@ private struct LayerRows: View {
             .background(model.selection == layer.layerID ? Theme.rowSelected.opacity(0.55)
                         : model.selectedLayers.contains(layer.layerID) ? Theme.rowSelected.opacity(0.32) : Theme.row)
             if expanded {
-                ForEach(trackSpecs) { spec in
+                ForEach(specs) { spec in
                     PropertyTrackRow(model: model, time: time, layer: layer, spec: spec, mapper: mapper, marquee: marquee)
                 }
             }
@@ -343,13 +383,27 @@ private struct LayerRows: View {
     }
 
     private func isCoreTransform(_ p: MFProp) -> Bool {
-        [.anchorPoint, .position, .scale, .rotation, .opacity].contains(p)
+        [.anchorPoint, .position, .positionZ, .scale, .rotationX, .rotationY, .rotation, .opacity, .cameraZoom].contains(p)
     }
 
     /// Transform rows always; other layer properties, mask and effect parameters once animated.
+    /// A property key (P, R, S, T, A, U, UU) narrows that to what it asked for.
     private var trackSpecs: [ParamSpec] {
-        layer.editableProps.filter { layer.isAnimated($0) || isCoreTransform($0) || $0 == .audioLevel }.map(ParamSpec.init)
-            + layer.animatedEffectAndMaskParams.map(ParamSpec.init)
+        switch model.propertyReveal[layer.layerID] {
+        case .props(let props)?:
+            // On a 3D layer P also shows Z, R all three rotations.
+            let wanted = Set(props + (props.contains(.position) ? [.positionZ] : []) + (props.contains(.rotation) ? [.rotationX, .rotationY] : []))
+            return layer.editableProps.filter(wanted.contains).map(ParamSpec.init)
+        case .animated?:
+            return layer.editableProps.filter { layer.isAnimated($0) || layer.isBakedRef(.layer($0)) }.map(ParamSpec.init)
+                + layer.animatedEffectAndMaskParams.map(ParamSpec.init)
+        case .modified?:
+            let changed = Set(model.engine.modifiedProperties(layer: layer.layerID).compactMap { MFProp(rawValue: $0.intValue) })
+            return layer.editableProps.filter(changed.contains).map(ParamSpec.init) + layer.animatedEffectAndMaskParams.map(ParamSpec.init)
+        case nil:
+            return layer.editableProps.filter { layer.isAnimated($0) || isCoreTransform($0) || $0 == .audioLevel }.map(ParamSpec.init)
+                + layer.animatedEffectAndMaskParams.map(ParamSpec.init)
+        }
     }
 }
 
@@ -372,8 +426,26 @@ private struct LayerNameCell: View {
             }
             .buttonStyle(.plain)
             .help(layer.kind == .audio ? "Mute / unmute" : "Show / hide")
+            if layer.kind == .camera {
+                Image(systemName: "cube.fill").foregroundStyle(Theme.accent).frame(width: 14).help("Cameras are 3D")
+            } else if layer.kind != .audio && layer.kind != .precomp {
+                Button { model.edit { _ = $0.setLayer(layer.layerID, threeD: !layer.threeD) } } label: {
+                    Image(systemName: layer.threeD ? "cube.fill" : "cube").foregroundStyle(layer.threeD ? Theme.accent : .secondary.opacity(0.5))
+                        .frame(width: 14)
+                }
+                .buttonStyle(.plain)
+                .help(layer.threeD ? "3D layer: click for 2D" : "Make it a 3D layer (Z Position, X / Y Rotation, camera)")
+            } else {
+                Color.clear.frame(width: 14)
+            }
             Button {
-                if expanded { model.expandedLayers.remove(layer.layerID) } else { model.expandedLayers.insert(layer.layerID) }
+                if model.propertyReveal.removeValue(forKey: layer.layerID) != nil {  // back to the usual rows
+                    if expanded { model.expandedLayers.remove(layer.layerID) } else { model.expandedLayers.insert(layer.layerID) }
+                } else if expanded {
+                    model.expandedLayers.remove(layer.layerID)
+                } else {
+                    model.expandedLayers.insert(layer.layerID)
+                }
             } label: {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .bold))
                     .frame(width: 12)
@@ -406,6 +478,7 @@ private struct LayerNameCell: View {
                     }
                     .help(layer.kind == .precomp ? "Double-click to open this precomp" : "Double-click to rename")
             }
+            if let collab = model.collab { LayerPresenceDots(collab: collab, layer: layer.layerID) }
             Spacer(minLength: 4)
             if layer.parentID != 0, let p = model.layers.first(where: { $0.layerID == layer.parentID }) {
                 Label(p.name, systemImage: "link").labelStyle(.titleAndIcon)
@@ -528,6 +601,15 @@ private struct LayerBar: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        // Sliding the bar out of view cancels the gesture without onEnded: finish the drag here, or
+        // the undo group stays open and the next drag starts from a stale origin.
+        .onChange(of: x1 > x0) { _, visible in
+            if !visible, drag != nil {
+                drag = nil
+                groupStart = [:]
+                model.engine.endUndoGroup()
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             // The second click of a double-click (or trackpad double tap) opens a precomp. Reading the
@@ -545,7 +627,7 @@ private struct LayerBar: View {
 
     private var handle: some View {
         Rectangle().fill(Color.white.opacity(0.001)).frame(width: 6, height: TimelineView.rowHeight)
-            .onHover { inside in if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
+            .pointerStyle(.columnResize)
     }
 
     private enum Mode { case move, trimIn, trimOut }

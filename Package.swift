@@ -5,6 +5,7 @@
 //   MFRender   Obj-C++ Metal renderer + Objective-C bridge (MFEngine) for Swift
 //   MotionForge Swift  SwiftUI/AppKit editor
 //   mftests / mfbench / mfcli   test runner, renderer benchmark, headless render/project tool
+//   mfmcp      MCP server Claude starts; bundled in MotionForge.app/Contents/MacOS
 import PackageDescription
 
 let package = Package(
@@ -15,6 +16,7 @@ let package = Package(
         .executable(name: "mftests", targets: ["mftests"]),
         .executable(name: "mfbench", targets: ["mfbench"]),
         .executable(name: "mfcli", targets: ["mfcli"]),
+        .executable(name: "mfmcp", targets: ["mfmcp"]),
     ],
     targets: [
         .target(
@@ -31,6 +33,7 @@ let package = Package(
                 .linkedFramework("CoreText"),
                 .linkedFramework("UniformTypeIdentifiers"),
                 .linkedFramework("AVFoundation"), .linkedFramework("CoreMedia"), .linkedFramework("CoreVideo"),
+                .linkedFramework("AppKit"),  // SVG / PDF artwork
             ]
         ),
         .executableTarget(
@@ -42,6 +45,8 @@ let package = Package(
         .executableTarget(name: "mftests", dependencies: ["MFRender", "MFCore"]),
         .executableTarget(name: "mfbench", dependencies: ["MFRender", "MFCore"]),
         .executableTarget(name: "mfcli", dependencies: ["MFRender", "MFCore"], linkerSettings: [.linkedFramework("CoreText")]),
+        // MCP server (stdio) for Claude Desktop / Claude Code; forwards tool calls to the running app.
+        .executableTarget(name: "mfmcp", dependencies: ["MFCore"]),
     ],
     cxxLanguageStandard: .cxx20
 )

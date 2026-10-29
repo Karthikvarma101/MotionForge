@@ -41,9 +41,24 @@ enum RecoveryStore {
         try data.write(to: infoURL, options: .atomic)
     }
 
+    /// Before a background autosave writes `autosaveURL`: records which project it belongs to.
+    static func prepare(originalURL: URL?) {
+        ensureDirectory()
+        let info: [String: String] = [
+            "originalPath": originalURL?.path ?? "",
+            "date": ISO8601DateFormatter().string(from: Date()),
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted]) {
+            try? data.write(to: infoURL, options: .atomic)
+        }
+    }
+
     static func pendingRecovery() -> Pending? {
         let fm = FileManager.default
         guard fm.fileExists(atPath: lockURL.path), fm.fileExists(atPath: autosaveURL.path) else { return nil }
+        // Another copy of MotionForge that is still running owns the lock: that's not a crash.
+        if let pid = (try? String(contentsOf: lockURL, encoding: .utf8)).flatMap({ Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }),
+           pid != ProcessInfo.processInfo.processIdentifier, kill(pid, 0) == 0 { return nil }
         var original: URL?
         var date = (try? fm.attributesOfItem(atPath: autosaveURL.path)[.modificationDate] as? Date) ?? Date()
         if let data = try? Data(contentsOf: infoURL),

@@ -37,14 +37,24 @@ enum RecentProjects {
         return thumbnailDirectory.appendingPathComponent(String(h, radix: 16) + ".png")
     }
 
+    /// Posted when the list or a thumbnail changes, so Home can update while it's showing.
+    static let changed = Notification.Name("MotionForgeRecentProjectsChanged")
+
+    /// One entry that doesn't decode (an older format) is skipped rather than losing the whole list.
+    private struct Lenient: Decodable {
+        let value: RecentProject?
+        init(from decoder: Decoder) throws { value = try? RecentProject(from: decoder) }
+    }
+
     static func all() -> [RecentProject] {
         guard let data = UserDefaults.standard.data(forKey: key),
-              let list = try? JSONDecoder().decode([RecentProject].self, from: data) else { return [] }
-        return list.sorted { $0.opened > $1.opened }
+              let list = try? JSONDecoder().decode([Lenient].self, from: data) else { return [] }
+        return list.compactMap(\.value).sorted { $0.opened > $1.opened }
     }
 
     private static func store(_ list: [RecentProject]) {
         if let data = try? JSONEncoder().encode(Array(list.prefix(limit))) { UserDefaults.standard.set(data, forKey: key) }
+        NotificationCenter.default.post(name: changed, object: nil)
     }
 
     /// Records `url` as just opened or saved, with a thumbnail of the active composition at `time`
@@ -68,6 +78,7 @@ enum RecentProjects {
         engine.renderMotionBlur = false  // a thumbnail doesn't need it, and stays instant
         let ok = (try? engine.writePNG(atTime: time, scale: scale, transparent: false, toPath: thumbnailURL(for: path).path)) != nil
         engine.renderMotionBlur = was
+        if ok { NotificationCenter.default.post(name: changed, object: nil) }
         if !ok, attemptsLeft > 1 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 MainActor.assumeIsolated { renderThumbnail(path, engine: engine, time: time, attemptsLeft: attemptsLeft - 1) }

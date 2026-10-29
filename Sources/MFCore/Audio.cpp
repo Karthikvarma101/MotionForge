@@ -21,10 +21,13 @@ constexpr double kGainStep = 0.1;  // seconds between gain samples of an animate
 void collect(const Project& p, const Composition& c, double offset, double w0, double w1, int depth,
              std::vector<AudioClip>& out) {
     for (const Layer& l : c.layers) {
-        if (l.kind == LayerKind::Audio) {
-            if (!l.visible) continue;  // the speaker switch
+        const Asset* footage = l.kind == LayerKind::Image ? p.findAsset(l.asset) : nullptr;
+        if (l.kind == LayerKind::Audio || (footage && footage->isVideo() && footage->hasAudio)) {
+            // Audio layers: the speaker switch. Video plays its sound whether or not the picture
+            // is shown (as in After Effects); its Audio Level turns it down.
+            if (l.kind == LayerKind::Audio && !l.visible) continue;
             const Asset* a = p.findAsset(l.asset);
-            if (!a || a->missing || a->kind != AssetKind::Audio || a->duration <= 0) continue;
+            if (!a || a->missing || (a->kind != AssetKind::Audio && !a->hasAudio) || a->duration <= 0) continue;
             const double s = std::max({l.inPoint, l.startTime, w0 - offset});
             const double e = std::min({l.outPoint, l.startTime + a->duration, w1 - offset});
             if (e - s < 1e-4) continue;

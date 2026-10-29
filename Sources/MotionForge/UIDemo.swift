@@ -74,6 +74,7 @@ enum UIDemo {
 
                 // Autosave the unsaved edits and read the recovery file back with a second engine.
                 model.autosaveIfNeeded()
+                while model.autosaveBusy { try? await Task.sleep(nanoseconds: 50_000_000) }  // written in the background
                 var recovered = -1.0
                 if let probe = try? MFEngine(device: model.engine.device),
                    (try? probe.recover(fromPath: RecoveryStore.autosaveURL.path)) != nil,

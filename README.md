@@ -63,6 +63,13 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | `scripts/ui-demo-audio.sh project.mfproj` | Select the audible audio layer (waveform, inspector), play and compare the picture with the audio clock, show the account card, run a 60 s export in the export window. Screenshots (plus offscreen `-view.png` renders, which Stage Manager can't shrink) go to `build/ui-demo-audio/`. While it runs the app ignores the keyboard |
 | `swift build -c release` | Build every target without bundling |
 | `scripts/make-icon.sh` | Rebuild `Resources/AppIcon.icns` from the brand artwork in `Resources/Brand/` |
+| `scripts/ui-demo-features.sh` | In-app check of hiding panels, the Claude panel, bundle export/import and 2 s auto save; screenshots and `features.json` in `build/ui-demo-features/`, non-zero exit on failure |
+| `scripts/ui-demo-shortcuts.sh` | In-app check of the After Effects shortcuts: every menu key equivalent (and that none clash), tool keys, property reveal, work area, RAM Preview, split, pre-compose, trim, the viewer tools, the shortcut sheet and Preferences (`build/ui-demo-shortcuts/`) |
+| `scripts/ui-demo-media.sh` | Generated clip, PNG and SVG imported the normal way, frames checked, Roto Brush following the subject, a mask rotoscoped by hand in the viewer, a video export (`build/ui-demo-media/`) |
+| `scripts/ui-demo-3d.sh` | 3D cards and a 2D title, a moving camera, the Custom View and Orbit tool, an export of the move (`build/ui-demo-3d/`) |
+| `scripts/ui-demo-update.sh` | The updater end to end with a local fake 9.9.9 release: Home finds it, unsigned / other / older apps are refused, it installs over a throwaway copy (`build/ui-demo-update/`) |
+| `scripts/ui-demo-collab.sh` | Live collaboration against the real server with your signed-in (Pro) account: share, a second editor joins, live edits both ways, per-person undo, simultaneous edits, a late joiner, stop sharing |
+| `.build/release/mfmcp` | The MCP server Claude starts (bundled in the app); `--version` prints the tool count |
 | `make dmg` | Build the app, then pack it into `build/MotionForge.dmg`, the drag-to-Applications disk image that releases ship (`scripts/make-dmg.sh`; the window layout comes from dmgbuild, fetched with `uvx`, so it needs [uv](https://docs.astral.sh/uv/)) |
 
 ## Using it
@@ -76,8 +83,73 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Skipping the animation:** click to skip it. With *Reduce Motion* on it's a plain fade.
     Opening a project file from Finder goes straight to the workspace.
 
-- **Add layers**: toolbar or *Layer* menu (rectangle, ellipse, polygon, star, null, text); import
-  images with ⌘I, the toolbar, or by dropping files on the viewer / project panel.
+- **Claude**: two ways to have Claude edit the open project. Every change shows up live and is one
+  undo step.
+  - **From Claude Desktop or Claude Code (MCP):** *Claude → Connect Claude Desktop…* adds MotionForge's
+    MCP server (`MotionForge.app/Contents/MacOS/mfmcp`) to Claude's settings. *Copy Claude Code
+    Command* gives `claude mcp add motionforge -- …`. This uses your Claude plan; no API key.
+  - **In the app:** the Claude panel (✨ in the toolbar, ⇧⌘L) chats with Claude using your own Anthropic
+    API key, stored in the Keychain. The default model is Claude Opus 5.5, with Sonnet and Haiku in the
+    panel's menu.
+  - **What Claude can do (30 tools, `mf/Commands.hpp`):** inspect the project; create and change
+    compositions, layers, text, effects, masks and text animators; animate with keyframes and easing;
+    render a frame to look at its own work; import media; save, open and export (Pro); undo.
+- **Collaboration (Pro)**: edit a project together with friends at the same time.
+  - **Friends:** add people by the email they sign in with (*Share → Friends…*, or Home).
+  - **Sharing:** *Share* (toolbar) → *Start Sharing* uploads the project and its images and audio
+    (each file up to 50 MB). Then invite friends.
+  - **Joining:** invitations appear on Home under *Shared*.
+  - **Live editing:** edits appear live for everyone. Avatars in the toolbar show who's there, and dots
+    in the timeline show the layers they have selected. Undo only undoes your own changes.
+  - **Conflicts:** two people changing the same property at once: the last change wins, the same on
+    every Mac.
+  - **Pro check:** everyone in a shared project needs Pro (the free trial counts), checked by the
+    server.
+- **Auto save**: every 2 s, unsaved changes are written into the project file (*File → Auto Save Every
+  2 Seconds*, on by default).
+  - **Untitled projects** go to a crash-recovery copy instead.
+  - **No hitches:** saving runs in the background, so even very large projects don't stall playback.
+    Nothing is written mid-drag.
+- **Project bundles**: *File → Export Project Bundle…* writes one `.mfbundle` file holding the project
+  and a copy of every image and audio file it uses.
+  - **Importing:** *File → Import Project Bundle…*, or double-click the file. It unpacks into a folder
+    you choose and opens, on any Mac.
+- **Hide panels**: the toolbar's panel buttons, or *View*:
+  - Project Panel ⌥⌘1, Timeline ⌥⌘2, Inspector ⌥⌘3, Status Bar ⌥⌘4.
+  - ⌥⌘0 hides every panel around the viewer, then brings them back.
+- **Add layers**: toolbar or *Layer* menu (rectangle, ellipse, polygon, star, null, text, camera);
+  import media with ⌘I, the toolbar, or by dropping files on the viewer / project panel.
+- **Footage and images**: video (MOV, MP4, M4V, MPG, MTS/AVCHD, TS, DV, 3GP: H.264, HEVC, ProRes and
+  whatever else AVFoundation decodes) comes in as footage: an image layer that plays the clip, with
+  its sound (Audio Level turns it down) and phone rotation applied; HDR is converted to the Rec. 709
+  working space. Frames are decoded on the GPU (VideoToolbox) a few ahead of the playhead; export waits
+  for each exact frame. Slide a clip in time like an audio layer. Images: everything ImageIO reads
+  (PNG, JPEG, HEIC/HEIF, AVIF, WebP, JPEG XL, TIFF, GIF, BMP, PSD, TGA, OpenEXR, DDS, ICO, JPEG 2000,
+  camera RAW from Canon, Nikon, Sony, Fuji, DNG …) plus SVG and PDF artwork (drawn at about 1000 px).
+  MKV and WebM aren't read (AVFoundation can't open them).
+- **After Effects keys**: *Help → Keyboard Shortcuts* (⌘/) lists them all. Tools: V selection, H hand,
+  Z zoom, W rotation, C orbit camera, Y pan behind (anchor point), G pen, Q shape (again: next shape),
+  ⌘T type. B / N set the work area (a bar on the ruler; drag its ends): playback loops over it, the
+  export window defaults to it, *Composition → Trim Comp to Work Area* (⇧⌘X) keeps just it. 0 (keypad)
+  is RAM Preview: every work-area frame is rendered once, then it plays in real time. P R S T A show
+  one property in the timeline (⇧ adds), U the animated ones, UU the modified ones. ⇧⌘D Split Layer,
+  ⇧⌘C Pre-compose, ⌥⌘Z / ⇧⌥⌘Z Step Backward / Forward, ⌥⌘N New Project, ⌘N New Composition,
+  ⌥⌘M Export with Last Settings, ⌥⌘; Preferences. Letter keys follow the keyboard layout.
+- **Rotoscoping**: press the stopwatch on a mask's *Mask Path* row, then move its points in the viewer
+  at other frames: each move is a key and the outline morphs between them point by point (‹ › jump
+  between keys, ◇ adds one, ◆ deletes it). *Roto Brush* (inspector, image and video layers) finds the
+  *Main Subject* or *People* in every frame of the work area with Apple's Vision and makes a mask that
+  follows it, one outline per frame; moving one of its points by hand turns it into keyframes.
+- **3D**: the cube switch on a timeline layer (or *Layer → 3D Layer*) adds Z Position and X / Y
+  Rotation; layers are then seen in perspective, far ones painted first. *Layer → New Camera* (⌥⇧⌘C)
+  adds a camera (position, Z, X / Y / Z rotation, zoom; parent it to a null for rigs); a new one shows
+  everything exactly as 2D, and without one a default 50 mm camera does. 2D layers ignore cameras.
+  The viewer's *Custom View* (or the Orbit Camera tool, C: drag to orbit, ⌥-drag to dolly, ⇧-drag to
+  pan) looks at the scene from anywhere; renders and exports always use the active camera.
+- **Updates**: when a newer release is on GitHub, Home says so with its notes. *Update Now* downloads
+  the disk image, checks it is MotionForge signed by the same developer and newer, replaces this copy
+  and reopens (or opens the disk image to drag in when the app's folder isn't writable). It checks at
+  most every six hours; *MotionForge → Check for Updates…* checks now.
 - **Viewer**: click to select, drag to move (Shift constrains to an axis; parented layers move
   in their parent's space), drag empty space or scroll to pan, pinch or ⌘-scroll to zoom.
   Arrow keys nudge 1 px (Shift: 10 px).
@@ -208,7 +280,7 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   (shifted by Offset), with a Square, Ramp Up, Ramp Down, Triangle, Round or Smooth shape;
   keyframe Start, End or Offset to sweep the effect across the text (a typewriter is Start
   0 → 100). Characters moved by an animator stay inside their layer's effects and masks.
-- **Pen tool**: *Pen* in the toolbar or P (V or Esc returns to selection). Click for a corner
+- **Pen tool**: *Pen* in the toolbar or G (V or Esc returns to selection). Click for a corner
   point, drag for a smooth point with handles, click the first point to close the shape, Return
   for an open line. The toolbar switch next to it chooses *New Shape* (a new path layer) or
   *Mask on Layer* (a bezier mask on the selected layer). Afterwards, drag points and handles of the
@@ -244,6 +316,9 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 | Position / scale / opacity edits change the rendered pixels correctly | `mftests` reads back real Metal output: centroid moves to the new position within 0.05 px, scale 150%×50% gives exactly 300×50 px coverage, 50% opacity gives peak alpha 0.500, 90° rotation swaps extents. `make sample` writes [Examples/demo/demo-sheet.png](Examples/demo/demo-sheet.png): measured area 94,626 px vs 94,627 analytic, centroid (1400.00, 300.00) after the move, ×2.25 area at 150%, peak alpha 0.400 at 40%. |
 | The GUI does it end to end | `scripts/ui-demo.sh`: a click in the viewer selects the star, a drag moves it by exactly (+260, −140) px, scale/opacity edits apply, 3× undo restores the original, the layer's keyframes show in the timeline. Screenshots of every step are in `build/ui-demo/`. |
 | Undo/redo, drag = one undo step | `undo_redo_and_groups` test; UI demo undo step |
+| Collaboration merges edits the same way on every Mac | `sync_*` tests: two Macs sharing a project converge after concurrent edits to different properties, the same property, adding and reordering layers (40 moves), and delete-while-editing; undo only reverts your own steps and leaves newer edits by others; a drag is one undo step; downloaded media resolves; the server's reordered JSON doesn't cause re-sends |
+| Claude's tools | `claude_*` tests: the catalog's 30 schemas; a title animation with easing, an effect and parameters built by name; one undo step per call; bad layers, properties and values are refused with a message. Live: `mfmcp` drove the running app (create a comp, an eased text slide, an ellipse with glow, `render_frame` returning the PNG, undo) |
+| Bundles, auto save, panels | `bundle_round_trip_with_media` (two files with the same name, a shared file, a missing file; moved to another folder and opened; links and `..` refused). `scripts/ui-demo-features.sh` in the real app: focus viewer hides and restores the panels, the Claude panel opens, a bundle with an image is exported, the original deleted, imported and opened with nothing missing, and an edit reached the project file within 2 s with no save |
 | Save → reopen is lossless; projects survive being moved | `project_file_roundtrip_and_portability` test (moves the project folder: relative media paths win; missing media is flagged, not fatal); UI demo save/reopen gives a byte-identical document |
 | Autosave + crash recovery | UI demo: autosave written, read back by a second engine (opacity 40 restored), and the relaunch check reports a recovery would be offered. The recovery prompt dialog itself was not clicked through. |
 | Real-time playback | UI demo: 4 s of playback of the starter scene presented 30 of 30 fps with 0 dropped frames |
@@ -373,11 +448,15 @@ MotionForge/
 ├── scripts/ui-demo.sh         scripted end-to-end GUI check with screenshots
 ├── scripts/make-icon.*        app icon from the brand artwork (transparent cut-out on Apple's grid)
 ├── scripts/make-dmg.sh        build/MotionForge.app → build/MotionForge.dmg (+ dmg-settings.py, make-dmg-background.swift)
+├── supabase/migrations/       accounts, Pro, admin console, trial, collaboration (friends, shared projects, live sync)
 ├── Resources/                 AppIcon.icns; Brand/ = source icon, 1024 px master, wordmark
 ├── Sources/
 │   ├── MFCore/                C++20, no platform dependencies
 │   │   ├── include/mf/Math.hpp        2D affine math
 │   │   ├── include/mf/Model.hpp       project / composition / layer / keyframe model
+│   │   ├── Commands.cpp               Claude's tools: catalog (JSON Schema) + runner, one undo step per call
+│   │   ├── Sync.cpp                   collaboration: project ↔ keyed pieces, last-writer-wins merge, per-person undo
+│   │   ├── Bundle.cpp                 .mfbundle folder: project + copied media, safety checks on import
 │   │   ├── Audio.cpp                  audio layers (through precomps) → clips with gain breakpoints
 │   │   ├── Model.cpp                  property defs, keyframe interpolation (linear, hold, bezier)
 │   │   ├── Evaluator.cpp              timeline → flat draw list + 64-bit content hash, hit testing
@@ -406,6 +485,11 @@ MotionForge/
 │   │   ├── HomeView.swift             launch animation (vector logo) + Home window with recent projects
 │   │   ├── RecentProjects.swift       recent-project list and thumbnails
 │   │   ├── AccountModel.swift         Google sign-in (Supabase), Keychain session, Pro entitlement, Razorpay checkout
+│   │   ├── ClaudeTools.swift          runs Claude's tools in the editor; the local MCP bridge socket
+│   │   ├── ClaudePanel.swift          in-app Claude chat (Messages API) and Claude Desktop / Code setup
+│   │   ├── Collab.swift               shared-project session: Realtime channel, server calls, media sync
+│   │   ├── CollabViews.swift          friends, Share sheet, Home "Shared", presence avatars and dots
+│   │   ├── ProjectBundle.swift        File › Export / Import Project Bundle
 │   │   ├── AccountViews.swift         account avatar + card, Pro paywall sheet
 │   │   ├── GraphEditorView.swift      value curves with ease / speed handles
 │   │   ├── NodeGraphView.swift        node workspace (layer stack as Source → Masks → Effects → Composite)
@@ -416,7 +500,8 @@ MotionForge/
 │   │   └── UIDemo.swift               scripted UI check used by scripts/ui-demo.sh
 │   ├── mftests/               test runner (core + GPU readback)
 │   ├── mfbench/               renderer benchmark
-│   └── mfcli/                 headless tool: info, render PNG, PNG sequence, demo, effects-demo, phase4-demo
+│   ├── mfcli/                 headless tool: info, render PNG, PNG sequence, demo, effects-demo, phase4-demo
+│   └── mfmcp/                 MCP server (stdio) for Claude; forwards tool calls to the running app
 ├── benchmarks/                benchmark results; ab/ = interleaved shader A/B harness
 ├── Examples/demo/             position/scale/opacity demo renders + demo.mfproj
 ├── Examples/effects/          effects / mask / matte contact sheet

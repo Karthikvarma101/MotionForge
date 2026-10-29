@@ -33,6 +33,7 @@
 namespace mf {
 
 class GlyphSheetCache;
+class VideoDecoder;
 
 struct PresentParams {
     double originX = 0, originY = 0;  // composition top-left, drawable pixels
@@ -83,6 +84,10 @@ public:
     bool loadImageSync(ObjectId asset, uint32_t generation, const std::string& path, std::string& error);
     bool hasImage(ObjectId asset, uint32_t generation) const;
     bool imagePending(ObjectId asset, uint32_t generation) const;
+    // Video footage: frames are decoded on demand (and a few ahead) once the clip is registered.
+    void registerVideo(ObjectId asset, uint32_t generation, const std::string& path, double fps, int64_t frameCount);
+    // Export, tests, CLI: decodes every video frame `f` shows (nested precomps and mattes too).
+    bool prepareVideoFrames(const FrameDesc& f, double timeoutSeconds, std::string& error);
 
     // ---- compositing --------------------------------------------------------------------
     // Returns the frame. On a cache hit the texture belongs to the cache; otherwise the composite
@@ -141,6 +146,9 @@ private:
     id<MTLBuffer> acquireBuffer(size_t bytes);
     void recycleBuffer(id<MTLBuffer> b);
     id<MTLTexture> imageTexture(ObjectId asset, uint32_t generation) const;
+    // The frame `d` shows, or a stand-in (*exact = false) while it decodes.
+    id<MTLTexture> videoTexture(const DrawItem& d, bool* exact) const;
+    std::shared_ptr<VideoDecoder> videoDecoder(ObjectId asset, uint32_t generation) const;
     id<MTLRenderPipelineState> presentPipeline(MTLPixelFormat format);
     bool decodeAndUpload(ObjectId asset, uint32_t generation, const std::string& path, std::string& error);
     bool admitLocked(const FrameDesc& f) const;
@@ -186,6 +194,7 @@ private:
     bool fbFetch_ = false;
     double compileMs_ = 0;
 
+    dispatch_group_t decodes_ = dispatch_group_create();  // image decodes in flight (they use `this`)
     mutable std::mutex mutex_;  // guards everything below (Metal completion handlers run on other threads)
     LruCache<uint64_t, id<MTLTexture>> cache_;
     std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> pool_;  // key: kind | w | h
@@ -199,6 +208,11 @@ private:
         size_t bytes = 0;
     };
     std::unordered_map<ObjectId, ImageEntry> images_;
+    struct VideoEntry {
+        uint32_t generation = 0;
+        std::shared_ptr<VideoDecoder> decoder;
+    };
+    std::unordered_map<ObjectId, VideoEntry> videos_;
     std::unordered_map<uint64_t, double> costMs_;  // per comp + output size
     CachePolicy policy_ = CachePolicy::Smart;
     double admitMs_ = 0.75;

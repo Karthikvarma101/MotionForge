@@ -30,6 +30,10 @@ const PropDef kPropDefs[kPropCount] = {
     {"trimOffset", "Trim Offset", 1, {0, 0, 0, 0}, -kBig, kBig, false},
     {"timeRemap", "Time Remap", 1, {0, 0, 0, 0}, -kBig, kBig, false},
     {"audioLevel", "Audio Level", 1, {0, 0, 0, 0}, -48, 0, false},
+    {"positionZ", "Z Position", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"rotationX", "X Rotation", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"rotationY", "Y Rotation", 1, {0, 0, 0, 0}, -kBig, kBig, false},
+    {"zoom", "Zoom", 1, {2666.7, 0, 0, 0}, 1, 1000000, false},
 };
 
 const PropDef kAnimParamDefs[kAnimParamCount] = {
@@ -52,7 +56,7 @@ std::optional<E> fromKey(std::string_view key, const char* const (&keys)[N]) {
 
 const char* const kInterpKeys[] = {"linear", "hold", "bezier"};
 const char* const kSpatialKeys[] = {"linear", "auto", "bezier"};
-const char* const kLayerKindKeys[] = {"shape", "image", "null", "text", "precomp", "audio"};
+const char* const kLayerKindKeys[] = {"shape", "image", "null", "text", "precomp", "audio", "camera"};
 const char* const kShapeTypeKeys[] = {"rectangle", "ellipse", "polygon", "star", "path"};
 const char* const kTextAlignKeys[] = {"left", "center", "right"};
 const char* const kSelectorShapeKeys[] = {"square", "rampUp", "rampDown", "triangle", "round", "smooth"};
@@ -387,6 +391,16 @@ Value SampledTrack::at(double time) const {
     return out;
 }
 
+BezierPath pathKeysAt(const std::vector<PathKey>& keys, double time) {
+    if (keys.empty()) return {};
+    if (time <= keys.front().time) return keys.front().path;
+    if (time >= keys.back().time) return keys.back().path;
+    auto it = std::upper_bound(keys.begin(), keys.end(), time, [](double t, const PathKey& k) { return t < k.time; });
+    const PathKey& k1 = *it;
+    const PathKey& k0 = *(it - 1);
+    return lerpPath(k0.path, k1.path, (time - k0.time) / std::max(1e-9, k1.time - k0.time));
+}
+
 BezierPath lerpPath(const BezierPath& a, const BezierPath& b, double t) {
     if (a.vertices.size() != b.vertices.size() || a.closed != b.closed || t <= 0) return a;
     if (t >= 1) return b;
@@ -572,6 +586,7 @@ Layer makeLayer(LayerKind kind, const Composition& comp, ObjectId id, const Asse
                 l.asset = asset->id;
                 l.name = asset->name;
                 l.prop(PropId::AnchorPoint).value = {asset->width * 0.5, asset->height * 0.5, 0, 0};
+                if (asset->isVideo() && asset->duration > 0) l.outPoint = asset->duration;  // as long as the clip
             } else {
                 l.name = "Image";
             }
@@ -595,6 +610,14 @@ Layer makeLayer(LayerKind kind, const Composition& comp, ObjectId id, const Asse
                 if (asset->duration > 0) l.outPoint = asset->duration;
             }
             break;
+        case LayerKind::Camera: {
+            // A 50 mm lens (on 36 mm film) at the distance where the composition looks exactly as in 2D.
+            l.name = "Camera";
+            const double zoom = std::round(comp.width * 50.0 / 36.0 * 10) / 10;
+            l.prop(PropId::CameraZoom).value = {zoom, 0, 0, 0};
+            l.prop(PropId::PositionZ).value = {-zoom, 0, 0, 0};
+            break;
+        }
     }
     return l;
 }
@@ -606,6 +629,18 @@ Layer makePrecompLayer(const Composition& comp, const Composition& source, Objec
     l.prop(PropId::AnchorPoint).value = {source.width * 0.5, source.height * 0.5, 0, 0};
     l.outPoint = std::min(comp.duration, source.duration);
     return l;
+}
+
+std::vector<PropId> modifiedProps(const Project& project, const Composition& comp, const Layer& layer) {
+    const Composition* source = layer.kind == LayerKind::Precomp ? project.findComposition(layer.source) : nullptr;
+    Layer fresh = source ? makePrecompLayer(comp, *source, 0) : makeLayer(layer.kind, comp, 0, project.findAsset(layer.asset));
+    if (layer.kind == LayerKind::Shape && layer.shape == ShapeType::Polygon) fresh.prop(PropId::Points).value[0] = 6;  // as addLayer
+    std::vector<PropId> out;
+    for (int i = 0; i < kPropCount; ++i) {
+        const Property& p = layer.props[size_t(i)];
+        if (p.animated() || p.baked() || p.value != fresh.props[size_t(i)].value) out.push_back(static_cast<PropId>(i));
+    }
+    return out;
 }
 
 bool compUses(const Project& project, ObjectId comp, ObjectId target) {

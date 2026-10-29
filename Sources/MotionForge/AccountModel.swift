@@ -122,6 +122,9 @@ final class AccountModel: NSObject, ObservableObject {
     @Published private(set) var awaitingPayment = false
 
     private var session: Session?
+    private let useKeychain = ProcessInfo.processInfo.environment["MOTIONFORGE_NO_KEYCHAIN"] == nil
+    /// Scripted checks run next to the person's own copy use the stored token as it is and never spend the refresh token.
+    private let noTokenRefresh = ProcessInfo.processInfo.environment["MOTIONFORGE_NO_TOKEN_REFRESH"] != nil
     private var authSession: ASWebAuthenticationSession?
     private var pollTask: Task<Void, Never>?
     /// Debug builds only: MOTIONFORGE_PRO=1 unlocks export for scripts and demos. Release builds always ask the server.
@@ -144,10 +147,9 @@ final class AccountModel: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        session = Keychain.read(Session.self)
-        user = session?.user
+        // Kept even when the Keychain can't be read, so an offline Pro user can still export.
         if let data = UserDefaults.standard.data(forKey: "proEntitlement"),
-           let e = try? JSONDecoder().decode(Entitlement.self, from: data), session != nil {
+           let e = try? JSONDecoder().decode(Entitlement.self, from: data) {
             entitlement = e
         }
         if let data = UserDefaults.standard.data(forKey: "serverPlans"), let p = try? JSONDecoder().decode([ProPlan].self, from: data), !p.isEmpty {
@@ -156,10 +158,19 @@ final class AccountModel: NSObject, ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "appSettings"), let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
             settings = s
         }
-        Task { await refreshFromServer(force: true) }
+        // The Keychain is read off the main thread: if macOS asks for permission (a new build), the
+        // window still opens and stays responsive while the question is up.
+        // Scripted checks (MOTIONFORGE_NO_KEYCHAIN) run signed out and never touch the Keychain.
+        let useKeychain = self.useKeychain
+        Task {
+            let stored = useKeychain ? await Task.detached(priority: .userInitiated) { Keychain.read(Session.self) }.value : nil
+            if session == nil, let stored { session = stored; user = stored.user }
+            if session == nil { entitlement = Entitlement() }  // signed out: no Pro
+            await refreshFromServer(force: true)
+        }
         // Changes made in the admin console reach a running app when it comes back to the front.
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { Task { await self?.refreshFromServer() } }
+            MainActor.assumeIsolated { _ = Task { await self?.refreshFromServer() } }
         }
     }
 
@@ -347,9 +358,13 @@ final class AccountModel: NSObject, ObservableObject {
         r.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: r)
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        guard (response as? HTTPURLResponse)?.statusCode == 200, let access = obj["access_token"] as? String,
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200, let access = obj["access_token"] as? String,
               let refresh = obj["refresh_token"] as? String, let u = obj["user"] as? [String: Any] else {
-            throw AccountError.server((obj["error_description"] ?? obj["msg"] ?? obj["error"]) as? String ?? "Sign-in was refused.")
+            let message = (obj["error_description"] ?? obj["msg"] ?? obj["error"]) as? String ?? "Sign-in was refused."
+            // Only a definite "no" (400–403) means the sign-in is over; 429 / 5xx are worth retrying later.
+            if (400...403).contains(code) { throw AccountError.rejected(message) }
+            throw AccountError.server(message)
         }
         let meta = u["user_metadata"] as? [String: Any] ?? [:]
         let email = u["email"] as? String ?? ""
@@ -366,22 +381,44 @@ final class AccountModel: NSObject, ObservableObject {
         Keychain.write(s)
     }
 
+    /// For other services (collaboration): a current access token, or nil when signed out.
+    func validAccessToken() async -> String? { await accessToken() }
+    var isPro: Bool { entitlement.pro }
+
     /// A current access token, refreshed when it is about to expire; nil when signed out (or the refresh was refused).
     private func accessToken() async -> String? {
         guard let s = session else { return nil }
         if s.expiresAt > Date() { return s.accessToken }
+        // One refresh at a time: refresh tokens are single-use, so a second one racing the first would be refused.
+        if let running = refreshTask { return try? await running.value.accessToken }
+        // Another copy of MotionForge may have refreshed already. Spending the refresh token it replaced
+        // would sign both out, so take the newer session it stored.
+        if useKeychain, let stored = await Task.detached(priority: .userInitiated, operation: { Keychain.read(Session.self) }).value,
+           let current = session, stored.user.id == current.user.id, stored.expiresAt > current.expiresAt {
+            session = stored
+            if stored.expiresAt > Date() { return stored.accessToken }
+        }
+        if noTokenRefresh { return nil }
+        if let running = refreshTask { return try? await running.value.accessToken }
+        guard let latest = session else { return nil }  // signed out meanwhile
+        if latest.expiresAt > Date() { return latest.accessToken }
+        let refreshToken = latest.refreshToken
+        let task = Task { try await tokenRequest(grant: "refresh_token", body: ["refresh_token": refreshToken]) }
+        refreshTask = task
+        defer { refreshTask = nil }
         do {
-            let fresh = try await tokenRequest(grant: "refresh_token", body: ["refresh_token": s.refreshToken])
+            let fresh = try await task.value
             store(fresh)
             return fresh.accessToken
-        } catch AccountError.server {
+        } catch AccountError.rejected {
             await signOut()  // revoked or expired refresh token
             message = "Please sign in again."
             return nil
         } catch {
-            return nil  // offline: keep the session
+            return nil  // offline or the server is busy: keep the session and try again later
         }
     }
+    private var refreshTask: Task<Session, Error>?
 
     // MARK: - Pro
 
@@ -473,6 +510,7 @@ final class AccountModel: NSObject, ObservableObject {
     enum AccountError: Error {
         case notConfigured, notSignedIn
         case server(String)
+        case rejected(String)  // the auth server said no (400–403)
         case function(String)
     }
 
@@ -480,7 +518,7 @@ final class AccountModel: NSObject, ObservableObject {
         switch error {
         case AccountError.notConfigured: return "Accounts aren't set up in this build yet."
         case AccountError.notSignedIn: return "Sign in with Google first."
-        case AccountError.server(let m): return m
+        case AccountError.server(let m), AccountError.rejected(let m): return m
         case AccountError.function("payments_not_configured"): return "Payments aren't switched on yet (Razorpay keys missing on the server)."
         case AccountError.function(let m): return m
         default: return error.localizedDescription
@@ -521,12 +559,16 @@ private enum Keychain {
 
     static func write<T: Encodable>(_ value: T) {
         guard let data = try? JSONEncoder().encode(value) else { return }
-        if SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecItemNotFound {
-            var add = query
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            SecItemAdd(add as CFDictionary, nil)
-        }
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecSuccess { return }
+        // Not there yet, or this build isn't allowed to change the old item (refused at the prompt):
+        // replace it, so the new refresh token isn't lost and the next launch doesn't sign out.
+        if status != errSecItemNotFound { SecItemDelete(query as CFDictionary) }
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let added = SecItemAdd(add as CFDictionary, nil)
+        if added != errSecSuccess { NSLog("MotionForge: couldn't store the session in the Keychain (\(added))") }
     }
 
     static func read<T: Decodable>(_ type: T.Type) -> T? {

@@ -94,6 +94,7 @@ extension EditorModel {
     func startExport(_ settings: MFExportSettings, to url: URL, summary: String = "") {
         guard exporter == nil else { return }
         closeCoalescedEdit()
+        lastExport = (settings, summary)
         let x: MFVideoExporter
         do {
             x = try MFVideoExporter(engine: engine, settings: settings, outputPath: url.path)
@@ -103,6 +104,7 @@ extension EditorModel {
         }
         exporter = x
         exportStatus = ExportStatus(url: url, settings: summary)
+        let framesFolder = settings.format == .pngSequence
         // Both callbacks arrive on the main queue.
         x.start(progress: { [weak self] p in
             MainActor.assumeIsolated {
@@ -123,12 +125,19 @@ extension EditorModel {
                 self.exportStatus = s
                 self.exporter = nil
                 if message == nil { NSSound(named: "Glass")?.play() }
+                if self.quitAfterExportStops {
+                    // PNG sequences aren't removed by the exporter: take the unfinished frames folder too.
+                    if message != nil, framesFolder { try? FileManager.default.removeItem(at: url) }
+                    NSApp.reply(toApplicationShouldTerminate: true)
+                }
             }
         })
     }
 
-    func cancelExport() {
+    func cancelExport(thenQuit: Bool = false) {
+        quitAfterExportStops = thenQuit
         exporter?.cancel()
+        if thenQuit && exporter == nil { NSApp.reply(toApplicationShouldTerminate: true) }
     }
 }
 
@@ -287,6 +296,11 @@ struct ExportSettingsForm: View {
             // The usual delivery targets: portrait = reels, landscape = YouTube.
             rate = c.height > c.width ? 10 : 35
             to = c.duration
+            if c.hasWorkArea {  // a work area (B / N) is what you meant to render, like a render queue's default
+                wholeComp = false
+                from = c.workAreaStart
+                to = c.workAreaEnd
+            }
         }
     }
 

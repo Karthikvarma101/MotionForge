@@ -12,7 +12,7 @@ inline constexpr const char* kSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-// Must match ItemGPU in MetalRenderer.mm (8 x float4 = 128 bytes).
+// Must match ItemGPU in MetalRenderer.mm (9 x float4 = 144 bytes).
 struct Item {
     float4 m0;      // a b c d      (layer -> target pixel matrix, column-major 2x2)
     float4 m1;      // tx ty opacity kind
@@ -22,6 +22,7 @@ struct Item {
     float4 p0;      // strokeWidth roundness points innerRatio
     float4 p1;      // shapeType blendMode maskStart maskCount
     float4 p2;      // bezier paths: fillEdgeStart fillEdgeCount strokeEdgeStart strokeEdgeCount
+    float4 m3;      // 3D layers: perspective row gx gy w (target = (m·p + t) / (gx·x + gy·y + w)); 0 0 1 in 2D
 };
 
 // Must match MaskGPU in MetalRenderer.mm.
@@ -59,9 +60,12 @@ vertex VOut item_vertex(uint vid [[vertex_id]],
     const float2 mn = it.bounds.xy - pad;
     const float2 mx = it.bounds.zw + pad;
     const float2 corner = float2((vid & 1) ? mx.x : mn.x, (vid & 2) ? mx.y : mn.y);
-    const float2 p = m * corner + it.m1.xy;
+    const float w = max(it.m3.x * corner.x + it.m3.y * corner.y + it.m3.z, 1e-6f);
+    const float2 p = (m * corner + it.m1.xy) / w;
     VOut o;
-    o.position = float4(p.x / fu.targetSize.x * 2.0f - 1.0f, 1.0f - p.y / fu.targetSize.y * 2.0f, 0.0f, 1.0f);
+    // A homogeneous position (× w) makes the rasterizer interpolate `local` perspective-correctly,
+    // so 3D layers keep exact shapes, masks and image sampling.
+    o.position = float4((p.x / fu.targetSize.x * 2.0f - 1.0f) * w, (1.0f - p.y / fu.targetSize.y * 2.0f) * w, 0.0f, w);
     o.local = corner;
     o.item = iid;
     return o;

@@ -123,7 +123,28 @@ struct SelectionOverlay: View {
                 }
             }
 
+            // Shape tool: the shape being dragged out.
+            if let r = model.shapeDraft {
+                let a = geometry.toView(r.origin), b = geometry.toView(CGPoint(x: r.maxX, y: r.maxY))
+                let vr = CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
+                ctx.stroke(model.shapeTool == .ellipse ? Path(ellipseIn: vr) : Path(vr), with: .color(Theme.accent),
+                           style: StrokeStyle(lineWidth: 1.25, dash: [4, 3]))
+            }
+
             guard let sel = model.selection else { return }
+            // The primary layer's anchor point (what Rotation turns around and Pan Behind moves).
+            do {
+                let a = model.engine.value(of: .anchorPoint, layer: sel, time: time.time)
+                let c = geometry.toView(model.engine.layerToComp(CGPoint(x: a.x, y: a.y), layer: sel, time: time.time))
+                let big = model.tool == .rotate || model.tool == .panBehind
+                let r = big ? 6.0 : 4.0, arm = big ? 11.0 : 7.0
+                var cross = Path()
+                cross.addEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+                cross.move(to: CGPoint(x: c.x - arm, y: c.y)); cross.addLine(to: CGPoint(x: c.x + arm, y: c.y))
+                cross.move(to: CGPoint(x: c.x, y: c.y - arm)); cross.addLine(to: CGPoint(x: c.x, y: c.y + arm))
+                ctx.stroke(cross, with: .color(.black.opacity(0.6)), lineWidth: 3)
+                ctx.stroke(cross, with: .color(.white), lineWidth: 1.25)
+            }
             // Points and handles of the selected bezier-path layer.
             if model.tool == .select, let pl = model.selectedLayer, pl.kind == .shape, pl.shape == .path {
                 for v in pl.pathVertices {
@@ -182,8 +203,26 @@ struct SelectionOverlay: View {
                     ctx.stroke(Path(r), with: .color(Theme.keyframe), lineWidth: 1)
                 }
             }
-            // Masks of the selected layer, dashed.
-            for m in model.selectedLayer?.masks ?? [] where m.enabled {
+            // Masks of the selected layer, dashed; path masks (rotoscoping) with their points.
+            for m in model.selectedLayer?.masks ?? [] where m.enabled && m.shape == .path {
+                let verts = model.engine.maskPath(m.maskID, layer: sel, time: time.time)
+                @MainActor func v(_ q: CGPoint) -> CGPoint { geometry.toView(model.engine.layerToComp(q, layer: sel, time: time.time)) }
+                let pts = verts.map { x -> (CGPoint, CGPoint, CGPoint) in
+                    let c = v(x.point)
+                    let i = v(CGPoint(x: x.point.x + x.inTangent.x, y: x.point.y + x.inTangent.y))
+                    let o = v(CGPoint(x: x.point.x + x.outTangent.x, y: x.point.y + x.outTangent.y))
+                    return (c, CGPoint(x: (i.x - c.x) / geometry.scale, y: (i.y - c.y) / geometry.scale),
+                            CGPoint(x: (o.x - c.x) / geometry.scale, y: (o.y - c.y) / geometry.scale))
+                }
+                ctx.stroke(bezier(pts, closed: true), with: .color(Theme.keyframe), style: StrokeStyle(lineWidth: 1.25, dash: [5, 4]))
+                if model.tool == .select && verts.count <= 400 {
+                    for (c, _, _) in pts {
+                        let r = CGRect(x: c.x - 3, y: c.y - 3, width: 6, height: 6)
+                        ctx.fill(Path(r), with: .color(m.pathAnimated ? Theme.keyframe : .white))
+                    }
+                }
+            }
+            for m in model.selectedLayer?.masks ?? [] where m.enabled && m.shape != .path {
                 let mq = model.engine.quad(forMask: m.maskID, layer: sel, time: time.time)
                 let a = geometry.toView(mq.topLeft), b = geometry.toView(mq.topRight), d = geometry.toView(mq.bottomLeft)
                 // Affine map from the unit square onto the (possibly rotated) mask rectangle.
@@ -260,12 +299,31 @@ struct ViewerFooter: View {
                 .toggleStyle(.button)
                 .help("Transparency grid")
 
+            if model.customView != nil || model.layers.contains(where: { $0.threeD && $0.kind != .camera }) {
+                Picker("", selection: Binding(get: { model.customView != nil },
+                                              set: { model.customView = $0 ? (model.customView ?? OrbitView(yaw: -30, pitch: 15, distance: 1.6)) : nil })) {
+                    Text("Active Camera").tag(false)
+                    Text("Custom View").tag(true)
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                .help("Look at the 3D scene from anywhere (Orbit Camera tool, C). Exports always use the active camera.")
+                if model.customView != nil {
+                    Button("Reset View") { model.customView = OrbitView(yaw: -30, pitch: 15, distance: 1.6) }
+                        .buttonStyle(.borderless)
+                }
+            }
+
             if let note = perf.autoQualityNote {
                 Label(note, systemImage: "gauge.with.dots.needle.33percent").foregroundStyle(Theme.warning).lineLimit(1)
             }
             Spacer()
             if perf.lastFrameIncomplete {
                 Label("Loading media…", systemImage: "hourglass").foregroundStyle(Theme.warning)
+            }
+            if let fill = perf.ramPreviewFill {
+                Label("RAM Preview: rendering \(Int(fill * 100))%", systemImage: "memorychip").foregroundStyle(Theme.keyframe)
+                    .help("Every frame of the work area is rendered once, then it plays in real time")
             }
             Text("\(model.comp.width)×\(model.comp.height) · \(fpsString(model.comp.fps)) fps")
                 .foregroundStyle(.secondary)
@@ -309,8 +367,27 @@ final class ViewerMTKView: MTKView {
     override func mouseUp(with e: NSEvent) { coordinator?.mouseUp(point(e), event: e) }
     override func scrollWheel(with e: NSEvent) { coordinator?.scroll(point(e), event: e) }
     override func magnify(with e: NSEvent) { coordinator?.magnify(point(e), event: e) }
-    var penCursor = false { didSet { if penCursor != oldValue { window?.invalidateCursorRects(for: self) } } }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: penCursor ? .crosshair : .arrow) }
+    var tool: EditorTool = .select { didSet { if tool != oldValue { window?.invalidateCursorRects(for: self) } } }
+    var grabbing = false { didSet { if grabbing != oldValue { window?.invalidateCursorRects(for: self) } } }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: Self.cursor(for: tool, grabbing: grabbing)) }
+
+    private static let zoomCursor: NSCursor = {
+        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        guard let img = NSImage(systemSymbolName: "plus.magnifyingglass", accessibilityDescription: "Zoom")?
+            .withSymbolConfiguration(config) else { return .crosshair }
+        return NSCursor(image: img, hotSpot: NSPoint(x: 6, y: 6))
+    }()
+
+    static func cursor(for tool: EditorTool, grabbing: Bool) -> NSCursor {
+        switch tool {
+        case .select: return .arrow
+        case .hand: return grabbing ? .closedHand : .openHand
+        case .zoom: return zoomCursor
+        case .type: return .iBeam
+        case .rotate, .panBehind, .pen, .shape: return .crosshair
+        case .orbit: return grabbing ? .closedHand : .openHand
+        }
+    }
 }
 
 struct MetalViewer: NSViewRepresentable {
@@ -319,6 +396,11 @@ struct MetalViewer: NSViewRepresentable {
     let geometry: ViewerGeometry
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
+
+    // Leaving the viewer (Nodes workspace) stops its idle-render timer; otherwise one leaks per switch.
+    static func dismantleNSView(_ nsView: ViewerMTKView, coordinator: Coordinator) {
+        coordinator.stopIdleRendering()
+    }
 
     func makeNSView(context: Context) -> ViewerMTKView {
         let v = ViewerMTKView(frame: .zero, device: model.engine.device)
@@ -332,12 +414,20 @@ struct MetalViewer: NSViewRepresentable {
         v.isPaused = true
         v.enableSetNeedsDisplay = true
         context.coordinator.view = v
+        // Drawing is skipped while the window is hidden; catch up when it shows again.
+        context.coordinator.occlusion = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main) { [weak v] note in
+            MainActor.assumeIsolated {
+                guard let v, let w = note.object as? NSWindow, w === v.window, w.occlusionState.contains(.visible) else { return }
+                v.needsDisplay = true
+            }
+        }
         return v
     }
 
     func updateNSView(_ v: ViewerMTKView, context: Context) {
         context.coordinator.geometry = geometry
-        v.penCursor = model.tool == .pen
+        v.tool = model.tool
         let playing = time.isPlaying
         if v.isPaused == playing {  // switch between on-demand and display-linked drawing
             v.isPaused = !playing
@@ -354,6 +444,7 @@ struct MetalViewer: NSViewRepresentable {
 
         // playback clock
         private var wasPlaying = false
+        private var lastWrittenTime = -1.0  // the playhead time playback last set
         private var playStartWall: CFTimeInterval = 0
         private var playStartTime = 0.0
         private var lastFrameIndex = -1
@@ -368,10 +459,19 @@ struct MetalViewer: NSViewRepresentable {
             case pathHandle(layer: UInt64, index: Int, isOut: Bool, start: CGPoint, tangentIn: MFValue, tangentOut: MFValue)
             case pen(index: Int)
             case shapePoint(layer: UInt64, index: Int, part: Int, start: CGPoint, original: [MFPathVertex], closed: Bool)  // part: 0 point, 1 in, 2 out
+            case rotate(pivot: CGPoint, rotations: [UInt64: Double])
+            case orbit(start: CGPoint, view: OrbitView)
+            case maskPoint(layer: UInt64, mask: UInt64, index: Int, part: Int, start: CGPoint, original: [MFPathVertex])
+            case anchor(layer: UInt64, start: CGPoint, anchor: MFValue, position: MFValue)
+            case shape(start: CGPoint)
         }
         private var drag: Drag?
         private var panStartView: CGPoint?
         private var panStart = CGSize.zero
+        // RAM Preview's first pass: one frame per finished render, no sound, until the range is cached
+        private var filling = false
+        private var fillFrameSince: CFTimeInterval = 0
+        private var rotateLast = 0.0, rotateTotal = 0.0  // radians, so a drag can go round more than once
         // adaptive preview resolution (Auto quality, playback only)
         private var autoBoost = 1
         private var overBudget = 0, underBudget = 0
@@ -386,6 +486,15 @@ struct MetalViewer: NSViewRepresentable {
             idleTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.idleTick() }
             }
+        }
+
+        var occlusion: NSObjectProtocol?
+
+        func stopIdleRendering() {
+            idleTimer?.invalidate()
+            idleTimer = nil
+            if let occlusion { NotificationCenter.default.removeObserver(occlusion) }
+            occlusion = nil
         }
 
         /// While paused, renders the next 2 s of frames into the cache a few at a time, so
@@ -415,45 +524,68 @@ struct MetalViewer: NSViewRepresentable {
             var t = clock.time
             let now = CACurrentMediaTime()
 
+            let range = model.playRange
             if clock.isPlaying {
                 if !wasPlaying {
                     wasPlaying = true
+                    // Playback stays in the work area: starting outside it starts at its beginning.
+                    if t < range.start - 1e-9 || t > range.end - 1 / fps + 1e-9 {
+                        t = range.start
+                        clock.time = t
+                    }
                     playStartWall = now
                     playStartTime = t
                     lastFrameIndex = -1
                     dropped = 0
+                    filling = model.ramPreview
+                    fillFrameSince = now
+                    lastWrittenTime = t
+                    if filling { autoBoost = 1 } else { model.audio.play(from: t) }
+                } else if !filling && abs(t - lastWrittenTime) > 1e-9 {
+                    // Something else moved the playhead (a keyframe click, the inspector's key arrows):
+                    // carry on playing from there instead of snapping back.
+                    playStartWall = now
+                    playStartTime = t
+                    lastFrameIndex = -1
                     model.audio.play(from: t)
                 }
-                var elapsed = playStartTime + (now - playStartWall)
-                if let a = model.audio.clockTime {
-                    // Sound leads: the picture follows the audio clock (and the wall clock is kept in
-                    // line with it for when the sound ends).
-                    elapsed = a
-                    playStartWall = now - (a - playStartTime)
-                }
-                let lastFrameTime = max(0, model.comp.duration - 1 / fps)
-                if elapsed > lastFrameTime + 1 / fps - 1e-9 {
-                    if clock.loop {
-                        playStartWall = now
-                        playStartTime = 0
-                        elapsed = 0
-                        lastFrameIndex = -1
-                        model.audio.play(from: 0)
-                    } else {
-                        clock.isPlaying = false
-                        elapsed = lastFrameTime
-                        model.audio.stop()
+                if !filling {
+                    var elapsed = playStartTime + (now - playStartWall)
+                    if let a = model.audio.clockTime {
+                        // Sound leads: the picture follows the audio clock (and the wall clock is kept in
+                        // line with it for when the sound ends).
+                        elapsed = a
+                        playStartWall = now - (a - playStartTime)
                     }
+                    let lastFrameTime = max(range.start, range.end - 1 / fps)
+                    if elapsed > lastFrameTime + 1 / fps - 1e-9 {
+                        if clock.loop || model.ramPreview {
+                            playStartWall = now
+                            playStartTime = range.start
+                            elapsed = range.start
+                            lastFrameIndex = -1
+                            model.audio.play(from: range.start)
+                        } else {
+                            clock.isPlaying = false
+                            elapsed = lastFrameTime
+                            model.audio.stop()
+                        }
+                    }
+                    let frameIndex = Int((elapsed * fps + 1e-6).rounded(.down))
+                    if frameIndex == lastFrameIndex { return }  // display refresh between comp frames
+                    if lastFrameIndex >= 0 && frameIndex > lastFrameIndex + 1 { dropped += frameIndex - lastFrameIndex - 1 }
+                    lastFrameIndex = frameIndex
+                    t = Double(frameIndex) / fps
+                    clock.time = t
+                    lastWrittenTime = t
                 }
-                let frameIndex = Int((elapsed * fps + 1e-6).rounded(.down))
-                if frameIndex == lastFrameIndex { return }  // display refresh between comp frames
-                if lastFrameIndex >= 0 && frameIndex > lastFrameIndex + 1 { dropped += frameIndex - lastFrameIndex - 1 }
-                lastFrameIndex = frameIndex
-                t = Double(frameIndex) / fps
-                clock.time = t
             } else {
-                if wasPlaying { model.audio.stop() }
+                if wasPlaying {
+                    model.audio.stop()
+                    model.endRAMPreview()
+                }
                 wasPlaying = false
+                filling = false
             }
 
             let backing = view.bounds.width > 0 ? view.drawableSize.width / view.bounds.width : 2
@@ -483,7 +615,29 @@ struct MetalViewer: NSViewRepresentable {
             if clock.isPlaying {
                 // Keep the GPU a few frames ahead of the playhead (only frames worth caching).
                 _ = model.engine.prefetch(fromTime: t, frames: 6, qualityDivisor: divisor, loop: clock.loop)
-                if model.quality == .auto { adaptResolution(fps: fps, divisor: divisor) }
+                if model.quality == .auto && !filling { adaptResolution(fps: fps, divisor: divisor) }
+            }
+            if filling && clock.isPlaying && (info.complete || now - fillFrameSince > 2) {
+                // RAM Preview: this frame is in the cache now, so on to the next; after the last one
+                // the whole range plays back in real time, with sound.
+                let next = t + 1 / fps
+                if next > range.end - 1 / fps + 1e-9 {
+                    filling = false
+                    model.perf.ramPreviewFill = nil
+                    playStartWall = now
+                    playStartTime = range.start
+                    lastFrameIndex = -1
+                    clock.time = range.start
+                    lastWrittenTime = range.start
+                    model.audio.play(from: range.start)
+                } else {
+                    clock.time = next
+                    lastWrittenTime = next
+                    fillFrameSince = now
+                    if now - lastPerfPublish > 0.2 {
+                        model.perf.ramPreviewFill = (next - range.start) / max(1e-9, range.end - range.start)
+                    }
+                }
             }
             if !info.complete && !clock.isPlaying {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { view.needsDisplay = true }
@@ -541,7 +695,53 @@ struct MetalViewer: NSViewRepresentable {
                 drag = .pen(index: model.penDraft.count - 1)
                 return
             }
-            // 1. Points and handles of a selected bezier-path layer.
+            switch model.tool {
+            case .hand:
+                panStartView = p
+                panStart = model.pan
+                view?.grabbing = true
+                return
+            case .zoom:
+                zoom(about: p, factor: flags.contains(.option) ? 0.5 : 2)
+                return
+            case .orbit:
+                if model.customView == nil { model.customView = OrbitView() }
+                drag = .orbit(start: p, view: model.customView ?? OrbitView())
+                view?.grabbing = true
+                return
+            case .shape:
+                drag = .shape(start: cp)
+                model.shapeDraft = CGRect(origin: cp, size: .zero)
+                return
+            case .type:
+                model.addText(at: cp)
+                model.tool = .select
+                return
+            case .rotate:
+                let hit = model.engine.hitTest(at: cp, time: t)
+                if hit != 0 && !model.selectedLayers.contains(hit) { model.selectLayer(hit, mode: .replace) }
+                guard let primary = model.selection else { return }
+                var rotations: [UInt64: Double] = [:]
+                for id in model.selectedLayers { rotations[id] = model.engine.value(of: .rotation, layer: id, time: t).x }
+                let pivot = anchorInComp(primary, t)
+                rotateLast = atan2(cp.y - pivot.y, cp.x - pivot.x)
+                rotateTotal = 0
+                drag = .rotate(pivot: pivot, rotations: rotations)
+                model.engine.beginUndoGroup(rotations.count > 1 ? "Rotate Layers" : "Rotate Layer")
+                return
+            case .panBehind:
+                let hit = model.engine.hitTest(at: cp, time: t)
+                if hit != 0 && !model.selectedLayers.contains(hit) { model.selectLayer(hit, mode: .replace) }
+                guard let id = hit != 0 ? hit : model.selection else { return }
+                drag = .anchor(layer: id, start: cp, anchor: model.engine.value(of: .anchorPoint, layer: id, time: t),
+                               position: model.engine.value(of: .position, layer: id, time: t))
+                model.engine.beginUndoGroup("Move Anchor Point")
+                return
+            case .select, .pen:
+                break
+            }
+            // 1. Points of the selected layer's path masks (rotoscoping), then of a bezier-path layer.
+            if let sel = model.selectedLayer, beginMaskPointDrag(sel, p, t) { return }
             if let sel = model.selectedLayer, sel.kind == .shape, sel.shape == .path, beginShapePointDrag(sel, p, t) { return }
             // 2. Motion-path handles and key points of the primary layer take precedence.
             if let sel = model.selection, let mp = model.engine.motionPath(layer: sel, time: t), beginPathDrag(mp, sel, p, cp, t) {
@@ -575,6 +775,56 @@ struct MetalViewer: NSViewRepresentable {
                 panStartView = p
                 panStart = model.pan
             }
+        }
+
+        /// A layer's anchor point in composition space (what it rotates and scales around).
+        private func anchorInComp(_ layer: UInt64, _ t: Double) -> CGPoint {
+            let a = model.engine.value(of: .anchorPoint, layer: layer, time: t)
+            return model.engine.layerToComp(CGPoint(x: a.x, y: a.y), layer: layer, time: t)
+        }
+
+        /// Starts moving a point (or handle) of one of `layer`'s path masks if `p` is on one.
+        private func beginMaskPointDrag(_ layer: MFLayerInfo, _ p: CGPoint, _ t: Double) -> Bool {
+            for m in layer.masks where m.enabled && m.shape == .path {
+                let verts = model.engine.maskPath(m.maskID, layer: layer.layerID, time: t)
+                func view(_ q: CGPoint) -> CGPoint { geometry.toView(model.engine.layerToComp(q, layer: layer.layerID, time: t)) }
+                for (i, v) in verts.enumerated() {
+                    let candidates: [(CGPoint, Int)] = [(v.point, 0),
+                                                        (CGPoint(x: v.point.x + v.outTangent.x, y: v.point.y + v.outTangent.y), 2),
+                                                        (CGPoint(x: v.point.x + v.inTangent.x, y: v.point.y + v.inTangent.y), 1)]
+                    for (q, part) in candidates {
+                        if part != 0 && (hypot(q.x - v.point.x, q.y - v.point.y) < 0.5 || verts.count > 60) { continue }  // traced outlines: points only
+                        let vq = view(q)
+                        if hypot(vq.x - p.x, vq.y - p.y) <= 6 {
+                            drag = .maskPoint(layer: layer.layerID, mask: m.maskID, index: i, part: part,
+                                              start: model.engine.compToLayer(geometry.toComp(p), layer: layer.layerID, time: t), original: verts)
+                            model.engine.beginUndoGroup("Edit Mask Path")
+                            return true
+                        }
+                    }
+                }
+            }
+            return false
+        }
+
+        /// `original` with point `index` (part 0) or one of its handles (1 in, 2 out) moved by `d`;
+        /// handles stay opposite each other unless `split`.
+        private func moved(_ original: [MFPathVertex], _ index: Int, _ part: Int, _ d: CGPoint, split: Bool) -> [MFPathVertex] {
+            var verts = original
+            let v = original[index]
+            switch part {
+            case 0:
+                verts[index] = MFPathVertex(point: CGPoint(x: v.point.x + d.x, y: v.point.y + d.y), inTangent: v.inTangent, outTangent: v.outTangent)
+            default:
+                let m = part == 2 ? CGPoint(x: v.outTangent.x + d.x, y: v.outTangent.y + d.y) : CGPoint(x: v.inTangent.x + d.x, y: v.inTangent.y + d.y)
+                var other = part == 2 ? v.inTangent : v.outTangent
+                if !split {
+                    let len = hypot(other.x, other.y), ml = hypot(m.x, m.y)
+                    if ml > 1e-6 { other = CGPoint(x: -m.x / ml * len, y: -m.y / ml * len) }
+                }
+                verts[index] = MFPathVertex(point: v.point, inTangent: part == 1 ? m : other, outTangent: part == 2 ? m : other)
+            }
+            return verts
         }
 
         private func beginShapePointDrag(_ layer: MFLayerInfo, _ p: CGPoint, _ t: Double) -> Bool {
@@ -677,6 +927,58 @@ struct MetalViewer: NSViewRepresentable {
                     verts[index] = MFPathVertex(point: v.point, inTangent: part == 1 ? moved : other, outTangent: part == 2 ? moved : other)
                 }
                 model.edit { _ = $0.setLayer(layer, pathVertices: verts, closed: closed) }
+            case .rotate(let pivot, let rotations):
+                let a = atan2(cp.y - pivot.y, cp.x - pivot.x)
+                var d = a - rotateLast
+                if d > .pi { d -= 2 * .pi } else if d < -.pi { d += 2 * .pi }
+                rotateTotal += d
+                rotateLast = a
+                let degrees = rotateTotal * 180 / .pi  // clockwise on screen, like the Rotation value
+                let snap = event.modifierFlags.contains(.shift)
+                model.edit { e in
+                    for (id, r0) in rotations {
+                        let r = snap ? ((r0 + degrees) / 45).rounded() * 45 : r0 + degrees
+                        _ = e.setPropertyValue(MFValue(x: r, y: 0, z: 0, w: 0), prop: .rotation, layer: id, time: t)
+                    }
+                }
+            case .anchor(let id, let start, let anchor, let position):
+                // Moving the anchor and the position together leaves the layer where it is on screen,
+                // so the layer-to-composition mapping (and with it these conversions) holds all drag.
+                let a0 = model.engine.compToLayer(start, layer: id, time: t)
+                let a1 = model.engine.compToLayer(cp, layer: id, time: t)
+                let v = model.engine.parentSpaceVector(CGPoint(x: cp.x - start.x, y: cp.y - start.y), layer: id, time: t)
+                model.edit { e in
+                    _ = e.setPropertyValue(MFValue(x: anchor.x + a1.x - a0.x, y: anchor.y + a1.y - a0.y, z: 0, w: 0),
+                                           prop: .anchorPoint, layer: id, time: t)
+                    _ = e.setPropertyValue(MFValue(x: position.x + v.x, y: position.y + v.y, z: 0, w: 0), prop: .position, layer: id, time: t)
+                }
+            case .orbit(let start, let v0):
+                var v = v0
+                let dx = p.x - start.x, dy = p.y - start.y
+                if event.modifierFlags.contains(.option) {        // closer / farther
+                    v.distance = min(max(v0.distance * exp(Double(dy) * 0.005), 0.05), 20)
+                } else if event.modifierFlags.contains(.shift) {  // pan
+                    let k = 1 / max(geometry.scale, 1e-3) * v0.distance
+                    v.pan = CGPoint(x: v0.pan.x - dx * k, y: v0.pan.y - dy * k)
+                } else {
+                    v.yaw = v0.yaw - Double(dx) * 0.35
+                    v.pitch = min(max(v0.pitch + Double(dy) * 0.35, -89), 89)
+                }
+                model.customView = v
+                view?.needsDisplay = true
+            case .maskPoint(let layer, let mask, let index, let part, let start, let original):
+                let lp = model.engine.compToLayer(cp, layer: layer, time: t)
+                let verts = moved(original, index, part, CGPoint(x: lp.x - start.x, y: lp.y - start.y),
+                                  split: event.modifierFlags.contains(.option))
+                model.edit { _ = $0.setMaskPath(mask, layer: layer, vertices: verts, time: t) }  // a key here when animated
+            case .shape(let start):
+                var w = cp.x - start.x, h = cp.y - start.y
+                if event.modifierFlags.contains(.shift) {  // square / circle
+                    let m = max(abs(w), abs(h))
+                    w = w < 0 ? -m : m
+                    h = h < 0 ? -m : m
+                }
+                model.shapeDraft = CGRect(x: min(start.x, start.x + w), y: min(start.y, start.y + h), width: abs(w), height: abs(h))
             case nil:
                 if let start = panStartView {
                     if model.zoom == nil { model.zoom = geometry.scale }
@@ -686,8 +988,21 @@ struct MetalViewer: NSViewRepresentable {
         }
 
         func mouseUp(_ p: CGPoint, event: NSEvent) {
+            view?.grabbing = false
+            if case .orbit = drag {  // a view, not an edit
+                drag = nil
+                return
+            }
             if case .pen = drag {
                 drag = nil
+                return
+            }
+            if case .shape(let start) = drag {  // a click (no real drag) makes the default size there
+                let r = model.shapeDraft ?? .zero
+                model.shapeDraft = nil
+                drag = nil
+                let tiny = r.width * geometry.scale < 4 || r.height * geometry.scale < 4
+                model.addShape(model.shapeTool, in: tiny ? CGRect(origin: start, size: .zero) : r)
                 return
             }
             if drag != nil {

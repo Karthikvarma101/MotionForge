@@ -182,8 +182,11 @@ int cmdTime(int argc, const char* argv[]) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 1;
     }
-    for (const mf::Asset& a : p.assets)
-        if (!a.missing && !r->loadImageSync(a.id, a.generation, a.path, err)) std::fprintf(stderr, "media: %s\n", err.c_str());
+    for (const mf::Asset& a : p.assets) {
+        if (a.missing) continue;
+        if (a.kind == mf::AssetKind::Video) r->registerVideo(a.id, a.generation, a.path, a.fps, a.frameCount());  // decoded per frame
+        else if (a.kind == mf::AssetKind::Image && !r->loadImageSync(a.id, a.generation, a.path, err)) std::fprintf(stderr, "media: %s\n", err.c_str());
+    }
     size_t layers = 0;
     for (const mf::Composition& k : p.compositions) layers += k.layers.size();
     const double from = argDouble(argc, argv, "--from", 0), to = argDouble(argc, argv, "--to", c->duration);

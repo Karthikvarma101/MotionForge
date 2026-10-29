@@ -1,4 +1,6 @@
 import AppKit
+import AVFoundation
+import ImageIO
 import Combine
 import MFRender
 import SwiftUI
@@ -23,7 +25,8 @@ enum PreviewQuality: Int, CaseIterable, Identifiable {
     }
 }
 
-enum EditorTool { case select, pen }
+/// Viewer tools, on After Effects' keys (see `EditorTool.key`).
+enum EditorTool: CaseIterable { case select, hand, zoom, rotate, orbit, panBehind, pen, shape, type }
 enum Workspace { case viewer, nodes }
 
 struct KeyframeRef: Hashable {
@@ -70,6 +73,7 @@ final class PerfModel: ObservableObject {
     @Published var cachedFrames = IndexSet()
     var currentDivisor = 1                     // preview resolution the viewer last rendered at
     @Published var autoQualityNote: String?   // why Auto lowered the preview resolution, if it did
+    @Published var ramPreviewFill: Double?    // RAM Preview's first pass: share of the work area rendered
 }
 
 @MainActor
@@ -92,18 +96,22 @@ final class EditorModel: ObservableObject {
     let viewport = TimelineViewport()
     /// The Home window (launch animation, recent projects) covers the workspace until a project is
     /// chosen. Scripted runs and file opens go straight to the workspace.
-    @Published var showHome: Bool
+    @Published var showHome: Bool { didSet { if showHome { stopPlayback() } } }
     let skipLaunchAnimation: Bool
     /// Whether the workspace has been shown (Home then offers to go back to it).
     private(set) var hasOpenWork = false
     /// Google account and MotionForge Pro (exporting needs Pro).
     let account = AccountModel()
+    let updater = Updater()
+    let roto = RotoBrush()
+    private(set) var isScriptedRun = false  // a check script drives this run (no update checks)
     /// The active composition's audio layers, played with the viewer.
     let audio = AudioPlayback()
     @Published var showPaywall = false
     /// Video export (see ExportView.swift).
     @Published var exportStatus: ExportStatus?
     var exporter: MFVideoExporter?
+    var quitAfterExportStops = false
     /// The primary selected layer (shown in the inspector); `selectedLayers` holds all of them.
     @Published var selection: UInt64? {
         didSet {
@@ -114,12 +122,18 @@ final class EditorModel: ObservableObject {
             }
         }
     }
-    @Published var selectedLayers: Set<UInt64> = []
+    @Published var selectedLayers: Set<UInt64> = [] { didSet { if selectedLayers != oldValue { collab?.trackPresence() } } }
+    /// The live shared editing session, when this project is shared (Collab.swift).
+    @Published var collab: CollabSession?
+    @Published var showShareSheet = false
+    @Published var showFriends = false
+    lazy var social = SocialModel(account: account)
     @Published var selectedKeyframes: Set<KeyframeRef> = []
     @Published var expandedLayers: Set<UInt64> = []
     @Published private(set) var projectURL: URL?
     @Published var alertMessage: String?
     @Published var showCompSettings = false
+    @Published var showShortcuts = false
 
     // Frame cache (persisted)
     @Published var cachePolicy: MFCachePolicy = .smart {
@@ -139,7 +153,32 @@ final class EditorModel: ObservableObject {
     @Published var tool: EditorTool = .select { didSet { if tool != .pen { penDraft = [] } } }
     @Published var penDraft: [MFPathVertex] = []   // composition space, while drawing
     @Published var penDrawsMask = false             // pen draws a mask on the selected layer
-    @Published var workspace: Workspace = .viewer
+    @Published var shapeTool: MFShapeType = .rectangle  // what the shape tool (Q) draws; Q again picks the next
+    @Published var shapeDraft: CGRect?                 // composition space, while the shape tool drags
+    @Published var focusTextOf: UInt64?               // the inspector puts the cursor in this layer's text (Type tool)
+    // The viewer's Custom View of the 3D scene (Orbit Camera tool, C); nil = through the active camera.
+    @Published var customView: OrbitView? {
+        didSet {
+            if let v = customView { engine.setViewOrbit(yaw: v.yaw, pitch: v.pitch, distance: v.distance, pan: v.pan) } else { engine.clearViewOrbit() }
+        }
+    }
+    // Timeline rows shown by a property key (P, R, S, T, A, U, UU), per layer. The layer's
+    // disclosure arrow goes back to the usual rows.
+    @Published var propertyReveal: [UInt64: PropertyReveal] = [:]
+    var lastRevealKey: (key: String, at: CFTimeInterval)?
+    // RAM Preview (0): renders every frame of the work area once, then plays it in real time.
+    @Published var ramPreview = false
+    var policyBeforeRAMPreview: MFCachePolicy?
+    var lastExport: (settings: MFExportSettings, summary: String)?  // for Export with Last Settings (⌥⌘M)
+    @Published var workspace: Workspace = .viewer { didSet { if workspace != oldValue { stopPlayback() } } }
+
+    /// Only the viewer's render loop drives playback, so leaving it (Home, the node workspace) stops it.
+    func stopPlayback() {
+        guard time.isPlaying else { return }
+        time.isPlaying = false
+        audio.stop()
+        endRAMPreview()
+    }
     @Published var showGraphEditor = false
     @Published private(set) var userPresets: [MFPresetInfo] = []
 
@@ -151,6 +190,38 @@ final class EditorModel: ObservableObject {
     @Published var fitScale: Double = 1  // reported by the viewer
     var memoryPressureUntil: CFTimeInterval = 0  // Auto quality stays at half resolution until then
 
+    // Workspace panels (View menu, toolbar). Remembered between launches.
+    @Published var showProjectPanel = EditorModel.panelDefault("project") { didSet { savePanels() } }
+    @Published var showTimeline = EditorModel.panelDefault("timeline") { didSet { savePanels() } }
+    @Published var showInspector = EditorModel.panelDefault("inspector") { didSet { savePanels() } }
+    @Published var showStatusBar = EditorModel.panelDefault("statusBar") { didSet { savePanels() } }
+    private var panelsBeforeFocus: [Bool]?
+
+    private static func panelDefault(_ name: String) -> Bool {
+        UserDefaults.standard.object(forKey: "panel." + name) as? Bool ?? true
+    }
+    private func savePanels() {
+        let d = UserDefaults.standard
+        d.set(showProjectPanel, forKey: "panel.project")
+        d.set(showTimeline, forKey: "panel.timeline")
+        d.set(showInspector, forKey: "panel.inspector")
+        d.set(showStatusBar, forKey: "panel.statusBar")
+    }
+    var anyPanelShown: Bool { showProjectPanel || showTimeline || showInspector || showStatusBar }
+
+    /// Hides every panel around the viewer, or brings back the ones that were open.
+    func toggleFocusViewer() {
+        if anyPanelShown {
+            panelsBeforeFocus = [showProjectPanel, showTimeline, showInspector, showStatusBar]
+            showProjectPanel = false; showTimeline = false; showInspector = false; showStatusBar = false
+        } else {
+            let p = panelsBeforeFocus ?? [true, true, true, true]
+            showProjectPanel = p[0]; showTimeline = p[1]; showInspector = p[2]; showStatusBar = p[3]
+            panelsBeforeFocus = nil
+        }
+    }
+
+    @Published var bundleActivity: String?  // "Exporting bundle…" while a bundle is written or unpacked
     private var autosaveTimer: Timer?
     private var lastAutosavedRevision: UInt64 = 0
     private var memoryPressure: DispatchSourceMemoryPressure?
@@ -170,8 +241,10 @@ final class EditorModel: ObservableObject {
         }
         comp = engine.composition
         let env = ProcessInfo.processInfo.environment
-        let scripted = ["MOTIONFORGE_UIDEMO", "MOTIONFORGE_SNAPSHOT", "MOTIONFORGE_OPEN"].contains { env[$0] != nil }
+        let scripted = ["MOTIONFORGE_UIDEMO", "MOTIONFORGE_SNAPSHOT", "MOTIONFORGE_OPEN", "MOTIONFORGE_UIDEMO_FEATURES",
+                        "MOTIONFORGE_UIDEMO_COLLAB", "MOTIONFORGE_UIDEMO_SHORTCUTS", "MOTIONFORGE_UIDEMO_MEDIA", "MOTIONFORGE_UIDEMO_3D"].contains { env[$0] != nil }
         showHome = !scripted
+        isScriptedRun = scripted || env.keys.contains { $0.hasPrefix("MOTIONFORGE_UIDEMO") }
         skipLaunchAnimation = scripted || env["MOTIONFORGE_NO_SPLASH"] != nil
         RecentProjects.importSystemRecentsIfEmpty()
         let defaults = UserDefaults.standard
@@ -191,11 +264,30 @@ final class EditorModel: ObservableObject {
         startAutosave()
         startMemoryPressureMonitoring()
         installKeyMonitor()
+        // Scripted runs leave the bridge to the user's own editor unless given their own socket.
+        if !scripted || env["MOTIONFORGE_CLAUDE_SOCKET"] != nil { startClaudeBridge() }
+    }
+
+    // MARK: - Claude
+
+    lazy var claudeTools = ClaudeToolHost(model: self)
+    lazy var claudeChat = ClaudeChat(editor: self)
+    @Published var showClaudePanel = UserDefaults.standard.bool(forKey: "panel.claude") {
+        didSet { UserDefaults.standard.set(showClaudePanel, forKey: "panel.claude") }
+    }
+    private var claudeBridge: ClaudeBridgeServer?
+
+    func startClaudeBridge() {
+        guard claudeBridge == nil else { return }
+        let server = ClaudeBridgeServer(host: claudeTools)
+        server.start()
+        claudeBridge = server
     }
 
     // MARK: - Snapshot refresh
 
     func refresh() {
+        defer { collab?.noteLocalEdit() }  // shared projects: send what changed
         revision = engine.revision
         layers = engine.layers()
         comp = engine.composition
@@ -210,7 +302,9 @@ final class EditorModel: ObservableObject {
             engine.layer(withID: k.layer).map { k.index < $0.keyframes(for: k.ref).count } ?? false
         }
         if validKeys.count != selectedKeyframes.count { selectedKeyframes = validKeys }
-        time.time = min(time.time, max(0, comp.duration - frameDuration))
+        // Only when it actually moves: every view that shows time re-renders on each assignment.
+        let clamped = min(time.time, max(0, comp.duration - frameDuration))
+        if clamped != time.time { time.time = clamped }
     }
 
     var frameDuration: Double { 1.0 / comp.fps }
@@ -652,10 +746,20 @@ final class EditorModel: ObservableObject {
     func importMedia(urls: [URL], addToComposition: Bool) {
         for url in urls {
             do {
-                let isAudio = UTType(filenameExtension: url.pathExtension)?.conforms(to: .audio) ?? false
+                let type = UTType(filenameExtension: url.pathExtension)
+                let isMovie = type.map { $0.conforms(to: .movie) || $0.conforms(to: .video) } ?? false
+                let isAudio = !isMovie && (type?.conforms(to: .audio) ?? false)
                 var assetID: UInt64 = 0
                 try tryEdit { engine in
-                    assetID = try (isAudio ? engine.importAudio(atPath: url.path) : engine.importImage(atPath: url.path)).uint64Value
+                    if isMovie {
+                        // A movie with no picture (sound only) comes in as audio.
+                        do { assetID = try engine.importVideo(atPath: url.path).uint64Value } catch {
+                            guard let sound = try? engine.importAudio(atPath: url.path) else { throw error }
+                            assetID = sound.uint64Value
+                        }
+                    } else {
+                        assetID = try (isAudio ? engine.importAudio(atPath: url.path) : engine.importImage(atPath: url.path)).uint64Value
+                    }
                 }
                 if addToComposition && assetID != 0 { addLayer(asset: assetID) }
             } catch {
@@ -669,11 +773,45 @@ final class EditorModel: ObservableObject {
         try body(engine)
     }
 
+    /// Everything that imports: whatever ImageIO and AVFoundation on this Mac read, plus vector artwork.
+    static let importableTypes: [UTType] = {
+        var types: [UTType] = [.image, .audio, .movie, .video, .audiovisualContent, .pdf, .svg]
+        types += (CGImageSourceCopyTypeIdentifiers() as? [String] ?? []).compactMap { UTType($0) }
+        types += AVURLAsset.audiovisualTypes().compactMap { UTType($0.rawValue) }
+        return types
+    }()
+
+    // MARK: - Updates
+
+    /// MotionForge ▸ Check for Updates…: Home shows a new version, otherwise a short answer.
+    func checkForUpdatesFromMenu() {
+        Task {
+            await updater.check(force: true)
+            if updater.available != nil {
+                UserDefaults.standard.removeObject(forKey: "updateSkipped")  // asked for: show it even if put off
+                showHome = true
+            } else if case .failed(let message) = updater.state {
+                alertMessage = message
+            } else {
+                alertMessage = "MotionForge \(Updater.currentVersion) is the newest version."
+            }
+        }
+    }
+
+    /// Before quitting to install an update: not mid-export, and unsaved work saved or let go.
+    func readyToQuitForUpdate() -> Bool {
+        if exporter != nil {
+            alertMessage = "Wait for the export to finish (or cancel it), then update."
+            return false
+        }
+        return confirmDiscardChanges()
+    }
+
     func presentImportPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .audio]
+        panel.allowedContentTypes = Self.importableTypes
         panel.allowsMultipleSelection = true
-        panel.message = "Import images (PNG, JPEG, HEIC, TIFF, …) or audio (WAV, MP3, AAC, AIFF, …)"
+        panel.message = "Import video (MOV, MP4, M4V, MPG, MTS, …), images (PNG, JPEG, HEIC, WebP, AVIF, PSD, EXR, RAW, SVG, PDF, …) or audio"
         if panel.runModal() == .OK { importMedia(urls: panel.urls, addToComposition: true) }
     }
 
@@ -695,11 +833,49 @@ final class EditorModel: ObservableObject {
 
     func undo() {
         closeCoalescedEdit()
+        if let collab {  // shared projects undo your own steps only
+            collab.flushNow()
+            collab.undo()
+            refresh()
+            return
+        }
         edit { _ = $0.undo() }
+    }
+
+    var canUndo: Bool { collab.map { $0.sync.canUndo } ?? engine.canUndo }
+    var canRedo: Bool { collab.map { $0.sync.canRedo } ?? engine.canRedo }
+    var undoTitle: String { collab != nil ? "Undo" : engine.canUndo ? "Undo \(engine.undoLabel)" : "Undo" }
+    var redoTitle: String { collab != nil ? "Redo" : engine.canRedo ? "Redo \(engine.redoLabel)" : "Redo" }
+
+    /// Other people's edits arrived (shared projects).
+    func remoteDidChange() {
+        refresh()
+        selectedLayers = selectedLayers.filter { id in layers.contains { $0.layerID == id } }
+        if let s = selection, !selectedLayers.contains(s) { selection = selectedLayers.first }
+    }
+
+    /// The editor now shows a shared project that lives on the server (no file of its own).
+    func showSharedProject() {
+        projectURL = nil
+        selection = nil
+        time.time = 0
+        zoom = nil
+        pan = .zero
+        engine.markCleanForNewDocument()
+        refresh()
+        resetCompNavigation()
+        RecoveryStore.clear()
+        enterWorkspace()
     }
 
     func redo() {
         closeCoalescedEdit()
+        if let collab {
+            collab.flushNow()
+            collab.redo()
+            refresh()
+            return
+        }
         edit { _ = $0.redo() }
     }
 
@@ -709,6 +885,16 @@ final class EditorModel: ObservableObject {
 
     /// Returns false if the user cancelled.
     func confirmDiscardChanges() -> Bool {
+        if let collab {
+            let alert = NSAlert()
+            alert.messageText = "Leave “\(collab.project.name)”?"
+            alert.informativeText = "Everything you changed is already saved in the shared project. You can open it again from Home."
+            alert.addButton(withTitle: "Leave")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+            leaveSharedProject()
+            if projectURL == nil { return true }  // nothing local to save
+        }
         guard engine.dirty else { return true }
         let alert = NSAlert()
         alert.messageText = "Save changes to “\(displayName)”?"
@@ -741,8 +927,9 @@ final class EditorModel: ObservableObject {
     func openProjectPanel() {
         guard confirmDiscardChanges() else { return }
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.motionForgeProject, .json]
-        if panel.runModal() == .OK, let url = panel.url { open(url: url) }
+        panel.allowedContentTypes = [.motionForgeProject, .motionForgeBundle, .json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if url.pathExtension == "mfbundle" { importBundle(url, askedToDiscard: true) } else { open(url: url) }
     }
 
     func open(url: URL) {
@@ -781,7 +968,8 @@ final class EditorModel: ObservableObject {
         return write(to: url)
     }
 
-    private func write(to url: URL) -> Bool {
+    @discardableResult
+    func write(to url: URL) -> Bool {
         closeCoalescedEdit()
         do {
             try engine.saveProject(toPath: url.path)
@@ -811,20 +999,77 @@ final class EditorModel: ObservableObject {
 
     // MARK: - Autosave & crash recovery
 
+    /// Every 2 s, unsaved changes are written: straight into the project file once it has one
+    /// (File › Auto Save, on by default), otherwise to the crash-recovery copy. Nothing is written
+    /// while an edit is still open (a drag, a burst of typing), so a save never lands mid-gesture.
+    static let autosaveInterval: TimeInterval = 2
+
+    @Published var autoSaveToFile = UserDefaults.standard.object(forKey: "autoSaveToFile") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoSaveToFile, forKey: "autoSaveToFile") }
+    }
+    @Published private(set) var lastAutoSave: Date?
+    private var autosaveFailed = false
+
     private func startAutosave() {
-        autosaveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        autosaveTimer = Timer.scheduledTimer(withTimeInterval: Self.autosaveInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.autosaveIfNeeded() }
         }
     }
 
+    private var autosaveInFlight = false
+    private var autosaveNotBefore = Date.distantPast
+    private var fileAutosaveRetryAt = Date.distantPast  // after a failed write, recovery copies until then
+    var autosaveBusy: Bool { autosaveInFlight }
+
     func autosaveIfNeeded() {
-        guard engine.dirty, engine.revision != lastAutosavedRevision else { return }
-        do {
-            try RecoveryStore.write(engine: engine, originalURL: projectURL)
-            lastAutosavedRevision = engine.revision
-        } catch {
-            NSLog("MotionForge autosave failed: \(error.localizedDescription)")
+        closeLeakedUndoGroup()
+        guard engine.dirty, engine.revision != lastAutosavedRevision, !engine.inUndoGroup, !autosaveInFlight,
+              !time.isPlaying, Date() >= autosaveNotBefore else { return }
+        let revision = engine.revision
+        let fileURL = autoSaveToFile && Date() >= fileAutosaveRetryAt ? projectURL.flatMap { $0.pathExtension == "mfproj" ? $0 : nil } : nil
+        let toFile = fileURL != nil
+        let url = fileURL ?? RecoveryStore.autosaveURL
+        if !toFile { RecoveryStore.prepare(originalURL: projectURL) }
+        autosaveInFlight = true
+        // Written off the main thread so a big project never stalls playback or editing.
+        engine.saveProjectInBackground(toPath: url.path, markSaved: toFile) { [weak self] error, seconds in
+            let message = error?.localizedDescription
+            MainActor.assumeIsolated {  // the engine calls back on the main queue
+                self?.autosaveFinished(revision: revision, toFile: toFile, url: url, error: message, seconds: seconds)
+            }
         }
+    }
+
+    private func autosaveFinished(revision: UInt64, toFile: Bool, url: URL, error: String?, seconds: Double) {
+        autosaveInFlight = false
+        // Slow writes (very large projects) back off instead of saving back to back.
+        autosaveNotBefore = Date().addingTimeInterval(max(0, seconds * 4 - Self.autosaveInterval))
+        if let error {
+            if toFile {
+                fileAutosaveRetryAt = Date().addingTimeInterval(30)
+                if !autosaveFailed {
+                    autosaveFailed = true
+                    alertMessage = "Auto Save couldn’t write “\(url.lastPathComponent)”: \(error). Unsaved changes go to a recovery copy until it works again."
+                }
+            }
+            NSLog("MotionForge autosave failed: \(error)")
+            return
+        }
+        lastAutosavedRevision = revision
+        if toFile {
+            autosaveFailed = false
+            lastAutoSave = Date()
+            RecoveryStore.clear()
+        }
+    }
+
+    /// A drag whose view disappeared mid-gesture (scrolled away, slid past the end) never ends its
+    /// undo group; later edits would all join it and autosave would stop. Close it once no mouse
+    /// button is down and no keyboard edit is open.
+    func closeLeakedUndoGroup() {
+        guard engine.inUndoGroup, coalesceKey == nil, NSEvent.pressedMouseButtons == 0 else { return }
+        var guardCount = 0
+        while engine.inUndoGroup && guardCount < 16 { engine.endUndoGroup(); guardCount += 1 }
     }
 
     /// Called once the window is up: offers to restore work from a session that didn't quit cleanly.
@@ -844,6 +1089,8 @@ final class EditorModel: ObservableObject {
                 try engine.recover(fromPath: pending.projectURL.path)
                 projectURL = pending.originalURL
                 refresh()
+                resetCompNavigation()
+                enterWorkspace()  // straight to the recovered work, with Home's "Back to…" available
             } catch {
                 alertMessage = "Recovery failed: \(error.localizedDescription)"
             }
@@ -855,6 +1102,7 @@ final class EditorModel: ObservableObject {
 
     /// Clean quit: the user has already answered the save prompt, so the autosave can go.
     func applicationWillTerminate() {
+        claudeBridge?.stop()
         RecoveryStore.endSession(keepAutosave: false)
     }
 
@@ -897,7 +1145,20 @@ final class EditorModel: ObservableObject {
 
     /// Editor shortcuts that must not fire while typing into a text field.
     private func handleKey(_ event: NSEvent) -> Bool {
+        // ⌥⌘; is After Effects' Preferences: Settings, as ⌘, opens it (macOS names the menu item
+        // Settings…, so a second item for it would read as a duplicate).
+        if event.modifierFlags.intersection([.command, .option, .control, .shift]) == [.command, .option],
+           event.charactersIgnoringModifiers == ";" {
+            // The app menu's own Settings… item (⌘,): the only way into a SwiftUI Settings scene from AppKit.
+            if let menu = NSApp.mainMenu?.items.first?.submenu,
+               let i = menu.items.firstIndex(where: { $0.keyEquivalent == "," && $0.keyEquivalentModifierMask.contains(.command) }) {
+                menu.performActionForItem(at: i)
+            }
+            return true
+        }
         if showHome { return false }  // the workspace is covered
+        // Only the editor window: not the export window, a sheet, or anything above the editor.
+        guard let window = event.window, !(window is NSPanel), window.sheetParent == nil, window.attachedSheet == nil else { return false }
         if let responder = event.window?.firstResponder, responder is NSText || responder is NSTextView { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control])
         if mods == [.command] && event.modifierFlags.contains(.shift) && event.keyCode == 126 {  // ⌘⇧↑
@@ -915,6 +1176,24 @@ final class EditorModel: ObservableObject {
         }
         guard mods.isEmpty else { return false }
         let shift = event.modifierFlags.contains(.shift)
+        // Letters by the character typed, so they follow the keyboard layout (Y and Z swap on QWERTZ).
+        if event.keyCode != 82, let key = event.charactersIgnoringModifiers?.lowercased(), key.count == 1, key.first!.isLetter {
+            if let t = EditorTool.allCases.first(where: { $0.key == key }) {
+                selectTool(t)
+                return true
+            }
+            switch key {
+            case "b": setWorkAreaStart(); return true
+            case "n": setWorkAreaEnd(); return true
+            case "p": revealProperties([.position], adding: shift); return true
+            case "r": revealProperties([.rotation], adding: shift); return true
+            case "s": revealProperties([.scale], adding: shift); return true
+            case "t": revealProperties([.opacity], adding: shift); return true
+            case "a": revealProperties([.anchorPoint], adding: shift); return true
+            case "u": revealAnimatedOrModified(); return true
+            default: return false
+            }
+        }
         switch event.keyCode {
         case 49: togglePlayback(); return true                                   // space
         case 51, 117: deleteSelection(); return true                             // delete, fwd-delete
@@ -927,16 +1206,15 @@ final class EditorModel: ObservableObject {
         case 115: goToStart(); return true                                       // home
         case 119: goToEnd(); return true                                         // end
         case 53:                                                                 // escape
-            if !penDraft.isEmpty { penDraft = [] } else if tool == .pen { tool = .select } else { clearSelection() }
+            if !penDraft.isEmpty { penDraft = [] } else if tool != .select { tool = .select } else { clearSelection() }
             return true
+        case 82, 29: startRAMPreview(); return true                               // 0 (keypad or main row)
         case 36, 76:                                                             // return / enter
             if tool == .pen && penDraft.count >= 2 { commitPen(closed: false); return true }
             return false
         case 24: zoomTimeline(by: 1.5); return true                               // = zoom timeline in
         case 27: zoomTimeline(by: 1 / 1.5); return true                           // - zoom out
         case 42: viewport.fit(); return true                                      // \ whole composition
-        case 35: tool = .pen; return true                                         // P
-        case 9: tool = .select; return true                                       // V
         default: return false
         }
     }

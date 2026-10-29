@@ -1,6 +1,7 @@
 // MotionForge core — document model: project, assets, compositions, layers, animatable properties.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -43,6 +44,10 @@ enum class PropId : uint8_t {
     TrimOffset,       // percent, shifts the trimmed range along the path
     TimeRemap,        // seconds of source time shown (precomp layers with time remapping)
     AudioLevel,       // dB relative to the source, -48 (silent) to 0 (audio layers)
+    PositionZ,        // px, 3D layers and cameras: + is away from the viewer
+    RotationX,        // degrees, 3D: tips the top away
+    RotationY,        // degrees, 3D: swings the right side towards the viewer
+    CameraZoom,       // px, cameras: distance at which 1 px of a layer is 1 px on screen (focal length)
     Count
 };
 inline constexpr int kPropCount = static_cast<int>(PropId::Count);
@@ -138,7 +143,7 @@ std::vector<std::array<double, 2>> sampleMotionPath(const Property& p, int perSe
 // Layers
 // ---------------------------------------------------------------------------------------------
 
-enum class LayerKind : uint8_t { Shape = 0, Image, Null, Text, Precomp, Audio };
+enum class LayerKind : uint8_t { Shape = 0, Image, Null, Text, Precomp, Audio, Camera };
 enum class ShapeType : uint8_t { Rectangle = 0, Ellipse, Polygon, Star, Path };
 
 // A cubic bezier path: each vertex has handles relative to its point (zero = sharp corner).
@@ -234,6 +239,15 @@ const char* maskModeKey(MaskMode);
 std::optional<MaskShape> maskShapeFromKey(std::string_view);
 std::optional<MaskMode> maskModeFromKey(std::string_view);
 
+// Rotoscoping: a mask path keyframed over time. Between keys with the same points the shape morphs
+// point by point; otherwise it switches at the next key.
+struct PathKey {
+    double time = 0;
+    BezierPath path;
+    bool operator==(const PathKey&) const = default;
+};
+BezierPath pathKeysAt(const std::vector<PathKey>& keys, double time);
+
 struct Mask {
     ObjectId id = 0;
     std::string name;
@@ -243,7 +257,8 @@ struct Mask {
     bool enabled = true;
     std::array<Property, kMaskParamCount> params{};
     BezierPath path;  // MaskShape::Path, in layer space (Position offsets it)
-    Shared<PathTrack> pathTrack;  // animated path (replaces `path` when set)
+    Shared<PathTrack> pathTrack;  // animated path (replaces `path` when set): imported, or Roto Brush
+    std::vector<PathKey> pathKeys;  // keyframed path (replaces `path` when not empty), sorted by time
     Property& param(MaskParam p) { return params[static_cast<size_t>(p)]; }
     const Property& param(MaskParam p) const { return params[static_cast<size_t>(p)]; }
     bool operator==(const Mask&) const = default;
@@ -307,14 +322,16 @@ struct Layer {
     // precomps draw their layers straight into this composition (no clipping to the source's
     // frame); others are composited as one group, clipped to the source's frame.
     ObjectId source = 0;
-    double startTime = 0;  // precomp and audio layers: where source time 0 sits in this composition
+    double startTime = 0;  // precomp, audio and video layers: where source time 0 sits in this composition
     bool timeRemap = false;
     bool collapse = false;
     bool motionBlur = false;  // blurred along its motion when the composition renders with motion blur
+    bool threeD = false;      // the 3D switch: Z position, X / Y rotation, seen through the camera
 
     Property& prop(PropId id) { return props[static_cast<size_t>(id)]; }
     const Property& prop(PropId id) const { return props[static_cast<size_t>(id)]; }
     bool activeAt(double t) const { return visible && t >= inPoint && t < outPoint; }
+    bool is3D() const { return threeD || kind == LayerKind::Camera; }
     bool inTimeRange(double t) const { return t >= inPoint && t < outPoint; }
     bool hasMatte() const { return matteLayer != 0 && matteMode != MatteMode::None; }
     double sourceTime(double t) const;  // precomp layers: source composition time shown at `t`
@@ -348,17 +365,27 @@ const PropDef* propertyDef(const Layer& l, PropRef r);
 // Assets, compositions, project
 // ---------------------------------------------------------------------------------------------
 
-enum class AssetKind : uint8_t { Image = 0, Audio };
+// Video assets are footage: image layers show them, one source frame at a time (and play their sound).
+enum class AssetKind : uint8_t { Image = 0, Audio, Video };
 
 struct Asset {
     ObjectId id = 0;
     AssetKind kind = AssetKind::Image;
     std::string name;
     std::string path;          // absolute, resolved at load time
-    int width = 0, height = 0; // pixels (images)
-    double duration = 0;       // seconds (audio)
+    int width = 0, height = 0; // pixels (images, video as displayed: rotation applied)
+    double duration = 0;       // seconds (audio, video)
+    double fps = 0;            // video: frames per second
+    bool hasAudio = false;     // video with a sound track
     bool missing = false;      // could not be found on load
     uint32_t generation = 0;   // bumped when the media is relinked/reloaded (invalidates caches)
+    bool isVideo() const { return kind == AssetKind::Video; }
+    int64_t frameCount() const { return std::max<int64_t>(1, std::llround(duration * (fps > 0 ? fps : 30))); }
+    // The source frame a footage layer shows `sourceTime` seconds into the clip (held at the ends).
+    int64_t frameAt(double sourceTime) const {
+        const int64_t f = static_cast<int64_t>(std::floor(sourceTime * (fps > 0 ? fps : 30) + 1e-6));
+        return std::clamp<int64_t>(f, 0, frameCount() - 1);
+    }
     bool operator==(const Asset&) const = default;
 };
 
@@ -375,9 +402,17 @@ struct Composition {
     bool motionBlur = false;
     double shutterAngle = 180, shutterPhase = -90;
     int motionBlurSamples = 8;
+    // Work area (B / N): the part previews loop over and Trim Comp to Work Area keeps.
+    // workEnd < 0 means the end of the composition.
+    double workStart = 0, workEnd = -1;
     std::vector<Layer> layers;            // index 0 is the TOP of the stack
 
     double frameDuration() const { return 1.0 / fps; }
+    double workAreaStart() const { return std::max(0.0, std::min(workStart, duration - frameDuration())); }
+    double workAreaEnd() const {
+        return std::max(workEnd < 0 ? duration : std::min(workEnd, duration), workAreaStart() + frameDuration());
+    }
+    bool hasWorkArea() const { return workAreaStart() > 0 || workAreaEnd() < duration; }
     int64_t frameCount() const { return static_cast<int64_t>(std::llround(duration * fps)); }
     double snapToFrame(double t) const { return std::round(t * fps) / fps; }
 
@@ -411,6 +446,9 @@ struct Project {
 Layer makeLayer(LayerKind kind, const Composition& comp, ObjectId id, const Asset* asset = nullptr);
 // A layer showing `source` inside `comp`, anchored at the source's centre.
 Layer makePrecompLayer(const Composition& comp, const Composition& source, ObjectId id);
+// Layer properties that are animated or differ from what a new layer of the same kind starts
+// with (the timeline's "show modified properties", UU).
+std::vector<PropId> modifiedProps(const Project& project, const Composition& comp, const Layer& layer);
 // True when `comp` shows `target` directly or through nested precomps (adding `target` to
 // `comp` would then create a cycle when comp == target or target contains comp).
 bool compUses(const Project& project, ObjectId comp, ObjectId target);

@@ -90,6 +90,7 @@ struct HomeView: View {
     @State private var hovered: String?
 
     enum Phase { case splash, home }
+    @MainActor static var splashPlayed = false
 
     var body: some View {
         ZStack {
@@ -111,7 +112,11 @@ struct HomeView: View {
         }
         .onAppear {
             recents = RecentProjects.all()
-            if model.skipLaunchAnimation || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            if !model.isScriptedRun || ProcessInfo.processInfo.environment["MOTIONFORGE_UPDATE_FEED"] != nil {
+                Task { await model.updater.check() }  // new versions on GitHub, at most every six hours
+            }
+            // The forge animation plays once per launch, not on every return to Home.
+            if model.skipLaunchAnimation || Self.splashPlayed || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 bars = 1; outline = 1; word = 1
                 phase = .home
                 withAnimation(.easeOut(duration: 0.3)) { contentShown = true }
@@ -119,7 +124,8 @@ struct HomeView: View {
                 runSplash()
             }
         }
-        .onChange(of: model.showHome) { _, shown in if shown { recents = RecentProjects.all() } }
+        // Saving while Home is showing (or a thumbnail finishing) updates the list right away.
+        .onReceive(NotificationCenter.default.publisher(for: RecentProjects.changed)) { _ in recents = RecentProjects.all() }
     }
 
     // MARK: launch animation
@@ -135,6 +141,7 @@ struct HomeView: View {
 
     private func finishSplash() {
         guard phase == .splash else { return }
+        Self.splashPlayed = true
         bars = 1; outline = 1; word = 1
         withAnimation(.spring(response: 0.6, dampingFraction: 0.86)) { phase = .home; glow = 0 }
         withAnimation(.easeOut(duration: 0.45).delay(0.2)) { contentShown = true }
@@ -168,6 +175,7 @@ struct HomeView: View {
             .padding(.bottom, 22)
 
             AnnouncementSlot(account: model.account)
+            UpdateBanner(updater: model.updater, model: model)
 
             HStack(alignment: .top, spacing: 34) {
                 actions
@@ -186,8 +194,7 @@ struct HomeView: View {
             Button { model.newProject() } label: {
                 Label("New Project", systemImage: "plus").frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(HomeButtonStyle(primary: true))
-            .keyboardShortcut("n")
+            .buttonStyle(HomeButtonStyle(primary: true))  // ⌘N / ⌥⌘N come from the File menu
             Button { model.openProjectPanel() } label: {
                 Label("Open Project…", systemImage: "folder").frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -215,6 +222,7 @@ struct HomeView: View {
 
     private var recentGrid: some View {
         VStack(alignment: .leading, spacing: 14) {
+            SharedProjectsSection(model: model, social: model.social, account: model.account)
             HStack {
                 Text("Recent Projects").font(.system(size: 17, weight: .semibold))
                 Spacer()
@@ -250,7 +258,7 @@ struct HomeView: View {
         return VStack(alignment: .leading, spacing: 8) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.45))
-                if let img = NSImage(contentsOf: r.thumbnailURL) {
+                if let img = HomeThumbnails.image(r.thumbnailURL) {
                     Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .padding(6)
@@ -304,7 +312,7 @@ struct HomeView: View {
     }
 }
 
-private struct HomeButtonStyle: ButtonStyle {
+struct HomeButtonStyle: ButtonStyle {
     let primary: Bool
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -353,5 +361,18 @@ struct AnnouncementBanner: View {
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.12)))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(tint.opacity(0.35)))
+    }
+}
+
+/// Home card thumbnails, read from disk once per file version (not on every hover redraw).
+@MainActor
+enum HomeThumbnails {
+    private static var cache: [URL: (Date, NSImage)] = [:]
+    static func image(_ url: URL) -> NSImage? {
+        guard let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return nil }
+        if let hit = cache[url], hit.0 == modified { return hit.1 }
+        guard let img = NSImage(contentsOf: url) else { return nil }
+        cache[url] = (modified, img)
+        return img
     }
 }

@@ -147,16 +147,17 @@ struct ProjectPanel: View {
                 }
                 Section("Media") {
                     if model.assets.isEmpty {
-                        Text("Drop images or audio here, or use Import").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("Drop video, images or audio here, or use Import").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                     ForEach(model.assets, id: \.assetID) { a in
                         HStack(spacing: 8) {
-                            Image(systemName: a.missing ? "exclamationmark.triangle.fill" : a.isAudio ? "waveform" : "photo")
+                            Image(systemName: a.missing ? "exclamationmark.triangle.fill" : a.isAudio ? "waveform" : a.isVideo ? "film" : "photo")
                                 .foregroundStyle(a.missing ? Theme.warning : a.isAudio ? Theme.audio : .secondary)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(a.name).lineLimit(1)
                                 Text(a.missing ? "Missing — \(a.path)"
                                      : a.isAudio ? "Audio · \(Timecode.string(a.duration, fps: model.comp.fps))"
+                                     : a.isVideo ? "\(a.width)×\(a.height) · \(fpsString(a.fps)) fps · \(Timecode.string(a.duration, fps: a.fps))\(a.hasAudio ? " · sound" : "")"
                                      : "\(a.width)×\(a.height)\(a.loaded ? "" : " · loading…")")
                                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                             }
@@ -260,6 +261,10 @@ struct CompSettingsSheet: View {
         Preset(label: "21:9 Cinema 2560×1080", w: 2560, h: 1080),
     ]
     private let rates: [Double] = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 120]
+    private var rateChoices: [Double] {
+        let current = model.comp.fps
+        return rates.contains(where: { abs($0 - current) < 1e-6 }) ? rates : (rates + [current]).sorted()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -280,7 +285,7 @@ struct CompSettingsSheet: View {
                         .help("Swap orientation")
                 }
                 Picker("Frame rate", selection: $fps) {
-                    ForEach(rates, id: \.self) { r in Text("\(fpsString(r)) fps").tag(r) }
+                    ForEach(rateChoices, id: \.self) { r in Text("\(fpsString(r)) fps").tag(r) }
                 }
                 HStack {
                     TextField("Duration", value: $duration, format: .number.precision(.fractionLength(0...3))).frame(width: 80)
@@ -311,7 +316,7 @@ struct CompSettingsSheet: View {
             name = c.name
             width = c.width
             height = c.height
-            fps = rates.min { abs($0 - c.fps) < abs($1 - c.fps) } ?? c.fps
+            fps = c.fps  // kept exactly (15 fps stays 15), offered alongside the presets
             duration = c.duration
             background = c.background.color
         }
@@ -346,6 +351,12 @@ struct StatusBar: View {
                 if s.pendingMedia > 0 { metric("Media", "\(s.pendingMedia) loading", warn: true) }
             }
             Spacer()
+            if let activity = model.bundleActivity {
+                HStack(spacing: 5) { ProgressView().controlSize(.mini); Text(activity) }
+            } else if let saved = model.lastAutoSave, !model.engine.dirty {
+                Text("Auto-saved \(saved.formatted(date: .omitted, time: .standard))").foregroundStyle(.secondary)
+                    .help("File › Auto Save Every 2 Seconds")
+            }
             ExportStatusPill(model: model)
             if let s { Text("\(s.deviceName) · Metal\(s.programmableBlending ? " · tile blending" : "")").foregroundStyle(.secondary) }
         }

@@ -101,17 +101,27 @@ final class AudioPlayback {
                 state = .playing
                 return currentTime
             }
-            if CACurrentMediaTime() - startRequested > 0.5 {  // don't hold the picture for long
+            if CACurrentMediaTime() - startRequested > 1.5 {
+                // The sound didn't start in time: play on silently rather than let it come in late
+                // and out of step with the picture.
+                wantsPlay = false
+                player.pause()
                 state = .idle
                 return nil
             }
             return startTime
         case .playing:
-            guard player.timeControlStatus == .playing else {  // reached the end of the sound
-                state = .idle
+            switch player.timeControlStatus {
+            case .playing:
+                return currentTime
+            case .waitingToPlayAtSpecifiedRate:
+                return currentTime  // a stall (output device change, buffering): the picture waits with the sound
+            case .paused:
+                state = .idle  // reached the end of the sound
                 return nil
+            @unknown default:
+                return currentTime
             }
-            return currentTime
         }
     }
 

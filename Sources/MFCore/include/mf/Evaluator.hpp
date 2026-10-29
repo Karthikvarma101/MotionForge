@@ -69,6 +69,32 @@ struct DrawItem {
     ShapeType shape = ShapeType::Rectangle;
     BlendMode blend = BlendMode::Normal;
     Affine toTarget;            // layer space -> render-target pixels (preview scale applied)
+    // 3D layers are a perspective (projective) map: target = toTarget(p) / (persp·p + perspW).
+    // 2D layers keep persp 0, perspW 1.
+    Vec2 persp{};
+    double perspW = 1;
+    bool threeD = false;
+    double depth = 0;           // 3D: distance in front of the camera (3D layers paint far to near)
+    bool projective() const { return persp.x != 0 || persp.y != 0 || perspW != 1; }
+    Vec2 project(Vec2 p) const {
+        const double w = persp.x * p.x + persp.y * p.y + perspW;
+        const Vec2 q = toTarget.apply(p);
+        return std::abs(w) > 1e-12 ? Vec2{q.x / w, q.y / w} : q;
+    }
+    // outer ∘ this: a 2D transform applied after this one (an offscreen region's offset).
+    void prepend(const Affine& o) {
+        const Affine m = toTarget;
+        toTarget = {o.a * m.a + o.c * m.b + o.tx * persp.x, o.b * m.a + o.d * m.b + o.ty * persp.x,
+                    o.a * m.c + o.c * m.d + o.tx * persp.y, o.b * m.c + o.d * m.d + o.ty * persp.y,
+                    o.a * m.tx + o.c * m.ty + o.tx * perspW, o.b * m.tx + o.d * m.ty + o.ty * perspW};
+    }
+    // this ∘ inner: a 2D transform applied first (a glyph inside a text layer).
+    void append(const Affine& g) {
+        toTarget = toTarget * g;
+        const Vec2 p = persp;
+        persp = {p.x * g.a + p.y * g.b, p.x * g.c + p.y * g.d};
+        perspW = p.x * g.tx + p.y * g.ty + perspW;
+    }
     double opacity = 1;         // 0–1
     Vec2 boundsMin, boundsMax;  // content rectangle in layer space
     Value fill{}, stroke{};     // straight RGBA
@@ -76,6 +102,7 @@ struct DrawItem {
     double strokeWidth = 0, roundness = 0, points = 5, innerRatio = 0.5;
     ObjectId asset = 0;
     uint32_t assetGeneration = 0;
+    int64_t videoFrame = -1;                    // footage: the source frame shown (-1 = a still image)
     uint32_t maskStart = 0, maskCount = 0;      // into FrameDesc::masks
     uint32_t effectStart = 0, effectCount = 0;  // into FrameDesc::effects
     int32_t matte = -1;                         // into FrameDesc::mattes
@@ -121,6 +148,37 @@ struct EvalStats {
 // Layer-space -> composition-pixel transform at `time`, including the parent chain.
 // Parent cycles (which the editing API prevents) are cut after 64 levels.
 Affine layerWorldTransform(const Composition& comp, const Layer& layer, double time);
+
+// 3D: a layer's full transform including its parents (2D parents act at z = 0).
+Mat4 layerWorldMatrix(const Composition& comp, const Layer& layer, double time);
+
+// What 3D layers are seen through: the topmost visible camera layer active at `time`, else a
+// default 50 mm camera that shows z = 0 exactly as 2D. Camera space: +z ahead, +y down.
+struct CameraView {
+    Mat4 view;          // composition (world) space -> camera space
+    double zoom = 1;    // px: screen = centre + zoom · (x, y) / z
+    double cx = 0, cy = 0;
+    ObjectId camera = 0;  // 0 = the default camera
+};
+CameraView cameraAt(const Composition& comp, double time);
+// The viewer's own look at a 3D scene (Custom View): while set on this thread, cameraAt() for
+// `comp` returns it instead. Export and other threads never see it.
+void setViewOverride(ObjectId comp, const CameraView* view);
+// A view orbiting the composition's centre: yaw / pitch in degrees, `distance` from the centre
+// (the default camera's distance at 1), shifted by `pan` (px, in the view's plane).
+CameraView orbitView(const Composition& comp, double yaw, double pitch, double distance, Vec2 pan);
+
+// Layer space -> composition pixels for any layer: a 2D layer's world transform, or a 3D layer's
+// perspective view through the camera. `visible` is false when a 3D layer is at or behind the camera.
+struct LayerMapping {
+    Affine aff;
+    Vec2 persp{};
+    double perspW = 1;
+    bool visible = true;
+    Vec2 apply(Vec2 p) const;
+    bool inverse(Vec2 compPoint, Vec2& layerPoint) const;  // false off the layer's plane (horizon)
+};
+LayerMapping layerToComp(const Composition& comp, const Layer& layer, double time, Vec2 boundsMin = {}, Vec2 boundsMax = {});
 
 // Precomps nested deeper than this draw nothing (cycles are refused when editing, too).
 inline constexpr int kMaxNesting = 16;

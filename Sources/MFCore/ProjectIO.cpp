@@ -1,6 +1,7 @@
 #include "mf/ProjectIO.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -251,13 +252,15 @@ Json layerToJson(const Layer& l) {
     lj.set("parent", Json(l.parent));
     lj.set("asset", Json(l.asset));
     if (l.motionBlur) lj.set("motionBlur", Json(true));
+    if (l.threeD) lj.set("threeD", Json(true));
     if (l.kind == LayerKind::Precomp) {
         lj.set("source", Json(l.source));
         lj.set("startTime", Json(l.startTime));
         lj.set("timeRemap", Json(l.timeRemap));
         lj.set("collapse", Json(l.collapse));
     }
-    if (l.kind == LayerKind::Audio) lj.set("startTime", Json(l.startTime));
+    // Audio and footage (image layers showing video) slide in time too.
+    if (l.kind == LayerKind::Audio || (l.kind == LayerKind::Image && l.startTime != 0)) lj.set("startTime", Json(l.startTime));
     Json props = Json::object();
     for (int i = 0; i < kPropCount; ++i) {
         const auto id = static_cast<PropId>(i);
@@ -282,6 +285,16 @@ Json layerToJson(const Layer& l) {
             mj.set("properties", std::move(mp));
             if (m.shape == MaskShape::Path) mj.set("path", pathToJson(m.path));
             if (m.pathTrack) mj.set("pathTrack", pathTrackToJson(*m.pathTrack));
+            if (!m.pathKeys.empty()) {
+                Json keys = Json::array();
+                for (const PathKey& k : m.pathKeys) {
+                    Json kj = Json::object();
+                    kj.set("t", Json(k.time));
+                    kj.set("path", pathToJson(k.path));
+                    keys.push(std::move(kj));
+                }
+                mj.set("pathKeys", std::move(keys));
+            }
             masks.push(std::move(mj));
         }
         lj.set("masks", std::move(masks));
@@ -357,13 +370,14 @@ Layer layerFromJson(const Json& lj, const Composition& c, ObjectId* maxId) {
     l.parent = static_cast<ObjectId>(lj.get("parent").number(0));
     l.asset = static_cast<ObjectId>(lj.get("asset").number(0));
     l.motionBlur = lj.get("motionBlur").boolean(false);
+    l.threeD = lj.get("threeD").boolean(false);
     if (kind == LayerKind::Precomp) {
         l.source = static_cast<ObjectId>(lj.get("source").number(0));
         l.startTime = lj.get("startTime").number(0);
         l.timeRemap = lj.get("timeRemap").boolean(false);
         l.collapse = lj.get("collapse").boolean(false);
     }
-    if (kind == LayerKind::Audio) l.startTime = lj.get("startTime").number(0);
+    if (kind == LayerKind::Audio || kind == LayerKind::Image) l.startTime = lj.get("startTime").number(0);
     const Json& props = lj.get("properties");
     for (int i = 0; i < kPropCount; ++i) {
         const auto id = static_cast<PropId>(i);
@@ -379,6 +393,8 @@ Layer layerFromJson(const Json& lj, const Composition& c, ObjectId* maxId) {
         m.inverted = mj.get("inverted").boolean(false);
         if (m.shape == MaskShape::Path) m.path = pathFromJson(mj.get("path"));
         if (mj.has("pathTrack")) m.pathTrack = pathTrackFromJson(mj.get("pathTrack"));
+        for (const Json& kj : mj.get("pathKeys").items()) m.pathKeys.push_back({kj.get("t").number(0), pathFromJson(kj.get("path"))});
+        std::sort(m.pathKeys.begin(), m.pathKeys.end(), [](const PathKey& a, const PathKey& b) { return a.time < b.time; });
         m.enabled = mj.get("enabled").boolean(true);
         for (int k = 0; k < kMaskParamCount; ++k) {
             const PropDef& def = maskParamDef(static_cast<MaskParam>(k));
@@ -434,7 +450,80 @@ Layer layerFromJson(const Json& lj, const Composition& c, ObjectId* maxId) {
     return l;
 }
 
-std::string serializeProject(const Project& project, const std::string& projectDir) {
+Json compositionToJson(const Composition& c, bool withLayers) {
+    Json cj = Json::object();
+    cj.set("id", Json(c.id));
+    cj.set("name", Json(c.name));
+    if (!c.folder.empty()) cj.set("folder", Json(c.folder));
+    cj.set("width", Json(c.width));
+    cj.set("height", Json(c.height));
+    cj.set("fps", Json(c.fps));
+    cj.set("duration", Json(c.duration));
+    cj.set("background", valueToJson(c.background, 4));
+    if (c.motionBlur) {
+        Json mb = Json::object();
+        mb.set("shutterAngle", Json(c.shutterAngle));
+        mb.set("shutterPhase", Json(c.shutterPhase));
+        mb.set("samples", Json(c.motionBlurSamples));
+        cj.set("motionBlur", std::move(mb));
+    }
+    if (c.hasWorkArea()) {
+        Json wa = Json::array();
+        wa.push(Json(c.workAreaStart()));
+        wa.push(Json(c.workAreaEnd()));
+        cj.set("workArea", std::move(wa));
+    }
+    if (withLayers) {
+        Json layers = Json::array();
+        for (const Layer& l : c.layers) layers.push(layerToJson(l));
+        cj.set("layers", std::move(layers));
+    }
+    return cj;
+}
+
+Composition compositionFromJson(const Json& cj, ObjectId* maxId) {
+    Composition c;
+    c.id = static_cast<ObjectId>(cj.get("id").number());
+    c.name = cj.get("name").string();
+    c.folder = cj.get("folder").string();
+    c.width = std::clamp(static_cast<int>(cj.get("width").number(1920)), 1, 16384);
+    c.height = std::clamp(static_cast<int>(cj.get("height").number(1080)), 1, 16384);
+    c.fps = std::clamp(cj.get("fps").number(30), 1.0, 240.0);
+    c.duration = std::max(cj.get("duration").number(10), c.frameDuration());
+    c.background = valueFromJson(cj.get("background"), c.background);
+    if (const Json& mb = cj.get("motionBlur"); mb.isObject()) {
+        c.motionBlur = true;
+        c.shutterAngle = std::clamp(mb.get("shutterAngle").number(180), 0.0, 720.0);
+        c.shutterPhase = std::clamp(mb.get("shutterPhase").number(-90), -360.0, 360.0);
+        c.motionBlurSamples = std::clamp(int(mb.get("samples").number(8)), 1, 64);
+    }
+    if (const Json& wa = cj.get("workArea"); wa.isArray() && wa.items().size() == 2) {
+        c.workStart = std::max(0.0, wa.items()[0].number(0));
+        c.workEnd = wa.items()[1].number(-1);
+    }
+    ObjectId localMax = c.id;
+    for (const Json& lj : cj.get("layers").items()) {
+        Layer l = layerFromJson(lj, c, &localMax);
+        localMax = std::max(localMax, l.id);
+        c.layers.push_back(std::move(l));
+    }
+    dropDanglingLinks(c);
+    if (maxId) *maxId = std::max(*maxId, localMax);
+    return c;
+}
+
+void dropDanglingLinks(Composition& c) {
+    // Dangling parent / matte links are dropped rather than failing the whole load.
+    for (Layer& l : c.layers) {
+        if (l.parent && (!c.findLayer(l.parent) || l.parent == l.id)) l.parent = 0;
+        if (l.matteLayer && (!c.findLayer(l.matteLayer) || l.matteLayer == l.id)) {
+            l.matteLayer = 0;
+            l.matteMode = MatteMode::None;
+        }
+    }
+}
+
+std::string serializeProject(const Project& project, const std::string& projectDir, bool absolutePaths) {
     Json root = Json::object();
     root.set("format", Json(kProjectFormat));
     root.set("version", Json(Project::kFormatVersion));
@@ -446,43 +535,23 @@ std::string serializeProject(const Project& project, const std::string& projectD
     for (const Asset& a : project.assets) {
         Json aj = Json::object();
         aj.set("id", Json(a.id));
-        aj.set("kind", Json(a.kind == AssetKind::Audio ? "audio" : "image"));
+        aj.set("kind", Json(a.kind == AssetKind::Audio ? "audio" : a.kind == AssetKind::Video ? "video" : "image"));
         aj.set("name", Json(a.name));
         aj.set("relativePath", Json(relativeTo(a.path, projectDir)));
-        aj.set("absolutePath", Json(a.path));
+        aj.set("absolutePath", Json(absolutePaths ? a.path : std::string()));
         aj.set("width", Json(a.width));
         aj.set("height", Json(a.height));
-        if (a.kind == AssetKind::Audio) aj.set("duration", Json(a.duration));
+        if (a.kind == AssetKind::Audio || a.kind == AssetKind::Video) aj.set("duration", Json(a.duration));
+        if (a.kind == AssetKind::Video) {
+            aj.set("fps", Json(a.fps));
+            if (a.hasAudio) aj.set("hasAudio", Json(true));
+        }
         assets.push(std::move(aj));
     }
     root.set("assets", std::move(assets));
 
     Json comps = Json::array();
-    for (const Composition& c : project.compositions) {
-        Json cj = Json::object();
-        cj.set("id", Json(c.id));
-        cj.set("name", Json(c.name));
-        if (!c.folder.empty()) cj.set("folder", Json(c.folder));
-        cj.set("width", Json(c.width));
-        cj.set("height", Json(c.height));
-        cj.set("fps", Json(c.fps));
-        cj.set("duration", Json(c.duration));
-        cj.set("background", valueToJson(c.background, 4));
-        if (c.motionBlur) {
-            Json mb = Json::object();
-            mb.set("shutterAngle", Json(c.shutterAngle));
-            mb.set("shutterPhase", Json(c.shutterPhase));
-            mb.set("samples", Json(c.motionBlurSamples));
-            cj.set("motionBlur", std::move(mb));
-        }
-        Json layers = Json::array();
-        for (const Layer& l : c.layers) {
-            Json lj = layerToJson(l);
-            layers.push(std::move(lj));
-        }
-        cj.set("layers", std::move(layers));
-        comps.push(std::move(cj));
-    }
+    for (const Composition& c : project.compositions) comps.push(compositionToJson(c, true));
     root.set("compositions", std::move(comps));
     return root.dump(2) + "\n";
 }
@@ -515,7 +584,12 @@ bool deserializeProject(const std::string& text, const std::string& projectDir, 
         Asset a;
         a.id = static_cast<ObjectId>(aj.get("id").number());
         a.name = aj.get("name").string();
-        a.kind = aj.get("kind").string() == "audio" ? AssetKind::Audio : AssetKind::Image;
+        const std::string kind = aj.get("kind").string();
+        a.kind = kind == "audio" ? AssetKind::Audio : kind == "video" ? AssetKind::Video : AssetKind::Image;
+        if (a.kind == AssetKind::Video) {
+            a.fps = std::clamp(aj.get("fps").number(30), 1.0, 480.0);
+            a.hasAudio = aj.get("hasAudio").boolean(false);
+        }
         a.width = static_cast<int>(aj.get("width").number());
         a.height = static_cast<int>(aj.get("height").number());
         a.duration = aj.get("duration").number(0);
@@ -534,38 +608,7 @@ bool deserializeProject(const std::string& text, const std::string& projectDir, 
         p.assets.push_back(std::move(a));
     }
 
-    for (const Json& cj : root.get("compositions").items()) {
-        Composition c;
-        c.id = static_cast<ObjectId>(cj.get("id").number());
-        c.name = cj.get("name").string();
-        c.folder = cj.get("folder").string();
-        c.width = std::clamp(static_cast<int>(cj.get("width").number(1920)), 1, 16384);
-        c.height = std::clamp(static_cast<int>(cj.get("height").number(1080)), 1, 16384);
-        c.fps = std::clamp(cj.get("fps").number(30), 1.0, 240.0);
-        c.duration = std::max(cj.get("duration").number(10), c.frameDuration());
-        c.background = valueFromJson(cj.get("background"), c.background);
-        if (const Json& mb = cj.get("motionBlur"); mb.isObject()) {
-            c.motionBlur = true;
-            c.shutterAngle = std::clamp(mb.get("shutterAngle").number(180), 0.0, 720.0);
-            c.shutterPhase = std::clamp(mb.get("shutterPhase").number(-90), -360.0, 360.0);
-            c.motionBlurSamples = std::clamp(int(mb.get("samples").number(8)), 1, 64);
-        }
-        maxId = std::max(maxId, c.id);
-        for (const Json& lj : cj.get("layers").items()) {
-            Layer l = layerFromJson(lj, c, &maxId);
-            maxId = std::max(maxId, l.id);
-            c.layers.push_back(std::move(l));
-        }
-        // Drop dangling parent links rather than failing the whole load.
-        for (Layer& l : c.layers) {
-            if (l.parent && (!c.findLayer(l.parent) || l.parent == l.id)) l.parent = 0;
-            if (l.matteLayer && (!c.findLayer(l.matteLayer) || l.matteLayer == l.id)) {
-                l.matteLayer = 0;
-                l.matteMode = MatteMode::None;
-            }
-        }
-        p.compositions.push_back(std::move(c));
-    }
+    for (const Json& cj : root.get("compositions").items()) p.compositions.push_back(compositionFromJson(cj, &maxId));
 
     if (p.compositions.empty()) {
         error = "Project contains no compositions";
@@ -578,7 +621,9 @@ bool deserializeProject(const std::string& text, const std::string& projectDir, 
 }
 
 bool writeFileAtomic(const std::string& path, const std::string& contents, std::string& error) {
-    const std::string tmp = path + ".tmp";
+    // A temporary name of its own, so a background autosave and a manual save never share one.
+    static std::atomic<uint64_t> counter{0};
+    const std::string tmp = path + ".tmp" + std::to_string(counter.fetch_add(1));
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {

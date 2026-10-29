@@ -15,7 +15,8 @@ namespace mf {
 inline constexpr const char* kProjectFormat = "motionforge.project";
 
 // `projectDir` is the directory the file will live in ("" = store absolute paths only).
-std::string serializeProject(const Project& project, const std::string& projectDir);
+// `absolutePaths` = false leaves out the absolute fallback (bundles: the path means nothing elsewhere).
+std::string serializeProject(const Project& project, const std::string& projectDir, bool absolutePaths = true);
 bool deserializeProject(const std::string& text, const std::string& projectDir, Project& out, std::string& error);
 
 // Atomic save: writes "<path>.tmp" then renames it over `path`, so a crash mid-save never
@@ -31,5 +32,9 @@ Json layerToJson(const Layer& l);
 // `comp` supplies defaults for properties missing from the JSON; `maxId` (optional) is raised to
 // the largest id found.
 Layer layerFromJson(const Json& j, const Composition& comp, ObjectId* maxId);
+// A composition's settings, and its layers when `withLayers`.
+Json compositionToJson(const Composition& c, bool withLayers);
+Composition compositionFromJson(const Json& j, ObjectId* maxId);
+void dropDanglingLinks(Composition& c);  // clears parent / matte links to layers that aren't there
 
 }  // namespace mf

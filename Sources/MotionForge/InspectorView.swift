@@ -17,8 +17,8 @@ struct InspectorView: View {
                         if layer.kind == .audio {
                             AudioSection(model: model, time: time, layer: layer)
                         } else {
-                            PropertySection(title: "Transform", model: model, time: time, layer: layer,
-                                            specs: [MFProp.anchorPoint, .position, .scale, .rotation, .opacity].map(ParamSpec.init))
+                            PropertySection(title: layer.kind == .camera ? "Camera" : "Transform", model: model, time: time, layer: layer,
+                                            specs: layer.transformProps.map(ParamSpec.init))
                         }
                         if layer.kind == .shape {
                             ShapeSection(model: model, time: time, layer: layer)
@@ -107,7 +107,15 @@ private struct LayerSection: View {
                 .onChange(of: layer.name) { _, n in name = n }
 
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
-                if layer.kind != .audio {
+                if layer.kind != .audio && layer.kind != .precomp && layer.kind != .camera {
+                GridRow {
+                    Text("3D").foregroundStyle(.secondary)
+                    Toggle("3D Layer", isOn: Binding(get: { layer.threeD },
+                                                     set: { v in model.edit { _ = $0.setLayer(layer.layerID, threeD: v) } }))
+                        .help("Z Position and X / Y Rotation, seen through the camera (Layer ▸ New Camera)")
+                }
+                }
+                if layer.kind != .audio && layer.kind != .camera {
                 GridRow {
                     Text("Blend").foregroundStyle(.secondary)
                     Picker("", selection: Binding(get: { layer.blend },
@@ -229,7 +237,7 @@ private struct ShapeSection: View {
                 .font(.system(size: 11))
             }
             PropertySection(title: "Shape Properties", model: model, time: time, layer: layer,
-                            specs: layer.editableProps.filter { ![.anchorPoint, .position, .scale, .rotation, .opacity].contains($0) }
+                            specs: layer.editableProps.filter { !layer.transformProps.contains($0) }
                                 .map(ParamSpec.init))
         }
     }
@@ -272,6 +280,7 @@ private struct TextSection: View {
     @ObservedObject var time: TimeModel
     let layer: MFLayerInfo
     @State private var text = ""
+    @FocusState private var editing: Bool
 
     static let fonts = ["Helvetica-Bold", "HelveticaNeue-Medium", "AvenirNext-Heavy", "AvenirNext-Regular", "Futura-Bold",
                         "GillSans-Bold", "DINAlternate-Bold", "Georgia-Bold", "Didot-Bold", "Menlo-Bold",
@@ -285,8 +294,12 @@ private struct TextSection: View {
                     .frame(minHeight: 48, maxHeight: 90)
                     .scrollContentBackground(.hidden)
                     .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.25)))
-                    .onAppear { text = layer.text }
+                    .focused($editing)
+                    .onAppear { text = layer.text; takeFocusIfAsked() }
                     .onChange(of: layer.layerID) { _, _ in text = layer.text }
+                    .onChange(of: model.focusTextOf) { _, _ in takeFocusIfAsked() }
+                    // Undo (or a collaborator) changed the text: show it, so the next keystroke builds on it.
+                    .onChange(of: layer.text) { _, new in if new != text { text = new } }
                     .onChange(of: text) { _, new in
                         guard new != layer.text else { return }
                         model.coalescedEdit("Edit Text") { _ = $0.setLayer(layer.layerID, text: new, font: layer.fontName, align: layer.textAlign) }
@@ -327,6 +340,16 @@ private struct TextSection: View {
                 PropertySection(title: "Stroke", model: model, time: time, layer: layer,
                                 specs: [MFProp.strokeColor, .strokeWidth].map(ParamSpec.init))
             }
+        }
+    }
+
+    /// The Type tool just placed this layer: put the cursor in its text with "Text" selected, so typing replaces it.
+    private func takeFocusIfAsked() {
+        guard model.focusTextOf == layer.layerID else { return }
+        DispatchQueue.main.async {
+            model.focusTextOf = nil
+            editing = true
+            DispatchQueue.main.async { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil) }
         }
     }
 
@@ -502,20 +525,24 @@ private struct MasksSection: View {
             HStack {
                 Text("Masks").font(.system(size: 11, weight: .semibold))
                 Spacer()
+                if layer.kind == .image { RotoBrushMenu(model: model, roto: model.roto, layer: layer) }
                 Menu {
                     Button("Rectangle Mask") { model.addMask(.rectangle) }
                     Button("Ellipse Mask") { model.addMask(.ellipse) }
+                    Button("Draw a Mask with the Pen (G)") { model.penDrawsMask = true; model.selectTool(.pen) }
                 } label: { Image(systemName: "plus") }
                     .menuStyle(.borderlessButton).fixedSize()
                     .help("Add a mask (cuts the layer before effects)")
             }
+            RotoBrushStatus(roto: model.roto)
             ForEach(layer.masks, id: \.maskID) { m in
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Toggle("", isOn: Binding(get: { m.enabled },
                                                  set: { v in model.edit { _ = $0.setMask(m.maskID, layer: layer.layerID, enabled: v) } }))
                             .labelsHidden().toggleStyle(.checkbox)
-                        Image(systemName: m.shape == .ellipse ? "circle.dashed" : "rectangle.dashed").foregroundStyle(Theme.keyframe)
+                        Image(systemName: m.tracked ? "figure.walk.motion" : m.shape == .path ? "scribble" : m.shape == .ellipse ? "circle.dashed" : "rectangle.dashed")
+                            .foregroundStyle(Theme.keyframe)
                         Text(m.name).font(.system(size: 11, weight: .medium))
                         Spacer()
                         Picker("", selection: Binding(get: { m.mode },
@@ -532,6 +559,7 @@ private struct MasksSection: View {
                             .buttonStyle(.borderless).help("Delete mask")
                     }
                     .font(.system(size: 11))
+                    MaskPathKeys(model: model, time: time, layer: layer, mask: m)
                     PropertyRows(model: model, time: time, layer: layer,
                                  specs: m.params.filter { m.shape == .rectangle || $0.key != "roundness" }.map(ParamSpec.init))
                         .padding(.leading, 6)
@@ -539,6 +567,98 @@ private struct MasksSection: View {
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.035)))
+            }
+        }
+    }
+}
+
+/// Rotoscoping a mask by hand: animate its outline, step between its keys, add or remove one. Moving
+/// a point in the viewer at another time adds a key there.
+private struct MaskPathKeys: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var time: TimeModel
+    let layer: MFLayerInfo
+    let mask: MFMaskInfo
+
+    var body: some View {
+        let keys = mask.pathKeyTimes.map(\.doubleValue)
+        let now = time.time
+        let onKey = keys.contains { abs($0 - now) < 0.5 / model.comp.fps }
+        HStack(spacing: 6) {
+            Button {
+                model.edit { _ = $0.setMaskPathAnimated(mask.maskID, layer: layer.layerID, animated: !mask.pathAnimated, time: now) }
+            } label: {
+                Image(systemName: "stopwatch").foregroundStyle(mask.pathAnimated ? Theme.keyframe : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(mask.pathAnimated ? "Stop animating the outline (keeps the shape at the playhead)"
+                                    : "Animate the outline (rotoscope): then move its points at other frames")
+            Text(mask.tracked ? "Mask Path · Roto Brush, frame by frame" : mask.pathAnimated ? "Mask Path · \(keys.count) key\(keys.count == 1 ? "" : "s")" : "Mask Path")
+                .foregroundStyle(.secondary)
+            Spacer()
+            if !keys.isEmpty {
+                Button { if let t = keys.last(where: { $0 < now - 1e-6 }) { model.time.isPlaying = false; model.time.time = t } } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .buttonStyle(.borderless).help("Previous mask key")
+                Button { if let t = keys.first(where: { $0 > now + 1e-6 }) { model.time.isPlaying = false; model.time.time = t } } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .buttonStyle(.borderless).help("Next mask key")
+            }
+            if mask.pathAnimated && !mask.tracked {
+                if onKey {
+                    Button { model.edit { _ = $0.removeMaskPathKey(at: now, mask: mask.maskID, layer: layer.layerID) } } label: {
+                        Image(systemName: "diamond.fill").foregroundStyle(Theme.keyframe)
+                    }
+                    .buttonStyle(.borderless).help("Delete the key at the playhead")
+                } else {
+                    Button {
+                        let shape = model.engine.maskPath(mask.maskID, layer: layer.layerID, time: now)
+                        model.edit { _ = $0.setMaskPath(mask.maskID, layer: layer.layerID, vertices: shape, time: now) }
+                    } label: { Image(systemName: "diamond") }
+                        .buttonStyle(.borderless).help("Add a key here with the current outline")
+                }
+            }
+        }
+        .font(.system(size: 11))
+    }
+}
+
+/// Roto Brush ▸ Main Subject / People, for image and video layers.
+private struct RotoBrushMenu: View {
+    @ObservedObject var model: EditorModel
+    @ObservedObject var roto: RotoBrush
+    let layer: MFLayerInfo
+
+    var body: some View {
+        Menu {
+            ForEach(RotoBrush.Subject.allCases) { s in
+                Button(s.rawValue) { Task { await roto.run(model: model, layerID: layer.layerID, subject: s) } }
+            }
+        } label: { Label("Roto Brush", systemImage: "wand.and.stars") }
+            .menuStyle(.borderlessButton).fixedSize()
+            .disabled(roto.progress != nil)
+            .help(layer.isVideo ? "Find the subject in every frame of the work area (or the whole clip) and mask it"
+                                : "Find the subject in this image and mask it")
+    }
+}
+
+private struct RotoBrushStatus: View {
+    @ObservedObject var roto: RotoBrush
+
+    var body: some View {
+        if let p = roto.progress {
+            HStack(spacing: 8) {
+                ProgressView(value: p).controlSize(.small)
+                Text("Roto Brush \(Int(p * 100))%").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+                Button("Stop") { roto.cancel() }.controlSize(.small)
+            }
+        } else if let m = roto.message {
+            HStack {
+                Text(m).font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                Button { roto.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
             }
         }
     }

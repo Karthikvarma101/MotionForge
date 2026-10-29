@@ -13,11 +13,15 @@
 
 #include "MFAudioInternal.h"
 #include "MFRender/MetalRenderer.hpp"
+#include "VideoDecoder.hpp"
+#include "mf/Bundle.hpp"
 #include "mf/Clipboard.hpp"
+#include "mf/Commands.hpp"
 #include "mf/Document.hpp"
 #include "mf/Presets.hpp"
 #include "mf/Evaluator.hpp"
 #include "mf/ProjectIO.hpp"
+#include "mf/Sync.hpp"
 
 using namespace mf;
 
@@ -110,6 +114,14 @@ NSInteger MFPropDimensions(MFProp prop) { return propDef(static_cast<PropId>(pro
 @end
 
 namespace {
+NSArray<MFPathVertex*>* fromPath(const BezierPath& p) {
+    NSMutableArray* out = [NSMutableArray arrayWithCapacity:p.vertices.size()];
+    for (const PathVertex& v : p.vertices)
+        [out addObject:[[MFPathVertex alloc] initWithPoint:CGPointMake(v.p.x, v.p.y) inTangent:CGPointMake(v.in.x, v.in.y)
+                                                outTangent:CGPointMake(v.out.x, v.out.y)]];
+    return out;
+}
+
 BezierPath toPath(NSArray<MFPathVertex*>* vs, bool closed) {
     BezierPath p;
     p.closed = closed;
@@ -250,6 +262,11 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
             [params addObject:[[MFParamInfo alloc] initWithRef:PropRef::mask(m.id, p) def:maskParamDef(p) property:m.param(p)]];
         }
         _params = params;
+        _pathAnimated = !m.pathKeys.empty() || bool(m.pathTrack);
+        _tracked = bool(m.pathTrack);
+        NSMutableArray* keys = [NSMutableArray array];
+        for (const PathKey& k : m.pathKeys) [keys addObject:@(k.time)];
+        _pathKeyTimes = keys;
     }
     return self;
 }
@@ -288,6 +305,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 @interface MFLayerInfo () {
     Layer _layer;
 }
+@property(nonatomic, readwrite) BOOL isVideo, hasAudio;
 @end
 
 @implementation MFLayerInfo
@@ -389,15 +407,18 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     return out;
 }
 - (BOOL)pathClosed { return _layer.path.closed; }
+- (BOOL)threeD { return _layer.is3D(); }
 - (uint64_t)matteLayerID { return _layer.matteLayer; }
 - (MFMatteMode)matteMode { return static_cast<MFMatteMode>(_layer.matteMode); }
 - (NSArray<NSNumber*>*)allKeyframeTimes {
     std::set<double> times;
     for (const Property& p : _layer.props)
         for (const Keyframe& k : p.keyframes) times.insert(k.time);
-    for (const Mask& m : _layer.masks)
+    for (const Mask& m : _layer.masks) {
         for (const Property& p : m.params)
             for (const Keyframe& k : p.keyframes) times.insert(k.time);
+        for (const PathKey& k : m.pathKeys) times.insert(k.time);
+    }
     for (const Effect& e : _layer.effects)
         for (const Property& p : e.params)
             for (const Keyframe& k : p.keyframes) times.insert(k.time);
@@ -422,6 +443,9 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         _background = toMF(c.background);
         _folder = @(c.folder.c_str());
         _layerCount = NSInteger(c.layers.size());
+        _workAreaStart = c.workAreaStart();
+        _workAreaEnd = c.workAreaEnd();
+        _hasWorkArea = c.hasWorkArea();
         NSMutableArray* sources = [NSMutableArray array];
         for (const Layer& l : c.layers)
             if (l.kind == LayerKind::Precomp && l.source != 0 && ![sources containsObject:@(l.source)]) [sources addObject:@(l.source)];
@@ -442,7 +466,10 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         _missing = a.missing;
         _loaded = loaded;
         _isAudio = a.kind == AssetKind::Audio;
+        _isVideo = a.kind == AssetKind::Video;
         _duration = a.duration;
+        _fps = a.fps;
+        _hasAudio = a.hasAudio;
     }
     return self;
 }
@@ -472,8 +499,27 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 
 // ---------------------------------------------------------------------------------------------
 
+namespace {
+// The viewer's Custom View, in force for one call (drawing, hit testing, overlays) on this thread.
+struct OrbitScope {
+    bool on;
+    OrbitScope(bool has, const Composition* c, double yaw, double pitch, double distance, CGPoint pan) : on(has && c) {
+        if (!on) return;
+        const CameraView v = orbitView(*c, yaw, pitch, distance, {pan.x, pan.y});
+        setViewOverride(c->id, &v);
+    }
+    ~OrbitScope() {
+        if (on) setViewOverride(0, nullptr);
+    }
+};
+}  // namespace
+#define MF_VIEW_SCOPE OrbitScope viewScope_(_orbitOn, [self comp], _orbitYaw, _orbitPitch, _orbitDistance, _orbitPan)
+
 @implementation MFEngine {
     Document _doc;
+    bool _orbitOn;
+    double _orbitYaw, _orbitPitch, _orbitDistance;
+    CGPoint _orbitPan;
     std::unique_ptr<MetalRenderer> _renderer;
     std::shared_ptr<std::atomic<int>> _inFlight;
     std::shared_ptr<std::atomic<int>> _prefetchInFlight;
@@ -505,6 +551,19 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 
 - (ObjectId)compID { return _doc.project().activeComposition; }
 - (mf::Project)mf_projectSnapshot { return _doc.project(); }  // cheap: baked tracks are shared
+- (uint64_t)mf_editSerial { return _doc.editSerial(); }
+- (void)mf_reserveIds:(ObjectId)base { _doc.reserveIds(base); }
+
+// Collaboration: swaps in the merged project and loads media whose file changed.
+- (void)mf_applyExternal:(Project)p {
+    std::map<ObjectId, std::pair<std::string, uint32_t>> before;
+    for (const Asset& a : _doc.project().assets) before[a.id] = {a.path, a.generation};
+    _doc.applyExternal(std::move(p));
+    for (const Asset& a : _doc.project().assets) {
+        auto it = before.find(a.id);
+        if (!a.missing && (it == before.end() || it->second != std::make_pair(a.path, a.generation))) [self requestMedia:a];
+    }
+}
 - (const Composition*)comp { return _doc.project().activeComp(); }
 
 // ---- project ----
@@ -515,6 +574,10 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (void)requestMedia:(const Asset&)a {
+    if (a.kind == AssetKind::Video) {  // frames are decoded as they're shown
+        _renderer->registerVideo(a.id, a.generation, a.path, a.fps, a.frameCount());
+        return;
+    }
     if (a.kind != AssetKind::Image) return;  // audio is read by AVFoundation when it plays
     __weak MFEngine* weakSelf = self;
     const ObjectId aid = a.id;
@@ -561,6 +624,27 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     return YES;
 }
 
+- (void)saveProjectInBackgroundToPath:(NSString*)path
+                            markSaved:(BOOL)markSaved
+                           completion:(void (^)(NSError*, double))completion {
+    static dispatch_queue_t queue = dispatch_queue_create("com.motionforge.autosave", DISPATCH_QUEUE_SERIAL);
+    auto snapshot = std::make_shared<Project>(_doc.project());  // baked tracks are shared, not copied
+    const uint64_t revision = _doc.revision();
+    const std::string target = path.fileSystemRepresentation;
+    __weak MFEngine* weakSelf = self;
+    dispatch_async(queue, ^{
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string err;
+        const bool ok = saveProjectFile(*snapshot, target, err);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MFEngine* s = weakSelf;
+            if (ok && markSaved && s && s->_doc.revision() == revision) s->_doc.markSaved(revision);
+            if (completion) completion(ok ? nil : makeError(3, err), seconds);
+        });
+    });
+}
+
 - (BOOL)recoverFromPath:(NSString*)path error:(NSError**)error {
     if (![self openProjectAtPath:path error:error]) return NO;
     _doc.markUnsaved();
@@ -575,6 +659,64 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     return @(serializeProject(_doc.project(), directory ? directory.fileSystemRepresentation : "").c_str());
 }
 
+- (NSDictionary<NSString*, id>*)writeBundleToDirectory:(NSString*)directory error:(NSError**)error {
+    NSString* version = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"dev";
+    BundleReport report;
+    std::string err;
+    if (!writeProjectBundle(_doc.project(), directory.fileSystemRepresentation,
+                            std::string("MotionForge ") + version.UTF8String, report, err)) {
+        if (error) *error = makeError(3, err);
+        return nil;
+    }
+    NSMutableArray<NSString*>* missing = [NSMutableArray array];
+    for (const std::string& m : report.missing) [missing addObject:@(m.c_str())];
+    return @{@"mediaFiles": @(report.mediaFiles), @"mediaBytes": @(report.mediaBytes), @"missing": missing};
+}
+
++ (NSString*)projectPathInBundleDirectory:(NSString*)directory error:(NSError**)error {
+    std::string path, err;
+    if (!checkProjectBundle(directory.fileSystemRepresentation, path, err)) {
+        if (error) *error = makeError(2, err);
+        return nil;
+    }
+    return @(path.c_str());
+}
+
++ (BOOL)isSafeBundleEntry:(NSString*)entry { return isSafeBundleEntry(entry.UTF8String); }
+
+// ---- Claude tools ----
+
++ (NSString*)claudeToolCatalogJSON {
+    Json list = Json::array();
+    for (const ToolDef& t : toolCatalog()) {
+        Json j = Json::object();
+        j.set("name", Json(t.name));
+        j.set("description", Json(t.description));
+        j.set("inputSchema", t.inputSchema);
+        j.set("host", Json(t.host));
+        list.push(std::move(j));
+    }
+    return @(list.dump(0).c_str());
+}
+
+- (NSString*)runClaudeTool:(NSString*)name arguments:(NSString*)argumentsJSON handled:(BOOL*)handled error:(NSString**)error {
+    Json args = Json::object();
+    std::string perr;
+    if (argumentsJSON.length && !Json::parse(argumentsJSON.UTF8String, args, perr)) {
+        if (handled) *handled = YES;
+        if (error) *error = [NSString stringWithFormat:@"The arguments aren't valid JSON: %s", perr.c_str()];
+        return nil;
+    }
+    ToolResult r = runTool(_doc, name.UTF8String, args);
+    if (handled) *handled = r.handled;
+    if (!r.handled) return nil;
+    if (!r.ok) {
+        if (error) *error = @(r.error.c_str());
+        return nil;
+    }
+    return @(r.value.dump(0).c_str());
+}
+
 // ---- undo ----
 
 - (BOOL)canUndo { return _doc.canUndo(); }
@@ -585,6 +727,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (BOOL)redo { return _doc.redo(); }
 - (void)beginUndoGroup:(NSString*)label { _doc.beginGroup(label.UTF8String); }
 - (void)endUndoGroup { _doc.endGroup(); }
+- (BOOL)inUndoGroup { return _doc.inGroup(); }
 
 // ---- composition ----
 
@@ -622,13 +765,25 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     return _doc.setPrecompOptions([self compID], layerID, collapse, timeRemap, startTime);
 }
 
+- (BOOL)setWorkAreaStart:(double)start end:(double)end {
+    return _doc.setWorkArea([self compID], start, end);
+}
+
+- (BOOL)trimCompositionToWorkArea {
+    return _doc.trimToWorkArea([self compID]);
+}
+
+- (uint64_t)precomposeLayers:(NSArray<NSNumber*>*)layerIDs name:(NSString*)name {
+    return _doc.precompose([self compID], toIds(layerIDs), name.UTF8String ?: "");
+}
+
 // ---- media ----
 
 - (NSArray<MFAssetInfo*>*)assets {
     NSMutableArray* out = [NSMutableArray array];
     for (const Asset& a : _doc.project().assets)
         [out addObject:[[MFAssetInfo alloc] initWithAsset:a
-                                                   loaded:a.kind == AssetKind::Audio ? !a.missing : _renderer->hasImage(a.id, a.generation)]];
+                                                   loaded:a.kind == AssetKind::Image ? _renderer->hasImage(a.id, a.generation) : !a.missing]];
     return out;
 }
 
@@ -644,6 +799,25 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
         return nil;
     }
     const ObjectId aid = _doc.addImageAsset(path.fileSystemRepresentation, path.lastPathComponent.UTF8String, w, h);
+    if (const Asset* a = _doc.project().findAsset(aid)) [self requestMedia:*a];
+    return @(aid);
+}
+
+- (NSNumber*)importVideoAtPath:(NSString*)path error:(NSError**)error {
+    int w = 0, h = 0;
+    double duration = 0, fps = 0;
+    bool hasAudio = false;
+    std::string err;
+    if (!VideoDecoder::probe(path.fileSystemRepresentation, w, h, duration, fps, hasAudio, err)) {
+        if (error) *error = makeError(4, err);
+        return nil;
+    }
+    if (w > 16384 || h > 16384) {
+        if (error) *error = makeError(4, "Video larger than 16384 px is not supported");
+        return nil;
+    }
+    const ObjectId aid = _doc.addVideoAsset(path.fileSystemRepresentation, path.lastPathComponent.UTF8String, w, h,
+                                            duration, fps, hasAudio);
     if (const Asset* a = _doc.project().findAsset(aid)) [self requestMedia:*a];
     return @(aid);
 }
@@ -679,14 +853,32 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (NSArray<MFLayerInfo*>*)layers {
     NSMutableArray* out = [NSMutableArray array];
     if (const Composition* c = [self comp])
-        for (const Layer& l : c->layers) [out addObject:[[MFLayerInfo alloc] initWithLayer:l]];
+        for (const Layer& l : c->layers) [out addObject:[self infoFor:l]];
     return out;
+}
+
+// Footage is an image layer whose asset is a video.
+- (MFLayerInfo*)infoFor:(const Layer&)l {
+    MFLayerInfo* info = [[MFLayerInfo alloc] initWithLayer:l];
+    const Asset* a = l.kind == LayerKind::Image ? _doc.project().findAsset(l.asset) : nullptr;
+    info.isVideo = a && a->isVideo();
+    info.hasAudio = info.isVideo && a->hasAudio;
+    return info;
 }
 
 - (MFLayerInfo*)layerWithID:(uint64_t)layerID {
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
-    return l ? [[MFLayerInfo alloc] initWithLayer:*l] : nil;
+    return l ? [self infoFor:*l] : nil;
+}
+
+- (NSArray<NSNumber*>*)modifiedPropertiesOfLayer:(uint64_t)layerID {
+    const Composition* c = [self comp];
+    const Layer* l = c ? c->findLayer(layerID) : nullptr;
+    NSMutableArray* out = [NSMutableArray array];
+    if (l)
+        for (PropId p : modifiedProps(_doc.project(), *c, *l)) [out addObject:@(static_cast<NSInteger>(p))];
+    return out;
 }
 
 - (uint64_t)addShapeLayer:(MFShapeType)shape {
@@ -699,11 +891,24 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
     return _doc.addLayer([self compID], LayerKind::Audio, ShapeType::Rectangle, assetID);
 }
 - (uint64_t)addNullLayer { return _doc.addLayer([self compID], LayerKind::Null); }
+- (uint64_t)addCameraLayer { return _doc.addLayer([self compID], LayerKind::Camera); }
+- (BOOL)setLayer:(uint64_t)layerID threeD:(BOOL)threeD { return _doc.setLayerThreeD([self compID], layerID, threeD); }
+- (void)setViewOrbitYaw:(double)yaw pitch:(double)pitch distance:(double)distance pan:(CGPoint)pan {
+    _orbitOn = true;
+    _orbitYaw = yaw;
+    _orbitPitch = pitch;
+    _orbitDistance = distance;
+    _orbitPan = pan;
+}
+- (void)clearViewOrbit { _orbitOn = false; }
 - (BOOL)removeLayer:(uint64_t)layerID { return _doc.removeLayer([self compID], layerID); }
 - (uint64_t)duplicateLayer:(uint64_t)layerID { return _doc.duplicateLayer([self compID], layerID); }
 - (BOOL)removeLayers:(NSArray<NSNumber*>*)layerIDs { return _doc.removeLayers([self compID], toIds(layerIDs)); }
 - (NSArray<NSNumber*>*)duplicateLayers:(NSArray<NSNumber*>*)layerIDs {
     return fromIds(_doc.duplicateLayers([self compID], toIds(layerIDs)));
+}
+- (NSArray<NSNumber*>*)splitLayers:(NSArray<NSNumber*>*)layerIDs atTime:(double)time {
+    return fromIds(_doc.splitLayers([self compID], toIds(layerIDs), time));
 }
 - (BOOL)moveLayer:(uint64_t)layerID toIndex:(NSInteger)index { return _doc.moveLayer([self compID], layerID, int(index)); }
 - (BOOL)setLayer:(uint64_t)layerID name:(NSString*)name { return _doc.setLayerName([self compID], layerID, name.UTF8String); }
@@ -829,19 +1034,73 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 - (uint64_t)addPathMaskWithVertices:(NSArray<MFPathVertex*>*)vertices layer:(uint64_t)layerID {
     return _doc.addPathMask([self compID], layerID, toPath(vertices, true));
 }
-- (CGPoint)compPoint:(CGPoint)p toLayer:(uint64_t)layerID time:(double)time {
+- (NSArray<MFPathVertex*>*)pathOfMask:(uint64_t)maskID layer:(uint64_t)layerID time:(double)time {
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
-    Affine inv;
-    if (!l || !layerWorldTransform(*c, *l, time).inverse(inv)) return p;
-    const Vec2 q = inv.apply({p.x, p.y});
-    return CGPointMake(q.x, q.y);
+    const Mask* m = l ? l->findMask(maskID) : nullptr;
+    if (!m) return @[];
+    if (m->shape == MaskShape::Path) return fromPath(maskPathAt(*m, time));
+    // Rectangles and ellipses as the path they'd become (to start rotoscoping from one).
+    const Value pos = evaluateProperty(m->param(MaskParam::Position), maskParamDef(MaskParam::Position), time);
+    const Value size = evaluateProperty(m->param(MaskParam::Size), maskParamDef(MaskParam::Size), time);
+    const double cx = pos[0], cy = pos[1], hx = size[0] * 0.5, hy = size[1] * 0.5;
+    BezierPath p;
+    if (m->shape == MaskShape::Ellipse) {
+        const double k = 0.5523;  // cubic approximation of a quarter circle
+        p.vertices = {{{cx, cy - hy}, {-hx * k, 0}, {hx * k, 0}}, {{cx + hx, cy}, {0, -hy * k}, {0, hy * k}},
+                      {{cx, cy + hy}, {hx * k, 0}, {-hx * k, 0}}, {{cx - hx, cy}, {0, hy * k}, {0, -hy * k}}};
+    } else {
+        p.vertices = {{{cx - hx, cy - hy}, {}, {}}, {{cx + hx, cy - hy}, {}, {}}, {{cx + hx, cy + hy}, {}, {}}, {{cx - hx, cy + hy}, {}, {}}};
+    }
+    return fromPath(p);
 }
-- (CGPoint)layerPoint:(CGPoint)p ofLayer:(uint64_t)layerID time:(double)time {
+- (BOOL)setMask:(uint64_t)maskID layer:(uint64_t)layerID pathVertices:(NSArray<MFPathVertex*>*)vertices time:(double)time {
+    return _doc.setMaskPathAt([self compID], layerID, maskID, time, toPath(vertices, true));
+}
+- (BOOL)setMask:(uint64_t)maskID layer:(uint64_t)layerID pathAnimated:(BOOL)animated time:(double)time {
+    if (animated) {  // a rectangle or ellipse becomes its path first
+        const Composition* c = [self comp];
+        const Layer* l = c ? c->findLayer(layerID) : nullptr;
+        const Mask* m = l ? l->findMask(maskID) : nullptr;
+        if (m && m->shape != MaskShape::Path) {
+            _doc.beginGroup("Animate Mask Path");
+            _doc.setMaskPath([self compID], layerID, maskID, toPath([self pathOfMask:maskID layer:layerID time:time], true));
+            const bool ok = _doc.setMaskPathAnimated([self compID], layerID, maskID, true, time);
+            _doc.endGroup();
+            return ok;
+        }
+    }
+    return _doc.setMaskPathAnimated([self compID], layerID, maskID, animated, time);
+}
+- (BOOL)removeMaskPathKeyAtTime:(double)time mask:(uint64_t)maskID layer:(uint64_t)layerID {
+    return _doc.removeMaskPathKey([self compID], layerID, maskID, time);
+}
+- (uint64_t)addTrackedMaskToLayer:(uint64_t)layerID frames:(NSArray<NSArray<MFPathVertex*>*>*)frames start:(double)start
+                             rate:(double)rate name:(NSString*)name {
+    PathTrack t;
+    t.t0 = start;
+    t.rate = rate > 0 ? rate : 30;
+    for (NSArray<MFPathVertex*>* f in frames) t.frames.push_back(toPath(f, true));
+    return _doc.addTrackedMask([self compID], layerID, t, name.UTF8String ?: "");
+}
+- (CGPoint)compPoint:(CGPoint)p toLayer:(uint64_t)layerID time:(double)time {
+    MF_VIEW_SCOPE;
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
     if (!l) return p;
-    const Vec2 q = layerWorldTransform(*c, *l, time).apply({p.x, p.y});
+    Vec2 mn, mx, q;
+    layerLocalBounds(_doc.project(), *l, time, mn, mx);
+    if (!layerToComp(*c, *l, time, mn, mx).inverse({p.x, p.y}, q)) return p;  // 3D layers through the camera too
+    return CGPointMake(q.x, q.y);
+}
+- (CGPoint)layerPoint:(CGPoint)p ofLayer:(uint64_t)layerID time:(double)time {
+    MF_VIEW_SCOPE;
+    const Composition* c = [self comp];
+    const Layer* l = c ? c->findLayer(layerID) : nullptr;
+    if (!l) return p;
+    Vec2 mn, mx;
+    layerLocalBounds(_doc.project(), *l, time, mn, mx);
+    const Vec2 q = layerToComp(*c, *l, time, mn, mx).apply({p.x, p.y});
     return CGPointMake(q.x, q.y);
 }
 
@@ -1003,11 +1262,13 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 // ---- viewer ----
 
 - (uint64_t)hitTestAtPoint:(CGPoint)p time:(double)time {
+    MF_VIEW_SCOPE;
     const Composition* c = [self comp];
     return c ? hitTest(_doc.project(), *c, time, {p.x, p.y}) : 0;
 }
 
 - (MFQuad)quadForLayer:(uint64_t)layerID time:(double)time {
+    MF_VIEW_SCOPE;
     MFQuad q{};
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
@@ -1021,6 +1282,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (MFQuad)quadForMask:(uint64_t)maskID layer:(uint64_t)layerID time:(double)time {
+    MF_VIEW_SCOPE;
     MFQuad q{};
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
@@ -1035,9 +1297,18 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (CGPoint)parentSpaceVector:(CGPoint)v layer:(uint64_t)layerID time:(double)time {
+    MF_VIEW_SCOPE;
     const Composition* c = [self comp];
     const Layer* l = c ? c->findLayer(layerID) : nullptr;
     const Layer* parent = (l && l->parent) ? c->findLayer(l->parent) : nullptr;
+    if (l && l->threeD && l->kind != LayerKind::Precomp) {
+        // On screen a 3D layer moves less the farther it is: scale by its distance over the zoom.
+        const CameraView cam = cameraAt(*c, time);
+        const Mat4 w = layerWorldMatrix(*c, *l, time);
+        const Vec3 pos = (cam.view * w).apply({0, 0, 0});
+        const double k = pos.z > 1 ? pos.z / cam.zoom : 1;
+        return CGPointMake(v.x * k, v.y * k);
+    }
     if (!parent) return v;
     Affine m = layerWorldTransform(*c, *parent, time);
     m.tx = m.ty = 0;  // vectors ignore translation
@@ -1053,6 +1324,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
                           origin:(CGPoint)origin
                            scale:(double)scale
                     checkerboard:(BOOL)checkerboard {
+    MF_VIEW_SCOPE;  // the Custom View, if one is set
     MFViewerFrameInfo* info = [MFViewerFrameInfo new];
     const Composition* c = [self comp];
     if (!c) return info;
@@ -1191,6 +1463,7 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (NSInteger)prefetchFromTime:(double)time frames:(NSInteger)count qualityDivisor:(NSInteger)divisor loop:(BOOL)loop {
+    MF_VIEW_SCOPE;
     const Composition* c = [self comp];
     if (!c || _renderer->cachePolicy() == CachePolicy::Off) return 0;
     const int64_t frames = std::max<int64_t>(1, c->frameCount());
@@ -1279,5 +1552,129 @@ NSArray<NSNumber*>* fromIds(const std::vector<ObjectId>& ids) {
 }
 
 - (void)resetStats { _renderer->resetCounters(); }
+
+@end
+
+// ---- live collaboration ----
+
+@interface MFEngine (Collab)
+- (mf::Project)mf_projectSnapshot;
+- (uint64_t)mf_editSerial;
+- (void)mf_reserveIds:(ObjectId)base;
+- (void)mf_applyExternal:(Project)p;
+@end
+
+@implementation MFCollabSync {
+    __weak MFEngine* _engine;
+    std::unique_ptr<SyncEngine> _sync;
+    ObjectId _idBase;
+    uint64_t _lastSerial;
+    uint64_t _lastRevision;
+}
+
+- (instancetype)initWithEngine:(MFEngine*)engine clientID:(NSString*)clientID slot:(NSInteger)slot {
+    if ((self = [super init])) {
+        _engine = engine;
+        _sync = std::make_unique<SyncEngine>(clientID.UTF8String);
+        _idBase = syncIdBase(int(std::max<NSInteger>(1, slot)));
+        __weak MFCollabSync* weakSelf = self;
+        _sync->mediaNameForAsset = [weakSelf](const Asset& a) -> std::string {
+            MFCollabSync* s = weakSelf;
+            if (!s || !s.mediaNameForAsset) return "";
+            NSString* name = s.mediaNameForAsset(a.id, @(a.path.c_str()));
+            return name ? std::string(name.UTF8String) : std::string();
+        };
+        _sync->pathForMedia = [weakSelf](const std::string& media) -> std::string {
+            MFCollabSync* s = weakSelf;
+            if (!s || !s.pathForMedia) return "";
+            NSString* path = s.pathForMedia(@(media.c_str()));
+            return path ? std::string(path.fileSystemRepresentation) : std::string();
+        };
+    }
+    return self;
+}
+
+- (void)markSynced {
+    _lastSerial = [_engine mf_editSerial];
+    _lastRevision = _engine.revision;
+}
+
+- (NSString*)startSharing {
+    [_engine mf_reserveIds:_idBase];
+    NSString* json = @(piecesToJson(_sync->start([_engine mf_projectSnapshot])).c_str());
+    [self markSynced];
+    return json;
+}
+
+- (BOOL)joinWithPieces:(NSString*)json error:(NSError**)error {
+    std::vector<SyncPiece> pieces;
+    std::string err;
+    if (!piecesFromJson(json.UTF8String, pieces, err)) {
+        if (error) *error = makeError(2, "The shared project couldn't be read: " + err);
+        return NO;
+    }
+    Project p = _sync->join(pieces, [_engine mf_projectSnapshot]);
+    if (p.compositions.empty()) {
+        if (error) *error = makeError(2, "The shared project is empty.");
+        return NO;
+    }
+    [_engine mf_applyExternal:std::move(p)];
+    [_engine mf_reserveIds:_idBase];
+    [self markSynced];
+    return YES;
+}
+
+- (BOOL)hasLocalChanges { return _engine.revision != _lastRevision; }
+
+- (NSString*)collectLocalChanges {
+    if (!self.hasLocalChanges) return @"[]";
+    const uint64_t serial = [_engine mf_editSerial];
+    std::vector<SyncPiece> sent = _sync->collectLocal([_engine mf_projectSnapshot], serial != _lastSerial);
+    [self markSynced];
+    return @(piecesToJson(sent).c_str());
+}
+
+- (BOOL)applyRemotePieces:(NSString*)json pending:(NSString**)pending {
+    // Collect first, so local edits aren't mistaken for the merged state.
+    NSString* local = [self collectLocalChanges];
+    if (pending) *pending = local;
+    std::vector<SyncPiece> pieces;
+    std::string err;
+    if (!piecesFromJson(json.UTF8String, pieces, err)) return NO;
+    Project p = [_engine mf_projectSnapshot];
+    if (!_sync->applyRemote(pieces, p)) return NO;
+    [_engine mf_applyExternal:std::move(p)];
+    [self markSynced];
+    return YES;
+}
+
+- (BOOL)canUndo { return _sync->canUndo(); }
+- (BOOL)canRedo { return _sync->canRedo(); }
+
+- (NSString*)revert:(BOOL)undo {
+    NSString* local = [self collectLocalChanges];
+    Project p = [_engine mf_projectSnapshot];
+    std::vector<SyncPiece> sent = undo ? _sync->undo(p) : _sync->redo(p);
+    if (!sent.empty()) [_engine mf_applyExternal:std::move(p)];
+    [self markSynced];
+    std::vector<SyncPiece> all;
+    std::string err;
+    piecesFromJson(local.UTF8String, all, err);
+    all.insert(all.end(), sent.begin(), sent.end());
+    return @(piecesToJson(all).c_str());
+}
+
+- (NSString*)undo { return [self revert:YES]; }
+- (NSString*)redo { return [self revert:NO]; }
+
+- (BOOL)refreshMedia {
+    Project p = [_engine mf_projectSnapshot];
+    if (!_sync->refreshMedia(p)) return NO;
+    [_engine mf_applyExternal:std::move(p)];
+    [self markSynced];
+    return YES;
+}
+
+- (NSUInteger)pieceCount { return _sync->pieceCount(); }
 
 @end

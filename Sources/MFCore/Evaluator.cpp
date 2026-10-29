@@ -83,6 +83,8 @@ struct CompIndex {
 
 void evaluateLayers(const CompIndex& ix, const Composition& comp, double time, double shutter, const Affine& toTarget,
                     FrameDesc& f, EvalStats* stats, int depth);
+bool projectThroughCamera(const Composition& comp, const Layer& l, double t, Vec2 mn, Vec2 mx, Affine& aff, Vec2& persp,
+                          double& perspW, double* depth);
 
 // Target-pixel box around everything a nested frame draws (offscreen region of a collapsed precomp).
 void nestedTargetBounds(const FrameDesc& nf, Vec2& mn, Vec2& mx) {
@@ -97,7 +99,7 @@ void nestedTargetBounds(const FrameDesc& nf, Vec2& mn, Vec2& mx) {
         b = {b.x + pad, b.y + pad};
         const double reach = effectReach(nf, d) + 2;
         for (Vec2 c : {a, Vec2{b.x, a.y}, b, Vec2{a.x, b.y}}) {
-            const Vec2 q = d.toTarget.apply(c);
+            const Vec2 q = d.project(c);
             mn = {std::min(mn.x, q.x - reach), std::min(mn.y, q.y - reach)};
             mx = {std::max(mx.x, q.x + reach), std::max(mx.y, q.y + reach)};
         }
@@ -110,22 +112,32 @@ bool buildItem(const CompIndex& ix, const Composition& comp, const Layer& l, dou
                const Affine& toTarget, FrameDesc& f, DrawItem& d, int depth) {
     const Project& project = ix.project;
     const double time = l.motionBlur ? baseTime + shutter : baseTime;
-    if (l.kind == LayerKind::Null || l.kind == LayerKind::Audio) return false;
+    if (l.kind == LayerKind::Null || l.kind == LayerKind::Audio || l.kind == LayerKind::Camera) return false;
     d.layerId = l.id;
     d.kind = l.kind;
     d.shape = l.shape;
     d.blend = l.blend;
     d.opacity = evaluateProperty(l.prop(PropId::Opacity), PropId::Opacity, time)[0] / 100.0;
     if (d.opacity <= 0) return false;
-    d.toTarget = toTarget * layerWorldTransform(comp, l, time);
-    if (std::abs(d.toTarget.determinant()) < 1e-12) return false;  // collapsed by a 0% scale
     layerLocalBounds(project, l, time, d.boundsMin, d.boundsMax);
+    if (l.threeD && l.kind != LayerKind::Precomp) {
+        // Through the camera: a perspective map, then into this target like any 2D layer.
+        Affine aff;
+        if (!projectThroughCamera(comp, l, time, d.boundsMin, d.boundsMax, aff, d.persp, d.perspW, &d.depth)) return false;
+        d.toTarget = aff;
+        d.threeD = true;
+        d.prepend(toTarget);
+    } else {
+        d.toTarget = toTarget * layerWorldTransform(comp, l, time);
+    }
+    if (std::abs(d.toTarget.determinant()) < 1e-12) return false;  // collapsed by a 0% scale (or edge-on)
 
     if (l.kind == LayerKind::Image) {
         const Asset* a = project.findAsset(l.asset);
         if (!a || a->missing || a->width <= 0 || a->height <= 0) return false;
         d.asset = a->id;
         d.assetGeneration = a->generation;
+        if (a->isVideo()) d.videoFrame = a->frameAt(time - l.startTime);
     } else if (l.kind == LayerKind::Precomp) {
         const Composition* src = ix.find(l.source);
         if (!src || src->id == comp.id || depth + 1 >= kMaxNesting) return false;
@@ -285,8 +297,10 @@ void hashItem(Hasher& h, const FrameDesc& f, const DrawItem& d) {
         h.f64(d.fill[i]);
         h.f64(d.stroke[i]);
     }
+    for (double v : {d.persp.x, d.persp.y, d.perspW}) h.f64(v);
     h.u64(d.asset);
     h.u64(d.assetGeneration);
+    h.u64(static_cast<uint64_t>(d.videoFrame + 1));
     h.u64(d.maskCount);
     for (uint32_t i = 0; i < d.maskCount; ++i) {
         const MaskEval& m = f.masks[d.maskStart + i];
@@ -348,6 +362,142 @@ Affine layerWorldTransform(const Composition& comp, const Layer& layer, double t
     return m;
 }
 
+namespace {
+
+double propAt(const Layer& l, PropId p, double t) { return evaluateProperty(l.prop(p), p, t)[0]; }
+
+// A layer's own transform in 3D: position (with z), X then Y then Z rotation, scale, anchor.
+Mat4 localMatrix(const Layer& l, double t) {
+    if (!l.is3D()) return Mat4::fromAffine(localTransform(l, t));
+    const Value anchor = evaluateProperty(l.prop(PropId::AnchorPoint), PropId::AnchorPoint, t);
+    const Value pos = evaluateProperty(l.prop(PropId::Position), PropId::Position, t);
+    const Value scl = evaluateProperty(l.prop(PropId::Scale), PropId::Scale, t);
+    const double sx = l.kind == LayerKind::Camera ? 1 : scl[0] / 100.0, sy = l.kind == LayerKind::Camera ? 1 : scl[1] / 100.0;
+    return Mat4::translate(pos[0], pos[1], propAt(l, PropId::PositionZ, t)) * Mat4::rotateX(propAt(l, PropId::RotationX, t)) *
+           Mat4::rotateY(propAt(l, PropId::RotationY, t)) * Mat4::rotateZ(propAt(l, PropId::Rotation, t)) * Mat4::scale(sx, sy, 1) *
+           Mat4::translate(l.kind == LayerKind::Camera ? 0 : -anchor[0], l.kind == LayerKind::Camera ? 0 : -anchor[1], 0);
+}
+
+// Layer space -> composition pixels through the camera, as numerator rows and the perspective row.
+// False when any corner of [mn, mx] is at or behind the camera (it would wrap around).
+bool projectThroughCamera(const Composition& comp, const Layer& l, double t, Vec2 mn, Vec2 mx, Affine& aff, Vec2& persp,
+                          double& perspW, double* depth) {
+    const CameraView cam = cameraAt(comp, t);
+    const Mat4 a = cam.view * layerWorldMatrix(comp, l, t);
+    // Camera-space point of layer point (u, v, 0) is a · (u, v, 0, 1); the screen point is
+    // (zoom·x + cx·z, zoom·y + cy·z) / z.
+    double h[3][3];
+    const int cols[3] = {0, 1, 3};
+    for (int j = 0; j < 3; ++j) {
+        const int c = cols[j];
+        h[0][j] = cam.zoom * a.m[0][c] + cam.cx * a.m[2][c];
+        h[1][j] = cam.zoom * a.m[1][c] + cam.cy * a.m[2][c];
+        h[2][j] = a.m[2][c];
+    }
+    constexpr double kNear = 1;  // px in front of the lens
+    for (Vec2 c : {mn, Vec2{mx.x, mn.y}, mx, Vec2{mn.x, mx.y}})
+        if (h[2][0] * c.x + h[2][1] * c.y + h[2][2] < kNear) return false;
+    aff = {h[0][0], h[1][0], h[0][1], h[1][1], h[0][2], h[1][2]};
+    persp = {h[2][0], h[2][1]};
+    perspW = h[2][2];
+    if (depth) {
+        const Vec2 c = (mn + mx) * 0.5;
+        *depth = h[2][0] * c.x + h[2][1] * c.y + h[2][2];
+    }
+    return true;
+}
+
+}  // namespace
+
+Mat4 layerWorldMatrix(const Composition& comp, const Layer& layer, double time) {
+    Mat4 m = localMatrix(layer, time);
+    ObjectId parent = layer.parent;
+    for (int depth = 0; parent != 0 && depth < 64; ++depth) {
+        const Layer* p = comp.findLayer(parent);
+        if (!p) break;
+        m = localMatrix(*p, time) * m;
+        parent = p->parent;
+    }
+    return m;
+}
+
+namespace {
+thread_local ObjectId gOverrideComp = 0;
+thread_local CameraView gOverride;
+thread_local bool gHasOverride = false;
+}  // namespace
+
+void setViewOverride(ObjectId comp, const CameraView* view) {
+    gHasOverride = view != nullptr;
+    gOverrideComp = comp;
+    if (view) gOverride = *view;
+}
+
+CameraView orbitView(const Composition& comp, double yaw, double pitch, double distance, Vec2 pan) {
+    CameraView v;
+    v.cx = comp.width * 0.5;
+    v.cy = comp.height * 0.5;
+    v.zoom = std::round(comp.width * 50.0 / 36.0 * 10) / 10;
+    const Mat4 world = Mat4::translate(v.cx, v.cy, 0) * Mat4::rotateY(yaw) * Mat4::rotateX(pitch) *
+                       Mat4::translate(-pan.x, -pan.y, -v.zoom * std::max(0.05, distance));
+    Mat4 inv;
+    if (world.inverse(inv)) v.view = inv;
+    return v;
+}
+
+CameraView cameraAt(const Composition& comp, double time) {
+    if (gHasOverride && gOverrideComp == comp.id) return gOverride;
+    CameraView v;
+    v.cx = comp.width * 0.5;
+    v.cy = comp.height * 0.5;
+    v.zoom = std::round(comp.width * 50.0 / 36.0 * 10) / 10;
+    v.view = Mat4::translate(-v.cx, -v.cy, v.zoom);  // the default camera sits at (cx, cy, -zoom)
+    for (const Layer& l : comp.layers) {  // the topmost one wins
+        if (l.kind != LayerKind::Camera || !l.activeAt(time)) continue;
+        Mat4 inv;
+        if (!layerWorldMatrix(comp, l, time).inverse(inv)) continue;
+        v.view = inv;
+        v.zoom = std::max(1.0, propAt(l, PropId::CameraZoom, time));
+        v.camera = l.id;
+        break;
+    }
+    return v;
+}
+
+Vec2 LayerMapping::apply(Vec2 p) const {
+    const double w = persp.x * p.x + persp.y * p.y + perspW;
+    const Vec2 q = aff.apply(p);
+    return std::abs(w) > 1e-12 ? Vec2{q.x / w, q.y / w} : q;
+}
+
+bool LayerMapping::inverse(Vec2 c, Vec2& out) const {
+    // Inverse of the 3x3 [[a c tx] [b d ty] [px py w]] applied to (c.x, c.y, 1).
+    const double m[3][3] = {{aff.a, aff.c, aff.tx}, {aff.b, aff.d, aff.ty}, {persp.x, persp.y, perspW}};
+    const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                       m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if (std::abs(det) < 1e-12) return false;
+    const double i00 = (m[1][1] * m[2][2] - m[1][2] * m[2][1]), i01 = -(m[0][1] * m[2][2] - m[0][2] * m[2][1]),
+                 i02 = (m[0][1] * m[1][2] - m[0][2] * m[1][1]);
+    const double i10 = -(m[1][0] * m[2][2] - m[1][2] * m[2][0]), i11 = (m[0][0] * m[2][2] - m[0][2] * m[2][0]),
+                 i12 = -(m[0][0] * m[1][2] - m[0][2] * m[1][0]);
+    const double i20 = (m[1][0] * m[2][1] - m[1][1] * m[2][0]), i21 = -(m[0][0] * m[2][1] - m[0][1] * m[2][0]),
+                 i22 = (m[0][0] * m[1][1] - m[0][1] * m[1][0]);
+    const double x = i00 * c.x + i01 * c.y + i02, y = i10 * c.x + i11 * c.y + i12, w = i20 * c.x + i21 * c.y + i22;
+    if (std::abs(w) < 1e-12 || (w / det) * (perspW >= 0 ? 1 : -1) < 0) return false;  // beyond the horizon
+    out = {x / w, y / w};
+    return true;
+}
+
+LayerMapping layerToComp(const Composition& comp, const Layer& layer, double time, Vec2 mn, Vec2 mx) {
+    LayerMapping m;
+    if (!layer.threeD || layer.kind == LayerKind::Precomp || layer.kind == LayerKind::Camera) {
+        m.aff = layerWorldTransform(comp, layer, time);
+        return m;
+    }
+    m.visible = projectThroughCamera(comp, layer, time, mn, mx, m.aff, m.persp, m.perspW, nullptr);
+    return m;
+}
+
 void layerLocalBounds(const Project& project, const Layer& layer, double time, Vec2& mn, Vec2& mx) {
     switch (layer.kind) {
         case LayerKind::Image: {
@@ -371,6 +521,10 @@ void layerLocalBounds(const Project& project, const Layer& layer, double time, V
             mn = {0, 0};
             mx = {100, 100};
             return;
+        case LayerKind::Camera:  // nothing to draw: a marker round its position
+            mn = {-50, -50};
+            mx = {50, 50};
+            return;
         case LayerKind::Text:
             measureText(styleFor(layer, time), mn, mx);
             return;
@@ -387,7 +541,10 @@ void layerLocalBounds(const Project& project, const Layer& layer, double time, V
 }
 
 BezierPath layerPathAt(const Layer& layer, double time) { return layer.pathTrack ? layer.pathTrack->at(time) : layer.path; }
-BezierPath maskPathAt(const Mask& mask, double time) { return mask.pathTrack ? mask.pathTrack->at(time) : mask.path; }
+BezierPath maskPathAt(const Mask& mask, double time) {
+    if (mask.pathTrack) return mask.pathTrack->at(time);
+    return mask.pathKeys.empty() ? mask.path : pathKeysAt(mask.pathKeys, time);
+}
 
 int textUnitCount(const std::string& text, SelectorUnit unit) {
     int chars = 0, words = 0, lines = 1;
@@ -452,6 +609,23 @@ bool splicePrecomp(const Layer& l, double time) {
 
 void evaluateLayers(const CompIndex& ix, const Composition& comp, double time, double shutter, const Affine& toTarget,
                     FrameDesc& f, EvalStats* stats, int depth) {
+    const size_t first = f.items.size();
+    // 3D layers next to each other in the stack paint far to near (2D layers between them keep
+    // their place, as in After Effects).
+    struct SortRuns {
+        FrameDesc& f;
+        size_t first;
+        ~SortRuns() {
+            auto far = [](const DrawItem& a, const DrawItem& b) { return a.depth > b.depth; };
+            for (size_t i = first; i < f.items.size();) {
+                if (!f.items[i].threeD) { ++i; continue; }
+                size_t j = i;
+                while (j < f.items.size() && f.items[j].threeD) ++j;
+                std::stable_sort(f.items.begin() + long(i), f.items.begin() + long(j), far);
+                i = j;
+            }
+        }
+    } sortRuns{f, first};
     // layers[0] is the top of the stack, so paint from the back.
     for (auto it = comp.layers.rbegin(); it != comp.layers.rend(); ++it) {
         const Layer& l = *it;
@@ -568,11 +742,11 @@ ObjectId hitTestIn(const Project& project, const Composition& comp, double time,
     for (const Layer& l : comp.layers) {  // top first
         if (!l.activeAt(time) || l.kind == LayerKind::Audio || (!nulls && l.kind == LayerKind::Null)) continue;
         if (l.kind != LayerKind::Null && evaluateProperty(l.prop(PropId::Opacity), PropId::Opacity, time)[0] <= 0) continue;
-        Affine inv;
-        if (!layerWorldTransform(comp, l, time).inverse(inv)) continue;
-        const Vec2 q = inv.apply(p);
-        Vec2 mn, mx;
+        if (l.kind == LayerKind::Camera) continue;
+        Vec2 mn, mx, q;
         layerLocalBounds(project, l, time, mn, mx);
+        const LayerMapping map = layerToComp(comp, l, time, mn, mx);
+        if (!map.visible || !map.inverse(p, q)) continue;
         if (l.kind == LayerKind::Precomp) {
             // Hit where the precomp draws something, not anywhere in its frame (collapsed precomps
             // aren't clipped to it at all).
@@ -603,7 +777,7 @@ ObjectId hitTest(const Project& project, const Composition& comp, double time, V
 std::array<Vec2, 4> layerCorners(const Project& project, const Composition& comp, const Layer& layer, double time) {
     Vec2 mn, mx;
     layerLocalBounds(project, layer, time, mn, mx);
-    const Affine m = layerWorldTransform(comp, layer, time);
+    const LayerMapping m = layerToComp(comp, layer, time, mn, mx);
     return {m.apply({mn.x, mn.y}), m.apply({mx.x, mn.y}), m.apply({mx.x, mx.y}), m.apply({mn.x, mx.y})};
 }
 
@@ -611,7 +785,7 @@ std::array<Vec2, 4> maskCorners(const Composition& comp, const Layer& layer, con
     const Value pos = evaluateProperty(mask.param(MaskParam::Position), maskParamDef(MaskParam::Position), time);
     const Value size = evaluateProperty(mask.param(MaskParam::Size), maskParamDef(MaskParam::Size), time);
     const double hx = size[0] * 0.5, hy = size[1] * 0.5;
-    const Affine m = layerWorldTransform(comp, layer, time);
+    const LayerMapping m = layerToComp(comp, layer, time, {pos[0] - hx, pos[1] - hy}, {pos[0] + hx, pos[1] + hy});
     return {m.apply({pos[0] - hx, pos[1] - hy}), m.apply({pos[0] + hx, pos[1] - hy}), m.apply({pos[0] + hx, pos[1] + hy}),
             m.apply({pos[0] - hx, pos[1] + hy})};
 }

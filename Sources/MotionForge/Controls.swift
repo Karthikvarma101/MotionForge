@@ -47,9 +47,7 @@ struct ScrubField: View {
                 Text(formatted)
                     .foregroundStyle(Theme.value)
                     .contentShape(Rectangle())
-                    .onHover { inside in
-                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-                    }
+                    .pointerStyle(.columnResize)  // balanced by the system (push/pop could stick)
                     .gesture(
                         DragGesture(minimumDistance: 1)
                             .onChanged { g in
@@ -157,11 +155,12 @@ extension MFValue {
 extension MFLayerInfo {
     var icon: String {
         switch kind {
-        case .image: return "photo"
+        case .image: return isVideo ? "film" : "photo"
         case .text: return "textformat"
         case .null: return "square.dashed"
         case .precomp: return "square.stack.3d.up"
         case .audio: return "waveform"
+        case .camera: return "video"
         default:
             switch shape {
             case .ellipse: return "circle"
@@ -173,12 +172,21 @@ extension MFLayerInfo {
         }
     }
 
+    /// The transform, in display order: 3D layers add depth and two more axes; cameras have a zoom.
+    var transformProps: [MFProp] {
+        if kind == .camera { return [.position, .positionZ, .rotationX, .rotationY, .rotation, .cameraZoom] }
+        return threeD ? [.anchorPoint, .position, .positionZ, .scale, .rotationX, .rotationY, .rotation, .opacity]
+                      : [.anchorPoint, .position, .scale, .rotation, .opacity]
+    }
+
     /// Properties shown for this layer, in display order.
     var editableProps: [MFProp] {
         if kind == .audio { return [.audioLevel] }
-        var p: [MFProp] = [.anchorPoint, .position, .scale, .rotation, .opacity]
+        var p = transformProps
+        if kind == .camera { return p }
         if kind == .text { return p + [.fontSize, .tracking, .lineHeight, .fillColor, .strokeColor, .strokeWidth] }
         if kind == .precomp { return timeRemapEnabled ? p + [.timeRemap] : p }
+        if isVideo && hasAudio { return p + [.audioLevel] }
         if kind == .shape && shape == .path { return p + [.fillColor, .strokeColor, .strokeWidth, .trimStart, .trimEnd, .trimOffset] }
         if kind == .shape {
             p += [.size]
@@ -197,7 +205,7 @@ extension MFProp {
         switch self {
         case .scale, .opacity, .trimStart, .trimEnd, .trimOffset, .fontSize: return 0.5
         case .lineHeight: return 0.01
-        case .rotation: return 0.5
+        case .rotation, .rotationX, .rotationY: return 0.5
         case .points, .audioLevel: return 0.1
         case .innerRatio: return 0.005
         default: return 1
@@ -213,7 +221,7 @@ extension MFProp {
     var suffix: String {
         switch self {
         case .scale, .opacity, .trimStart, .trimEnd, .trimOffset: return "%"
-        case .rotation: return "°"
+        case .rotation, .rotationX, .rotationY: return "°"
         case .audioLevel: return " dB"
         default: return ""
         }

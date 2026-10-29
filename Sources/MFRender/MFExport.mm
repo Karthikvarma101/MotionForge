@@ -113,8 +113,11 @@ std::vector<FrameDesc> subframesAt(const Project& p, const Composition& c, doubl
     auto renderer = MetalRenderer::create(_device, err);
     if (!renderer) return exportError(21, err);
     renderer->setCachePolicy(CachePolicy::Off);
-    for (const Asset& a : _project.assets)
+    for (const Asset& a : _project.assets) {
         if (!a.missing && a.kind == AssetKind::Image && !renderer->loadImageSync(a.id, a.generation, a.path, err)) return exportError(22, "Media: " + err);
+        // Footage decodes as the frames are rendered (each frame waits for its exact video frame).
+        if (!a.missing && a.kind == AssetKind::Video) renderer->registerVideo(a.id, a.generation, a.path, a.fps, a.frameCount());
+    }
 
     const Composition& c = *_project.findComposition(_comp);
     const double fps = c.fps;
