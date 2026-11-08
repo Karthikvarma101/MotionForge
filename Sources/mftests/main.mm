@@ -2886,6 +2886,32 @@ TEST(three_d_layers_paint_far_to_near) {
     CHECK(px2[0] > 0.9);  // now the red one (top of the stack) covers it
 }
 
+// Effects on a 3D layer are sized by its on-screen scale (perspective Jacobian), not by the raw
+// numerator rows of the camera map, so a blurred layer far from the camera still renders like a
+// 2D layer of the same on-screen size (it used to vanish / exhaust GPU memory).
+TEST(three_d_layer_effects_use_on_screen_scale) {
+    ObjectId l;
+    Document d = colorRectDoc(&l, 200, 100, {1, 1, 1, 1});
+    const ObjectId comp = d.project().activeComposition;
+    const ObjectId fx = d.addEffect(comp, l, EffectType::GaussianBlur);
+    setFx(d, l, fx, 0, {10, 0, 0, 0});
+    const Coverage flat = coverage(render(d.project()));
+    CHECK(d.setLayerThreeD(comp, l, true));
+    const double zoom = std::round(640 * 50.0 / 36.0 * 10) / 10;
+    // At z = 0 the default camera shows it exactly as the 2D layer, effect included.
+    const FrameDesc f0 = evaluateFrame(d.project(), *d.project().activeComp(), 0, 1.0);
+    CHECK(f0.items.size() == 1 && std::abs(effectScale(f0.items[0]) - 1.0) < 1e-6);
+    const Coverage c0 = coverage(render(d.project()));
+    CHECK_NEAR(c0.area, flat.area, flat.area * 0.01);
+    // Three zooms away: one third of the size, and the blur scales with it.
+    d.setPropertyValue(comp, l, PropId::PositionZ, 0, {2 * zoom, 0, 0, 0});
+    const FrameDesc f1 = evaluateFrame(d.project(), *d.project().activeComp(), 0, 1.0);
+    CHECK(f1.items.size() == 1 && std::abs(effectScale(f1.items[0]) - 1.0 / 3.0) < 1e-3);
+    const Coverage c1 = coverage(render(d.project()));
+    CHECK_NEAR(c1.area, flat.area / 9, flat.area * 0.01);
+    CHECK_NEAR(c1.cx, 320, 0.2);
+}
+
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
         const char* filter = argc > 1 ? argv[1] : nullptr;
