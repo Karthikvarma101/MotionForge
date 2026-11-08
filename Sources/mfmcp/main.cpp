@@ -29,7 +29,7 @@ using mf::Json;
 
 namespace {
 
-constexpr const char* kVersion = "0.3.0";
+constexpr const char* kVersion = "0.3.1";
 constexpr const char* kInstructions =
     "Tools for MotionForge, the motion graphics editor open on this Mac. Changes appear live in the editor and "
     "each tool call is one undo step. Start with get_project / get_composition, use layer ids from their answers, "
