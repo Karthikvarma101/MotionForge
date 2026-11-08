@@ -708,7 +708,20 @@ std::vector<double> motionBlurOffsets(const Project& project, const Composition&
     return out;
 }
 
-double effectScale(const DrawItem& d) { return std::sqrt(std::abs(d.toTarget.determinant())); }
+// Target pixels per layer pixel. For a 3D layer `toTarget` holds the numerator rows of a perspective
+// map, so its determinant is off by the depth: use the map's Jacobian at the layer's centre instead
+// (q = (A·p + t) / w, w = g·p + w0  =>  J = (A − q·gᵀ) / w). For 2D items (g = 0, w0 = 1) this is A.
+double effectScale(const DrawItem& d) {
+    if (!d.threeD) return std::sqrt(std::abs(d.toTarget.determinant()));
+    const Vec2 c = (d.boundsMin + d.boundsMax) * 0.5;
+    const double w = d.persp.x * c.x + d.persp.y * c.y + d.perspW;
+    if (std::abs(w) < 1e-9) return std::sqrt(std::abs(d.toTarget.determinant()));
+    const Affine& m = d.toTarget;
+    const Vec2 q = m.apply(c) * (1.0 / w);
+    const double j00 = (m.a - q.x * d.persp.x) / w, j01 = (m.c - q.x * d.persp.y) / w;
+    const double j10 = (m.b - q.y * d.persp.x) / w, j11 = (m.d - q.y * d.persp.y) / w;
+    return std::sqrt(std::abs(j00 * j11 - j01 * j10));
+}
 
 double effectReach(const FrameDesc& f, const DrawItem& d) {
     const double k = effectScale(d);
