@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Learn MotionForge — a beginner's guide</title>
+  <meta name="description" content="A step-by-step beginner's guide to MotionForge: install it, learn the workspace, animate with keyframes and easing, add text, effects, masks, footage, sound and 3D, then export your first video." />
+  <link rel="icon" type="image/png" href="/favicon.png" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="top wrap">
+    <a class="logo" href="/"><img src="/assets/icon.png" alt="" />MotionForge</a>
+    <nav><a href="/#features">Features</a><a href="/learn" class="active">Learn</a><a href="/#pricing">Pricing</a><a href="https://github.com/Karthikvarma101/MotionForge">GitHub</a></nav>
+  </header>
+
+  <main>
+    <div class="guide-hero wrap">
+      <div class="eyebrow">Beginner's guide</div>
+      <h1>Learn <span>MotionForge</span></h1>
+      <p>From opening the app for the first time to exporting your first video. No motion-graphics experience needed:
+        each lesson builds on the one before and takes about five minutes. Keep MotionForge open beside this page and
+        follow along.</p>
+      <div class="cta">
+        <a class="button primary" href="https://github.com/Karthikvarma101/MotionForge/releases/latest/download/MotionForge.dmg">Download for Mac</a>
+        <a class="button secondary" href="#start">Start lesson 1</a>
+      </div>
+    </div>
+
+    <div class="guide wrap">
+      <aside class="toc" aria-label="Contents">
+        <div class="toc-title">Contents</div>
+        <ol>
+          <li><a href="#setup">Install and open</a></li>
+          <li><a href="#words">Six words to know</a></li>
+          <li><a href="#tour">The workspace</a></li>
+          <li><a href="#start">1 · Your first animation</a></li>
+          <li><a href="#easing">2 · Natural movement</a></li>
+          <li><a href="#transform">3 · Fade, grow and spin</a></li>
+          <li><a href="#text">4 · Animated text</a></li>
+          <li><a href="#effects">5 · Presets and effects</a></li>
+          <li><a href="#shapes">6 · Shapes, masks, mattes</a></li>
+          <li><a href="#media">7 · Footage and sound</a></li>
+          <li><a href="#organise">8 · Tidy projects</a></li>
+          <li><a href="#threed">9 · A first look at 3D</a></li>
+          <li><a href="#export">10 · Export your video</a></li>
+          <li><a href="#claude">Bonus · Claude</a></li>
+          <li><a href="#saving">Saving and sharing</a></li>
+          <li><a href="#shortcuts">Shortcut cheat sheet</a></li>
+          <li><a href="#help">When something goes wrong</a></li>
+          <li><a href="#practice">Practice projects</a></li>
+        </ol>
+        <div class="toc-progress" id="progress"></div>
+      </aside>
+
+      <article>
+        <!-- ───────────────────────── Setup ───────────────────────── -->
+        <section class="lesson" id="setup">
+          <div class="eyebrow">Before you start</div>
+          <h2>Install and open MotionForge</h2>
+          <p>You need a Mac with Apple silicon (M1 or later) running macOS 26 or later.</p>
+          <ol class="steps">
+            <li><a href="https://github.com/Karthikvarma101/MotionForge/releases/latest/download/MotionForge.dmg">Download MotionForge.dmg</a>,
+              open it and drag <strong>MotionForge</strong> onto the <strong>Applications</strong> folder.</li>
+            <li>Open MotionForge from Applications. The first time, macOS says <em>“Apple could not verify…”</em> because
+              this build isn't notarised by Apple yet. Open <strong>System Settings → Privacy &amp; Security</strong>,
+              scroll down and click <strong>Open Anyway</strong> next to MotionForge. You only do this once.</li>
+            <li>The app plays a short logo animation (click to skip it), then shows the <strong>Home</strong> window.</li>
+          </ol>
+          <p>Home is where every project starts:</p>
+          <ul>
+            <li><strong>New Project</strong> (<kbd>⌥⌘N</kbd>) opens an empty 1920 × 1080, 30 fps, 10-second composition.</li>
+            <li><strong>Open Project…</strong> (<kbd>⌘O</kbd>) opens a saved <code>.mfproj</code> file.</li>
+            <li><strong>Starter Scene</strong> opens a small finished animation. Open it first and press <kbd>Space</kbd>
+              to play: it's a good thing to poke at.</li>
+            <li><strong>Recent projects</strong> appear as cards with thumbnails. Click one to open it.</li>
+          </ul>
+          <div class="tip"><strong>Tip.</strong> You can come back to Home any time with the house button at the left of
+            the toolbar, or <kbd>⇧⌘H</kbd>. When a new version is out, Home tells you, and <strong>Update Now</strong>
+            installs it.</div>
+          <label class="done"><input type="checkbox" data-lesson="setup" /> I've installed MotionForge</label>
+        </section>
+
+        <!-- ───────────────────────── Words ───────────────────────── -->
+        <section class="lesson" id="words">
+          <div class="eyebrow">The basics</div>
+          <h2>Six words to know</h2>
+          <p>Every motion-graphics app, MotionForge included, is built on the same few ideas. Learn these and the rest of
+            the app makes sense.</p>
+          <div class="terms">
+            <div class="term"><h3>Composition</h3><p>Your canvas and its length in time: a size (say 1920 × 1080), a frame
+              rate (say 30 frames per second) and a duration. A project can hold several compositions.</p></div>
+            <div class="term"><h3>Layer</h3><p>One thing in the composition: a shape, a piece of text, an image, a video
+              clip, a sound, a camera. Layers stack: the one at the top of the timeline is drawn in front.</p></div>
+            <div class="term"><h3>Property</h3><p>A setting on a layer that you can change, such as Position, Scale,
+              Rotation, Opacity or an effect's strength.</p></div>
+            <div class="term"><h3>Keyframe</h3><p>A saved value of a property at one moment. Set two keyframes with
+              different values and MotionForge fills in every frame between them. That's animation.</p></div>
+            <div class="term"><h3>Playhead</h3><p>The blue line in the timeline marking the current time. Keyframes are
+              written wherever the playhead is.</p></div>
+            <div class="term"><h3>Easing</h3><p>How a change speeds up and slows down between keyframes. Easing is the
+              difference between movement that feels robotic and movement that feels real.</p></div>
+          </div>
+          <label class="done"><input type="checkbox" data-lesson="words" /> I know the six words</label>
+        </section>
+
+        <!-- ───────────────────────── Tour ───────────────────────── -->
+        <section class="lesson" id="tour">
+          <div class="eyebrow">Find your way around</div>
+          <h2>The workspace</h2>
+          <p>Open the Starter Scene from Home. The editor has six areas:</p>
+          <figure>
+            <div class="annotated">
+              <img src="/assets/learn/workspace.jpg" width="1800" height="1130" loading="lazy"
+                   alt="The MotionForge editor with numbered areas: toolbar, project panel, viewer, timeline, inspector and status bar" />
+              <span class="pin" style="left:42%;top:2.4%">1</span>
+              <span class="pin" style="left:10%;top:26%">2</span>
+              <span class="pin" style="left:30%;top:11%">3</span>
+              <span class="pin" style="left:62%;top:84%">4</span>
+              <span class="pin" style="left:88%;top:86%">5</span>
+              <span class="pin" style="left:74%;top:98.6%">6</span>
+            </div>
+          </figure>
+          <ol class="legend">
+            <li><strong>Toolbar.</strong> Home, buttons that add shapes, text and media, the tools (selection, hand, zoom,
+              pen and more), the <em>Viewer | Nodes</em> switch, panel buttons, Claude, undo / redo, Share, Export and
+              your account.</li>
+            <li><strong>Project panel.</strong> Your compositions and imported media, plus the <strong>Effects</strong>
+              tab with every effect and preset. The <strong>Import…</strong> button sits at the bottom.</li>
+            <li><strong>Viewer.</strong> The picture. Click a layer to select it, drag to move it. Scroll to pan, pinch or
+              <kbd>⌘</kbd>-scroll to zoom. The footer shows the zoom, the preview quality and the size.</li>
+            <li><strong>Timeline.</strong> One row per layer, with time running left to right. The time display and play
+              controls are along its top; the ruler below them is where you drag to move the playhead.</li>
+            <li><strong>Inspector</strong> (Properties). Every setting of the selected layer: Transform, Shape or Text,
+              Masks and Effects. With nothing selected, it shows the composition's settings.</li>
+            <li><strong>Status bar.</strong> Live performance: frame time, GPU time and frame-cache use. Handy when
+              playback slows down.</li>
+          </ol>
+          <div class="tip"><strong>Need more room?</strong> <kbd>⌥⌘1</kbd>–<kbd>⌥⌘4</kbd> hide or show the Project
+            panel, Timeline, Inspector and Status bar. <kbd>⌥⌘0</kbd> hides everything around the viewer and brings it
+            back.</div>
+          <label class="done"><input type="checkbox" data-lesson="tour" /> I know where everything is</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 1 ───────────────────────── -->
+        <section class="lesson" id="start">
+          <div class="eyebrow">Lesson 1</div>
+          <h2>Your first animation: a sliding ball</h2>
+          <p>You'll make a circle glide from the left of the screen to the right in one second.</p>
+          <ol class="steps">
+            <li>On Home, click <strong>New Project</strong> (<kbd>⌥⌘N</kbd>).</li>
+            <li>Add a circle: click the <strong>ellipse</strong> button in the toolbar, or choose
+              <strong>Layer → New Ellipse</strong> (<kbd>⌥⌘E</kbd>). It appears in the middle of the viewer and as a row
+              in the timeline.</li>
+            <li>Drag the circle to the left side of the viewer.</li>
+            <li>Press <kbd>Home</kbd> so the playhead is at the very start, 00:00:00.</li>
+            <li>In the Inspector, find <strong>Transform → Position</strong> and click the <strong>stopwatch</strong>
+              icon beside it. It turns gold, and a small diamond, your first keyframe, appears in the timeline.</li>
+            <li>Move the playhead to one second: drag in the timeline ruler until the time display reads
+              <strong>00:01:00</strong> (frame 30).</li>
+            <li>Drag the circle to the right side of the viewer. Because the stopwatch is on, MotionForge writes a second
+              keyframe for you.</li>
+            <li>Press <kbd>Space</kbd> to play. The circle slides across. Press <kbd>Space</kbd> again to stop.</li>
+          </ol>
+          <p>That is the whole idea of animation: <strong>turn on the stopwatch, move in time, change the value.</strong>
+            Every lesson after this uses the same three moves.</p>
+          <div class="note"><strong>Remember.</strong> Once a property's stopwatch is on, <em>any</em> change to it
+            writes a keyframe at the playhead. If something jumps unexpectedly, check where the playhead was.
+            <kbd>⌘Z</kbd> undoes anything, and a whole drag is one undo step.</div>
+          <div class="tip"><strong>Making a reel?</strong> Press <kbd>⌘K</kbd> for Composition Settings and pick the
+            9:16 preset (also 1:1, 4:5, 16:9 HD/4K, 21:9 or a custom size), the frame rate and the duration.</div>
+          <label class="done"><input type="checkbox" data-lesson="start" /> My circle slides</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 2 ───────────────────────── -->
+        <section class="lesson" id="easing">
+          <div class="eyebrow">Lesson 2</div>
+          <h2>Make it move naturally</h2>
+          <p>Your circle moves at one steady speed and stops dead, like a machine. Real things speed up and slow down.
+            That's <strong>easing</strong>.</p>
+          <h3>Add an ease</h3>
+          <ol class="steps">
+            <li>In the timeline, click the circle's first keyframe, then <kbd>⇧</kbd>-click the second so both are
+              selected. (You can also drag a box around them.)</li>
+            <li>Right-click one of them and choose <strong>Easy Ease</strong>.</li>
+            <li>Play again. The circle now starts gently and settles into place.</li>
+          </ol>
+          <p>The same menu has <strong>Ease In</strong> (slow arrival), <strong>Ease Out</strong> (slow departure),
+            <strong>Linear</strong> (constant speed) and <strong>Hold</strong> (no in-between: the value jumps when the
+            next keyframe arrives).</p>
+
+          <h3>Curve the path</h3>
+          <figure>
+            <img src="/assets/learn/motion-path.jpg" width="1400" height="716" loading="lazy"
+                 alt="A selected layer's motion path drawn as a dotted curve, with a keyframe square and two handle dots" />
+            <figcaption>The motion path: squares are keyframes, the round dots are handles that bend the curve.</figcaption>
+          </figure>
+          <p>When a layer with position keyframes is selected, its path is drawn as a dotted line in the viewer. Drag a
+            <strong>square</strong> to move that keyframe, or a <strong>handle dot</strong> to bend the path into an arc.
+            Hold <kbd>⌥</kbd> to move one handle on its own and make a sharp corner. Right-click a position keyframe to
+            switch it between <strong>Smooth</strong> and <strong>Corner</strong>.</p>
+
+          <h3>Fine-tune in the graph editor</h3>
+          <figure>
+            <img src="/assets/learn/graph-editor.jpg" width="1400" height="791" loading="lazy"
+                 alt="The graph editor showing value curves with ease handles" />
+            <figcaption>The graph editor: steep parts of a curve are fast, flat parts are slow.</figcaption>
+          </figure>
+          <p>Click <strong>Graph</strong> in the timeline's transport bar. The keyframe rows turn into curves of each
+            value over time. Drag a handle <strong>sideways</strong> to stretch the ease, and <strong>up or down</strong>
+            to change the speed. Pull a handle past the next value and the move overshoots and settles back, which gives
+            a springy, bouncy feel. Click <strong>Graph</strong> again to go back.</p>
+          <label class="done"><input type="checkbox" data-lesson="easing" /> My animation is eased</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 3 ───────────────────────── -->
+        <section class="lesson" id="transform">
+          <div class="eyebrow">Lesson 3</div>
+          <h2>Fade, grow and spin</h2>
+          <p>Position is one of five <strong>Transform</strong> properties every layer has:</p>
+          <ul>
+            <li><strong>Anchor Point</strong>: the point the layer scales and rotates around.</li>
+            <li><strong>Position</strong>: where it is.</li>
+            <li><strong>Scale</strong>: its size in percent. Width and height are linked; hold <kbd>⌘</kbd> to change one.</li>
+            <li><strong>Rotation</strong>: its angle in degrees.</li>
+            <li><strong>Opacity</strong>: 0% invisible, 100% solid.</li>
+          </ul>
+          <h3>Changing numbers quickly</h3>
+          <p>Every number in the Inspector is <strong>hot text</strong>: drag left or right on it to scrub the value
+            (hold <kbd>⇧</kbd> for big steps, <kbd>⌥</kbd> for fine ones), or click it and type. In the viewer, arrow keys
+            nudge the selected layer 1 pixel, or 10 with <kbd>⇧</kbd>.</p>
+          <h3>Try it: a pop-in</h3>
+          <ol class="steps">
+            <li>Add a star (toolbar or <strong>Layer → New Star</strong>) and press <kbd>Home</kbd>.</li>
+            <li>Turn on the stopwatch for <strong>Scale</strong> and set it to <strong>0%</strong>. Turn on
+              <strong>Opacity</strong> and set it to <strong>0%</strong>.</li>
+            <li>Step forward 8 frames: press <kbd>Page Down</kbd> (or <kbd>⌘→</kbd>) eight times. Set Scale to
+              <strong>115%</strong> and Opacity to <strong>100%</strong>.</li>
+            <li>Step forward 4 more frames and set Scale to <strong>100%</strong>.</li>
+            <li>Select all the keyframes, right-click, <strong>Easy Ease</strong>, and play. The star pops up, overshoots
+              slightly and settles.</li>
+          </ol>
+          <div class="tip"><strong>Show just what you need.</strong> Select a layer and press <kbd>P</kbd> Position,
+            <kbd>S</kbd> Scale, <kbd>R</kbd> Rotation, <kbd>T</kbd> Opacity or <kbd>A</kbd> Anchor Point to show only that
+            row in the timeline (<kbd>⇧</kbd> adds another). <kbd>U</kbd> shows every animated property, <kbd>UU</kbd>
+            every property you've changed. The ◀ ◆ ▶ buttons next to a property jump to the previous keyframe, add or
+            remove one, and jump to the next.</div>
+          <label class="done"><input type="checkbox" data-lesson="transform" /> My star pops in</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 4 ───────────────────────── -->
+        <section class="lesson" id="text">
+          <div class="eyebrow">Lesson 4</div>
+          <h2>Animated text</h2>
+          <figure>
+            <img src="/assets/learn/text-animator.jpg" width="1600" height="1089" loading="lazy"
+                 alt="A text layer typing on, with the Text, Character and Text Animators sections in the inspector" />
+            <figcaption>A typewriter half way through. The Inspector shows the text, its font and the animator doing the work.</figcaption>
+          </figure>
+          <h3>Add text</h3>
+          <ol class="steps">
+            <li>Click <strong>Aa</strong> in the toolbar, or choose <strong>Layer → New Text</strong>
+              (<kbd>⌥⇧⌘T</kbd>).</li>
+            <li>Type your words in the Inspector's <strong>Text</strong> box. Press Return for a new line.</li>
+            <li>Choose a font from the menu under it and set left, centre or right alignment.</li>
+            <li>Under <strong>Character</strong>, set Font Size, Tracking (space between letters), Line Height and Fill
+              Colour. Each has a stopwatch, so they can be animated too.</li>
+          </ol>
+          <h3>The quick way: a text preset</h3>
+          <p>Put the playhead where the text should start, open the <strong>Effects</strong> tab in the Project panel and
+            double-click <strong>Typewriter</strong>, <strong>Fade Up by Character</strong> or <strong>Pop by Word</strong>
+            under <em>Text</em>. Done.</p>
+          <h3>How it works: text animators</h3>
+          <p>Presets are built from <strong>text animators</strong>, which change some letters while leaving the rest
+            alone. Here's a typewriter by hand:</p>
+          <ol class="steps">
+            <li>In <strong>Text Animators</strong>, click <strong>+</strong> and choose <strong>Opacity</strong>.</li>
+            <li>Set its <strong>Char Opacity</strong> to <strong>0%</strong>. Every letter inside the animator's range
+              disappears, and right now the range is the whole text.</li>
+            <li>Press <kbd>Home</kbd>, turn on the stopwatch for <strong>Range Start</strong> and leave it at 0.</li>
+            <li>Move to 1.5 seconds and set Range Start to <strong>100</strong>. As the range shrinks, the letters
+              appear one by one.</li>
+          </ol>
+          <p>Swap Opacity for a <strong>Position</strong>, <strong>Scale</strong> or <strong>Rotation</strong> animator,
+            or switch the range from <em>Characters</em> to <em>Words</em> or <em>Lines</em>, and you have a different
+            effect. The shape menu (Square, Ramp Up, Ramp Down, Triangle, Round, Smooth) softens the edge of the range.</p>
+          <label class="done"><input type="checkbox" data-lesson="text" /> My text types on</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 5 ───────────────────────── -->
+        <section class="lesson" id="effects">
+          <div class="eyebrow">Lesson 5</div>
+          <h2>Presets and effects</h2>
+          <h3>Presets: animation in one double-click</h3>
+          <p>Select one or more layers, put the playhead where the animation should begin, and double-click a preset in
+            the <strong>Effects</strong> tab (or select it and click <strong>Apply</strong>):</p>
+          <ul>
+            <li><strong>Entrances:</strong> Fade In, Pop In, Slide Up, Spin In, Blur In</li>
+            <li><strong>Exits:</strong> Fade Out, Slide Out Up</li>
+            <li><strong>Attention:</strong> Glow Pulse, Bounce</li>
+            <li><strong>Styles:</strong> Soft Shadow</li>
+            <li><strong>Text:</strong> Typewriter, Fade Up by Character, Pop by Word</li>
+          </ul>
+          <p>Presets just write ordinary keyframes and effects, so you can edit everything they add. Movement presets
+            are relative: <em>Slide Up</em> ends exactly where your layer already is. Made something you like? Select
+            the layer and choose <strong>Layer → Save Animation Preset…</strong>; it appears under <em>My Presets</em>.</p>
+
+          <div class="side">
+            <div>
+              <h3>Effects</h3>
+              <p>Effects change how a layer looks. Add one from the <strong>Effects</strong> tab (search, then
+                double-click), the <strong>Effect</strong> menu, or <strong>Add Effect</strong> in the Inspector:</p>
+              <ul>
+                <li><strong>Gaussian Blur</strong>: softens the layer.</li>
+                <li><strong>Drop Shadow</strong>: colour, opacity, direction, distance and softness.</li>
+                <li><strong>Glow</strong>: bright parts bleed light.</li>
+                <li><strong>Brightness &amp; Contrast</strong>, <strong>Hue/Saturation</strong>, <strong>Fill</strong>
+                  and <strong>Gradient Ramp</strong> for colour.</li>
+              </ul>
+              <p>Each effect in the Inspector has a checkbox to switch it off for comparison, ▲▼ to change the order,
+                and a stopwatch on every setting. Animate <em>Blur Radius</em> from 40 to 0 for a focus-in, or Glow
+                Intensity up and down for a pulse.</p>
+            </div>
+            <figure>
+              <img src="/assets/learn/effects-inspector.jpg" width="356" height="700" loading="lazy"
+                   alt="The inspector with a Drop Shadow and a Gaussian Blur effect" />
+              <figcaption>Two effects on one layer, applied top to bottom.</figcaption>
+            </figure>
+          </div>
+          <label class="done"><input type="checkbox" data-lesson="effects" /> I've used a preset and an effect</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 6 ───────────────────────── -->
+        <section class="lesson" id="shapes">
+          <div class="eyebrow">Lesson 6</div>
+          <h2>Shapes, masks and track mattes</h2>
+          <h3>Draw with the pen</h3>
+          <ol class="steps">
+            <li>Press <kbd>G</kbd> (or click <strong>Pen</strong> in the toolbar).</li>
+            <li>Click to place a sharp corner; click and drag to place a smooth point with handles.</li>
+            <li>Click the first point to close the shape, or press Return to finish an open line.</li>
+            <li>Press <kbd>V</kbd> or Esc to go back to the selection tool. Drag points and handles of the selected path
+              to reshape it.</li>
+          </ol>
+          <p>The switch next to the pen chooses what you draw: a <strong>New Shape</strong> (its own layer) or a
+            <strong>Mask on Layer</strong> (cuts out part of the selected layer).</p>
+          <h3>A line that draws itself</h3>
+          <p>Turn on <strong>Stroke</strong> for your path and give it a width. In <strong>Shape Properties</strong>,
+            keyframe <strong>Trim End</strong> from 0% to 100%: the line draws itself from start to finish. Great for
+            underlines, arrows and signatures.</p>
+          <h3>Masks</h3>
+          <p>A mask shows only part of a layer. Click <strong>+</strong> in the Inspector's Masks section, or choose
+            <strong>Layer → New Rectangle Mask</strong> / <strong>New Ellipse Mask</strong>. Set its mode (add,
+            subtract, intersect, difference), feather (a soft edge), expansion and opacity, and invert it if you need the
+            outside. All of them can be animated: an ellipse mask that grows from nothing is a classic reveal.</p>
+          <h3>Track mattes</h3>
+          <p>A track matte lets one layer decide where another is visible, for example a video showing only inside some
+            big text. Select the layer to fill, open the <strong>Matte</strong> menu in the Inspector's Layer section,
+            and pick the shaping layer and a mode: <strong>Alpha</strong> (visible where the matte is solid),
+            <strong>Luma</strong> (visible where it's bright) or their inverted versions. The matte layer hides itself
+            automatically.</p>
+          <label class="done"><input type="checkbox" data-lesson="shapes" /> I've drawn a shape and a mask</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 7 ───────────────────────── -->
+        <section class="lesson" id="media">
+          <div class="eyebrow">Lesson 7</div>
+          <h2>Footage, images and sound</h2>
+          <p>Bring media in with <kbd>⌘I</kbd>, the <strong>Import…</strong> button, or by dropping files onto the viewer
+            or the Project panel.</p>
+          <ul>
+            <li><strong>Video:</strong> MOV, MP4, M4V, MPG, MTS, TS, DV and 3GP (H.264, HEVC, ProRes…). Clips play with
+              their sound, and phone videos come in the right way up. MKV and WebM can't be read yet; convert them to MP4
+              first.</li>
+            <li><strong>Images:</strong> PNG, JPEG, HEIC, WebP, AVIF, PSD, TIFF, OpenEXR, camera RAW and more, plus SVG
+              and PDF artwork. PNGs with transparency stay transparent.</li>
+            <li><strong>Audio:</strong> WAV, MP3, AAC/M4A, AIFF and CAF. Audio layers are teal in the timeline and show
+              their waveform.</li>
+          </ul>
+          <p>Drag a bar in the timeline to slide a clip in time; drag its ends to trim it. The speaker switch mutes an
+            audio layer.</p>
+          <h3>Fade music in and out</h3>
+          <p>Audio layers have an <strong>Audio Level</strong> in decibels: 0 dB is as recorded, −48 dB is silent.
+            Keyframe it from −48 to 0 over the first second for a fade-in, and back down at the end for a fade-out.
+            Video clips have the same control for their sound.</p>
+          <div class="tip"><strong>Cut someone out of a video.</strong> Select a video or image layer and use
+            <strong>Roto Brush</strong> in the Inspector. Choose <em>Main Subject</em> or <em>People</em> and MotionForge
+            finds them in every frame of the work area and builds a mask that follows them. Put text behind the cut-out
+            for a pro-looking depth effect.</div>
+          <label class="done"><input type="checkbox" data-lesson="media" /> I've imported media</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 8 ───────────────────────── -->
+        <section class="lesson" id="organise">
+          <div class="eyebrow">Lesson 8</div>
+          <h2>Keep bigger projects tidy</h2>
+          <h3>Name your layers</h3>
+          <p>Select a layer and type a name at the top of the Inspector. “Title”, “Logo” and “BG” beat “Rectangle 4”.</p>
+          <h3>Parenting: move things together</h3>
+          <p>Set a layer's <strong>Parent</strong> (Inspector, Layer section) to another layer and it follows that
+            layer's position, scale and rotation, while still keeping its own animation. A common trick is a
+            <strong>null</strong>, an invisible layer that only exists to be a parent: <strong>Layer → New Null</strong>
+            (<kbd>⌥⇧⌘Y</kbd>), parent a group of layers to it, then animate the null to move them all at once.</p>
+          <h3>Pre-compose: a composition inside a composition</h3>
+          <p>Select several layers and press <kbd>⇧⌘C</kbd>. They're bundled into a new composition that sits in your
+            main one as a single layer. Double-click it to open it; each open composition gets a tab above the timeline,
+            and the trail under the tabs (main › scene › rig) takes you back up. <kbd>⇧⌘↑</kbd> goes to the parent.</p>
+          <h3>Everyday editing</h3>
+          <ul>
+            <li><kbd>⌘D</kbd> duplicates, <kbd>⇧⌘D</kbd> splits a layer at the playhead.</li>
+            <li><kbd>]</kbd> and <kbd>[</kbd> move a layer forward or backward in the stack.</li>
+            <li><kbd>⌘C</kbd> / <kbd>⌘V</kbd> copy and paste layers, or selected keyframes, even between projects. Pasted
+              keyframes start at the playhead.</li>
+            <li><kbd>B</kbd> and <kbd>N</kbd> set the start and end of the <strong>work area</strong>, the part of the
+              timeline you're working on. Playback loops over it. Press <kbd>0</kbd> on the number pad for a
+              <strong>RAM Preview</strong>: every frame is rendered once, then it plays in real time.</li>
+          </ul>
+          <label class="done"><input type="checkbox" data-lesson="organise" /> My project is organised</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 9 ───────────────────────── -->
+        <section class="lesson" id="threed">
+          <div class="eyebrow">Lesson 9</div>
+          <h2>A first look at 3D</h2>
+          <figure>
+            <img src="/assets/learn/3d-camera.jpg" width="1600" height="1004" loading="lazy"
+                 alt="Three cards at different depths seen through an animated camera" />
+            <figcaption>Three flat cards at different depths. A moving camera makes them slide past each other like real objects.</figcaption>
+          </figure>
+          <ol class="steps">
+            <li>Make two or three layers (cards, text, images). Turn on the <strong>cube</strong> switch on each one's
+              timeline row (or <strong>Layer → 3D Layer</strong>). They gain <strong>Z Position</strong> (depth) and
+              <strong>X / Y Rotation</strong>.</li>
+            <li>Give each a different Z Position, for example 0, 400 and 800. Positive Z pushes a layer further away.</li>
+            <li>Add a camera: <strong>Layer → New Camera</strong> (<kbd>⌥⇧⌘C</kbd>). It starts out showing exactly what
+              you saw before.</li>
+            <li>Keyframe the camera's Position or Z Position over a few seconds and play. The near layers move faster
+              than the far ones: that's parallax, and it's what makes 3D feel real.</li>
+          </ol>
+          <p>To look around without changing your shot, pick <strong>Custom View</strong> in the viewer's footer, or press
+            <kbd>C</kbd> for the Orbit Camera tool: drag to orbit, <kbd>⌥</kbd>-drag to move in and out, <kbd>⇧</kbd>-drag
+            to pan. Exports always use your real camera.</p>
+          <label class="done"><input type="checkbox" data-lesson="threed" /> I've moved a camera</label>
+        </section>
+
+        <!-- ───────────────────────── Lesson 10 ───────────────────────── -->
+        <section class="lesson" id="export">
+          <div class="eyebrow">Lesson 10</div>
+          <h2>Export your video</h2>
+          <p>Click <strong>Export</strong> in the toolbar, or choose <strong>File → Export Video…</strong>
+            (<kbd>⌘M</kbd>).</p>
+          <figure>
+            <img src="/assets/learn/export-window.jpg" width="1000" height="534" loading="lazy"
+                 alt="The export window with Format, Size, Range, Bitrate, Motion blur, Audio layers and Extra soundtrack settings" />
+          </figure>
+          <table class="formats">
+            <thead><tr><th>Format</th><th>Use it for</th></tr></thead>
+            <tbody>
+              <tr><td>H.264 (.mp4)</td><td>Posting anywhere: Instagram, YouTube, WhatsApp. The safe choice.</td></tr>
+              <tr><td>HEVC (.mp4)</td><td>The same quality in a smaller file, for newer devices.</td></tr>
+              <tr><td>ProRes 422 (.mov)</td><td>Bringing your animation into DaVinci Resolve, Premiere or Final Cut at top quality.</td></tr>
+              <tr><td>ProRes 4444 (.mov)</td><td>Overlays with a <strong>transparent background</strong>, such as titles or lower thirds to put over other footage.</td></tr>
+              <tr><td>PNG sequence</td><td>One image per frame, also with transparency.</td></tr>
+            </tbody>
+          </table>
+          <ul>
+            <li><strong>Size:</strong> full, half or quarter resolution.</li>
+            <li><strong>Range:</strong> the whole composition or a custom part; it starts out as your work area if you
+              set one.</li>
+            <li><strong>Bitrate:</strong> <em>Reels</em> (10 Mb/s) for phone videos, <em>YouTube</em> (35 Mb/s) for
+              long-form, or your own.</li>
+            <li><strong>Audio:</strong> audio layers are mixed in at their levels, and you can add an extra soundtrack.</li>
+            <li><strong>Motion blur:</strong> the viewer doesn't show it, but exports render it. Switch it on for smoother
+              fast movement.</li>
+          </ul>
+          <p>Exports run in the background from a snapshot of your project, so you can keep editing. Click
+            <strong>Hide</strong> and a progress pill stays in the status bar; click it to bring the window back.
+            <strong>Reveal</strong> shows the finished file in Finder.</p>
+          <div class="note"><strong>Exporting needs MotionForge Pro.</strong> Editing, previewing and saving are free.
+            Sign in with Google (toolbar, top right) and every new account gets a free Pro trial. Need a single still
+            instead? <strong>File → Export Frame as PNG…</strong> (<kbd>⇧⌘E</kbd>) saves the frame at the playhead; turn
+            on <strong>Composition → Transparency Grid</strong> first to keep the background transparent.</div>
+          <label class="done"><input type="checkbox" data-lesson="export" /> I've exported my first video</label>
+        </section>
+
+        <!-- ───────────────────────── Claude ───────────────────────── -->
+        <section class="lesson" id="claude">
+          <div class="eyebrow">Bonus</div>
+          <h2>Let Claude help</h2>
+          <div class="side">
+            <div>
+              <p>Claude can build and change animations in your open project for you. Describe what you want in plain
+                words:</p>
+              <ul class="prompts">
+                <li>“Make a 5-second title card with my name that fades up.”</li>
+                <li>“Slow down the logo animation.”</li>
+                <li>“Add a glow to the selected layer.”</li>
+              </ul>
+              <p>Every change appears live in the viewer and is one undo step, so you can try ideas safely. It's also a
+                great way to learn: ask Claude to build something, then look at the keyframes and effects it made.</p>
+              <p>Open the panel with ✨ in the toolbar (<kbd>⇧⌘L</kbd>). There are two ways to connect:</p>
+              <ul>
+                <li><strong>Your Claude app:</strong> <em>Connect Claude Desktop…</em> or <em>Copy Claude Code
+                  Command</em>, then chat from there. This uses your Claude plan; no API key.</li>
+                <li><strong>Right in the panel:</strong> paste an Anthropic API key. It's kept in your Mac's Keychain and
+                  usage is billed to that key.</li>
+              </ul>
+            </div>
+            <figure>
+              <img src="/assets/learn/claude-panel.jpg" width="311" height="560" loading="lazy"
+                   alt="The Claude panel with example requests and the two ways to connect" />
+            </figure>
+          </div>
+          <label class="done"><input type="checkbox" data-lesson="claude" /> I've tried Claude</label>
+        </section>
+
+        <!-- ───────────────────────── Saving ───────────────────────── -->
+        <section class="lesson" id="saving">
+          <div class="eyebrow">Good habits</div>
+          <h2>Saving and sharing</h2>
+          <ul>
+            <li><strong>Save early:</strong> <kbd>⌘S</kbd> saves a <code>.mfproj</code> file. Once it has a name,
+              MotionForge auto-saves into it every 2 seconds (<em>File → Auto Save Every 2 Seconds</em>).</li>
+            <li><strong>Crashes:</strong> untitled work is kept in a recovery copy, and MotionForge offers it back the
+              next time it opens.</li>
+            <li><strong>Moving to another Mac:</strong> <em>File → Export Project Bundle…</em> makes one
+              <code>.mfbundle</code> file holding the project and copies of every image, clip and sound it uses.
+              Double-click it on the other Mac to unpack and open it.</li>
+            <li><strong>Editing together (Pro):</strong> <em>Share → Start Sharing</em> in the toolbar, then invite
+              friends by the email they sign in with. Everyone's edits appear live, and each person's undo only undoes
+              their own work.</li>
+          </ul>
+          <label class="done"><input type="checkbox" data-lesson="saving" /> My project is saved</label>
+        </section>
+
+        <!-- ───────────────────────── Shortcuts ───────────────────────── -->
+        <section class="lesson" id="shortcuts">
+          <div class="eyebrow">Reference</div>
+          <h2>Shortcut cheat sheet</h2>
+          <p>MotionForge uses After Effects' shortcuts, so they carry over if you ever move between the two.
+            <strong>Help → Keyboard Shortcuts</strong> (<kbd>⌘/</kbd>) shows the full list in the app.</p>
+          <div class="keys-grid">
+            <table class="keys">
+              <caption>Time</caption>
+              <tr><td><kbd>Space</kbd></td><td>Play / stop</td></tr>
+              <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>Go to start / end</td></tr>
+              <tr><td><kbd>Page Down</kbd> <kbd>Page Up</kbd></td><td>Next / previous frame (also <kbd>⌘→</kbd> <kbd>⌘←</kbd>)</td></tr>
+              <tr><td><kbd>B</kbd> <kbd>N</kbd></td><td>Work area start / end</td></tr>
+              <tr><td><kbd>0</kbd> (number pad)</td><td>RAM Preview</td></tr>
+              <tr><td><kbd>=</kbd> <kbd>−</kbd> <kbd>\</kbd></td><td>Zoom the timeline in / out / fit</td></tr>
+            </table>
+            <table class="keys">
+              <caption>Tools</caption>
+              <tr><td><kbd>V</kbd></td><td>Selection</td></tr>
+              <tr><td><kbd>H</kbd> <kbd>Z</kbd></td><td>Hand / zoom</td></tr>
+              <tr><td><kbd>W</kbd></td><td>Rotation</td></tr>
+              <tr><td><kbd>Y</kbd></td><td>Pan behind (move the anchor point)</td></tr>
+              <tr><td><kbd>G</kbd></td><td>Pen</td></tr>
+              <tr><td><kbd>Q</kbd></td><td>Shape (press again for the next shape)</td></tr>
+              <tr><td><kbd>⌘T</kbd></td><td>Type</td></tr>
+              <tr><td><kbd>C</kbd></td><td>Orbit camera</td></tr>
+            </table>
+            <table class="keys">
+              <caption>Show in the timeline</caption>
+              <tr><td><kbd>P</kbd> <kbd>S</kbd> <kbd>R</kbd> <kbd>T</kbd> <kbd>A</kbd></td><td>Position, Scale, Rotation, Opacity, Anchor Point</td></tr>
+              <tr><td><kbd>⇧</kbd> + key</td><td>Add to what's shown</td></tr>
+              <tr><td><kbd>U</kbd></td><td>Animated properties</td></tr>
+              <tr><td><kbd>UU</kbd></td><td>Changed properties</td></tr>
+            </table>
+            <table class="keys">
+              <caption>Layers</caption>
+              <tr><td><kbd>⌥⌘R</kbd> <kbd>⌥⌘E</kbd></td><td>New rectangle / ellipse</td></tr>
+              <tr><td><kbd>⌥⇧⌘T</kbd></td><td>New text</td></tr>
+              <tr><td><kbd>⌥⇧⌘Y</kbd></td><td>New null</td></tr>
+              <tr><td><kbd>⌥⇧⌘C</kbd></td><td>New camera</td></tr>
+              <tr><td><kbd>⌘D</kbd> <kbd>⇧⌘D</kbd></td><td>Duplicate / split at playhead</td></tr>
+              <tr><td><kbd>⇧⌘C</kbd></td><td>Pre-compose</td></tr>
+              <tr><td><kbd>]</kbd> <kbd>[</kbd></td><td>Bring forward / send backward</td></tr>
+            </table>
+            <table class="keys">
+              <caption>Project</caption>
+              <tr><td><kbd>⌥⌘N</kbd> <kbd>⌘N</kbd></td><td>New project / new composition</td></tr>
+              <tr><td><kbd>⌘S</kbd> <kbd>⌘O</kbd></td><td>Save / open</td></tr>
+              <tr><td><kbd>⌘I</kbd></td><td>Import media</td></tr>
+              <tr><td><kbd>⌘K</kbd></td><td>Composition settings</td></tr>
+              <tr><td><kbd>⌘M</kbd> <kbd>⌥⌘M</kbd></td><td>Export / export with last settings</td></tr>
+              <tr><td><kbd>⌘Z</kbd> <kbd>⇧⌘Z</kbd></td><td>Undo / redo</td></tr>
+            </table>
+            <table class="keys">
+              <caption>Panels</caption>
+              <tr><td><kbd>⌥⌘1</kbd>–<kbd>⌥⌘4</kbd></td><td>Project, Timeline, Inspector, Status bar</td></tr>
+              <tr><td><kbd>⌥⌘0</kbd></td><td>Hide / show all panels</td></tr>
+              <tr><td><kbd>⇧⌘L</kbd></td><td>Claude panel</td></tr>
+              <tr><td><kbd>⇧⌘H</kbd></td><td>Home</td></tr>
+              <tr><td><kbd>⌘/</kbd></td><td>All shortcuts</td></tr>
+            </table>
+          </div>
+        </section>
+
+        <!-- ───────────────────────── Help ───────────────────────── -->
+        <section class="lesson" id="help">
+          <div class="eyebrow">Troubleshooting</div>
+          <h2>When something goes wrong</h2>
+          <details>
+            <summary>macOS won't open the app (“Apple could not verify…”)</summary>
+            <p>Open <strong>System Settings → Privacy &amp; Security</strong>, scroll down and click <strong>Open
+              Anyway</strong> next to MotionForge. This is needed once, because the build isn't notarised by Apple yet.</p>
+          </details>
+          <details>
+            <summary>Playback is choppy</summary>
+            <p>Leave the preview quality in the viewer's footer on <strong>Auto</strong>: it drops to half or quarter
+              resolution when a frame takes too long, and says so. You can also pick Half or Quarter yourself. For a
+              perfectly smooth check, set a work area (<kbd>B</kbd> / <kbd>N</kbd>) and press <kbd>0</kbd> for a RAM
+              Preview. Exports are always full quality.</p>
+          </details>
+          <details>
+            <summary>A layer jumped, or keyframes appeared where I didn't want them</summary>
+            <p>With a property's stopwatch on, every change writes a keyframe at the playhead. Check where the playhead
+              is before you change a value, and press <kbd>⌘Z</kbd> to undo.</p>
+          </details>
+          <details>
+            <summary>I can't click the layer I want in the viewer</summary>
+            <p>A big layer on top (a full-frame background or a layer with a track matte) can catch the clicks. Click the
+              layer's name in the timeline instead, or hide the top layer with its eye icon while you work.</p>
+          </details>
+          <details>
+            <summary>My video file won't import</summary>
+            <p>MKV and WebM files can't be read yet. Convert them to MP4 or MOV and import again.</p>
+          </details>
+          <details>
+            <summary>I can't see motion blur</summary>
+            <p>The viewer shows frames without motion blur so it stays fast. Switch on <strong>Motion blur</strong> in the
+              export window and it's rendered in the file.</p>
+          </details>
+          <details>
+            <summary>Export opens a “Pro” window</summary>
+            <p>Exporting needs MotionForge Pro. Sign in with Google to start the free trial, or choose a plan in that
+              window. Creators can also ask about free access for a promotion reel: see
+              <a href="/#pricing">Pricing</a>.</p>
+          </details>
+          <details>
+            <summary>The app closed unexpectedly</summary>
+            <p>Open MotionForge again. Saved projects are auto-saved every 2 seconds, and untitled work is offered back
+              from its recovery copy.</p>
+          </details>
+          <p>Still stuck? Email <a href="mailto:karthikvarmaedu@gmail.com">karthikvarmaedu@gmail.com</a> or open an issue
+            on <a href="https://github.com/Karthikvarma101/MotionForge/issues">GitHub</a>.</p>
+        </section>
+
+        <!-- ───────────────────────── Practice ───────────────────────── -->
+        <section class="lesson" id="practice">
+          <div class="eyebrow">Keep going</div>
+          <h2>Practice projects</h2>
+          <p>The fastest way to get good is to finish small pieces. Try these in order; each uses the lessons above.</p>
+          <div class="terms">
+            <div class="term"><h3>1 · Bouncing ball</h3><p>A circle falls and bounces three times, each bounce lower.
+              Position keyframes, Ease In on the way down, Ease Out on the way up, then shape it in the graph editor.
+              <em>Lessons 1–2</em></p></div>
+            <div class="term"><h3>2 · Name lower third</h3><p>A rounded rectangle slides in at the bottom left, your
+              name types on over it, a subtitle fades up, and everything slides out after 4 seconds. Export it as ProRes
+              4444 to use over any video. <em>Lessons 3–5, 10</em></p></div>
+            <div class="term"><h3>3 · Logo reveal</h3><p>Import a logo PNG. Reveal it with a growing ellipse mask, pop
+              it in with a little overshoot, then add a Glow Pulse and a line drawn with Trim Paths underneath.
+              <em>Lessons 3, 5–7</em></p></div>
+            <div class="term"><h3>4 · Reel title card</h3><p>A 9:16 composition (<kbd>⌘K</kbd>) with a three-line
+              title using Pop by Word, a music track that fades in and out, and a 3D camera drifting through two layers
+              of shapes. Export with the Reels preset. <em>Lessons 4, 7, 9, 10</em></p></div>
+          </div>
+          <p>Share what you make and tag MotionForge, and if you have 5,000+ followers, ask about free Pro for a
+            promotion reel.</p>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div><a href="/learn">Learn</a><a href="/privacy">Privacy policy</a><a href="/terms">Terms of service</a><a href="mailto:karthikvarmaedu@gmail.com">Contact</a></div>
+      <div>© 2026 MotionForge</div>
+    </div>
+  </footer>
+
+  <script>
+    // Highlight the section being read in the contents list.
+    const links = new Map([...document.querySelectorAll(".toc a")].map((a) => [a.getAttribute("href").slice(1), a]));
+    const seen = new Set();
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) e.isIntersecting ? seen.add(e.target.id) : seen.delete(e.target.id);
+      const current = [...links.keys()].find((id) => seen.has(id));
+      if (!current) return;
+      for (const [id, a] of links) a.classList.toggle("on", id === current);
+    }, { rootMargin: "-10% 0px -70% 0px" });
+    for (const id of links.keys()) { const el = document.getElementById(id); if (el) io.observe(el); }
+
+    // "Done" ticks, remembered in this browser only.
+    const KEY = "mf-learn-done";
+    let done = [];
+    try { done = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (_) {}
+    const boxes = [...document.querySelectorAll("input[data-lesson]")];
+    const render = () => {
+      for (const b of boxes) {
+        b.checked = done.includes(b.dataset.lesson);
+        links.get(b.dataset.lesson)?.classList.toggle("ticked", b.checked);
+      }
+      const n = boxes.filter((b) => b.checked).length;
+      document.getElementById("progress").textContent = n ? `${n} of ${boxes.length} done` : "";
+    };
+    for (const b of boxes) b.addEventListener("change", () => {
+      done = b.checked ? [...new Set([...done, b.dataset.lesson])] : done.filter((x) => x !== b.dataset.lesson);
+      try { localStorage.setItem(KEY, JSON.stringify(done)); } catch (_) {}
+      render();
+    });
+    render();
+  </script>
+</body>
+</html>

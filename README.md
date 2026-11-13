@@ -74,6 +74,9 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
 
 ## Using it
 
+New to motion graphics? The beginner's guide at https://motionforge-app.pages.dev/learn
+(`site/learn.html`) walks through ten short lessons, from a first keyframe to a first export.
+
 - **Home**: the app opens with a short animation of the logo being built, then the Home window.
   - **Recent projects:** opened and saved projects appear as cards with a rendered thumbnail, size,
     length, composition count and when you last opened them. Click a card to open it; right-click
@@ -216,7 +219,8 @@ ad-hoc signed) followed by `open build/MotionForge.app`. Other targets:
   - **Admin console:** customers, free Pro, cancellations, prices, the export switch and the Home announcement
     can all be managed at https://motionforge-admin.pages.dev ([admin/README.md](admin/README.md)).
   - **Website:** https://motionforge-app.pages.dev (`site/`, static, Cloudflare Pages).
-    - It has the home page with the download link and live prices, plus `/privacy` and `/terms`.
+    - It has the home page with the download link and live prices, the beginner's guide at `/learn`, plus
+      `/privacy` and `/terms`.
     - Google sign-in's branding links to these pages, and the Google app is published, so any Google account can
       sign in.
     - To redeploy, run this from `site/`:
